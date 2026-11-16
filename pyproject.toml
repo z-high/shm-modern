@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shm-modern"
+version = "3.0.0"
+description = "Modern Python/PyQt6 rewrite of SeismicHandler Motif (SHM) & Command Interpreter (SHC)"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt6>=6.4.0",
+    "numpy>=1.23.0",
+    "matplotlib>=3.6.0",
+]
+keywords = [
+    "seismology",
+    "earthquake",
+    "waveform-analysis",
+    "seismichandler",
+    "miniseed",
+    "fdsn",
+    "pyqt6",
+]
+
+[tool.setuptools.packages.find]
+include = ["shm_app*"]
+
+[tool.setuptools.package-data]
+shm_app = ["assets/*.gz", "gui/icons/*.svg"]

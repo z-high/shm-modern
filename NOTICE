@@ -1,0 +1,28 @@
+# NOTICE & ATTRIBUTION
+
+## Modernized SeismicHandler Motif (`SHM`) & Command Interpreter (`SHC`)
+
+This program is a modernized, ground-up rewrite and extension of **SeismicHandler (SH / SHM)** originally created by **Dr. Klaus Stammler** at the **Federal Institute for Geosciences and Natural Resources (BGR, Hannover, Germany)**.
+
+- **Original Software:** SeismicHandler (SH / SHM)
+- **Original Copyright:** (C) 1991–2013 Klaus Stammler, Bundesanstalt für Geowissenschaften und Rohstoffe (BGR), Hannover, Germany.
+- **Original License:** GNU General Public License version 2 or later (GPL-2.0-or-later).
+
+## Third-Party Libraries & Dependencies
+
+This modernized implementation utilizes the following open-source libraries:
+
+1. **PyQt6**
+   - License: GNU General Public License v3 (GPL-3.0) / Riverbank Commercial License
+   - Website: https://www.riverbankcomputing.com/software/pyqt/
+2. **NumPy**
+   - License: BSD 3-Clause License
+   - Website: https://numpy.org/
+3. **Matplotlib**
+   - License: Matplotlib PSF-based License / BSD-compatible
+   - Website: https://matplotlib.org/
+
+## Licensing
+
+The modern implementation is distributed under the terms of the **GNU General Public License Version 3 (GPL-3.0-or-later)**.
+See the `LICENSE` file for the complete license text.

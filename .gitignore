@@ -1,0 +1,63 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+.env
+
+# Test / lint / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE, OS & agent workspace files
+.vscode/
+.idea/
+.antigravity/
+.gemini/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Internal planning & roadmap documents (excluded from release repository)
+WORKFLOW_GAP_ANALYSIS.md
+TODO_REMAINING_WORKFLOW_PHASES.md
+PLAN*.md
+
+# Temporary outputs / screenshots / local data downloads
+/*.png
+!docs/**/*.png
+*.tmp
+shm_event.evt
+export.*
+shm_bgr_downloads/
+shm_live_events/
+*.mseed
+sfdlist.sfd
