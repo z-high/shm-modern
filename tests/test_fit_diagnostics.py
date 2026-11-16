@@ -20,9 +20,11 @@ Tests:
 
 import math
 import unittest
+import warnings
 import numpy as np
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QPointF, Qt
+from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import QApplication
 
 # Ensure QApplication exists for headless Qt widget tests
@@ -45,6 +47,7 @@ from shm_app.core.models import AnalysisParamSet, PhasePick, Trace
 from shm_app.core.time_utils import format_sh_time
 from shm_app.gui.fit_dialog import FitDiagnosticWindow, KPICard
 from shm_app.gui.main_window import MainWindow
+from shm_app.gui.waveform_canvases import snap_time_to_feature
 from shm_app.seismology.array_loc import locate_network_geiger
 
 
@@ -559,6 +562,98 @@ class TestReactiveReFitLoop(unittest.TestCase):
             self.assertTrue(len(tr.theo_picks) > 0)
             for p in tr.picks:
                 self.assertIsNotNone(p.resid)
+        win.close()
+
+    def test_zero_height_canvas_recompute_no_singular_matrix(self) -> None:
+        """FitDiagnosticWindow must never crash with LinAlgError when canvases are tiny/zero-height."""
+        win = MainWindow(autoload_example=True)
+        win.resize(1280, 620)
+        win.show()
+        win.fit_dock.show()
+        app.processEvents()
+
+        try:
+            win.engine.execute_line("PICK ALL")
+            picks = [pk for tr in win.engine.traces for pk in tr.picks if pk.onset and pk.station]
+            _, _, diag_res = locate_network_geiger(
+                picks, config=win.config, ttt=win.engine.ttt, return_diagnostics=True
+            )
+            win.fit_dock.canvas_scatter.resize(700, 0)
+            win.fit_dock.canvas_ellipse.resize(0, 0)
+            with warnings.catch_warnings(record=True) as ws:
+                warnings.simplefilter("always")
+                win.fit_dock.set_fit_result(diag_res)
+                win.fit_dock.btn_recompute.click()
+                app.processEvents()
+            mean_warns = [w for w in ws if "Mean of empty slice" in str(w.message)]
+            self.assertEqual(mean_warns, [])
+        finally:
+            win.close()
+
+    def test_pick_placement_matches_release_cursor_and_no_empty_mean_warning(self) -> None:
+        """Verify cursor-to-pick alignment on release and empty-slice protection in snap_time_to_feature."""
+        win = MainWindow(autoload_example=True)
+        win.resize(1200, 800)
+        win.show()
+        app.processEvents()
+
+        try:
+            mc = win.main_canvas
+            tr = win.engine.traces[0]
+            tr.picks.clear()
+
+            # Out-of-bounds snap must not trigger numpy Mean of empty slice warning
+            with warnings.catch_warnings(record=True) as ws:
+                warnings.simplefilter("always")
+                ep_oob = tr.start_epoch - 500.0
+                self.assertEqual(snap_time_to_feature(tr, ep_oob, "PEAK_LOCK"), ep_oob)
+            mean_warns = [w for w in ws if "Mean of empty slice" in str(w.message)]
+            self.assertEqual(mean_warns, [])
+
+            # Click press with <= 4 px release drift picks cleanly at the final cursor release X
+            rect = mc.plot_rect()
+            press_pt = QPointF(rect.left() + 0.30 * rect.width(), rect.top() + 0.5 * mc.slot_height())
+            release_pt = QPointF(press_pt.x() + 3.0, press_pt.y())
+            g_press = mc.mapToGlobal(press_pt.toPoint()).toPointF()
+            g_rel = mc.mapToGlobal(release_pt.toPoint()).toPointF()
+
+            mc.mousePressEvent(
+                QMouseEvent(
+                    QMouseEvent.Type.MouseButtonPress,
+                    press_pt,
+                    g_press,
+                    Qt.MouseButton.LeftButton,
+                    Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+            )
+            mc.mouseMoveEvent(
+                QMouseEvent(
+                    QMouseEvent.Type.MouseMove,
+                    release_pt,
+                    g_rel,
+                    Qt.MouseButton.NoButton,
+                    Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+            )
+            mc.mouseReleaseEvent(
+                QMouseEvent(
+                    QMouseEvent.Type.MouseButtonRelease,
+                    release_pt,
+                    g_rel,
+                    Qt.MouseButton.LeftButton,
+                    Qt.MouseButton.NoButton,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+            )
+            app.processEvents()
+
+            self.assertEqual(len(tr.picks), 1)
+            drawn_x = mc.time_to_x(tr.picks[0].onset_epoch + tr.display_offset - mc.reference_epoch())
+            self.assertLess(abs(drawn_x - release_pt.x()), 0.5)
+        finally:
+            win.close()
 
 
 if __name__ == "__main__":

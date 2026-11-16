@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 from typing import Any, Callable, Optional
+import warnings
+
+from numpy.linalg import LinAlgError
 
 from PyQt6.QtCore import QLocale
 from PyQt6.QtWidgets import QAbstractSpinBox, QComboBox, QPushButton, QWidget
@@ -392,3 +395,27 @@ def make_push_button(
     if slot is not None:
         btn.clicked.connect(slot)
     return btn
+
+
+def safe_tight_layout(fig: Any, canvas: Optional[Any] = None, min_px: int = 80) -> None:
+    """Apply Matplotlib tight_layout only when the target canvas is large enough to avoid singular transforms."""
+    if fig is None:
+        return
+    if canvas is not None:
+        try:
+            if canvas.width() < min_px or canvas.height() < min_px:
+                return
+        except Exception:
+            pass
+    try:
+        dpi = float(fig.dpi)
+        if fig.get_figwidth() * dpi < min_px or fig.get_figheight() * dpi < min_px:
+            return
+    except Exception:
+        return
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            fig.tight_layout()
+        except (LinAlgError, ValueError, RuntimeError):
+            pass

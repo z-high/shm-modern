@@ -520,7 +520,7 @@ class SHMMainWindow(QMainWindow):
             return
         tr = self.engine.traces[trace_idx]
         ref_ep = self.main_canvas.reference_epoch()
-        epoch = ref_ep + rel_t - tr.display_offset
+        epoch = self.main_canvas.snap_time_to_feature(tr, ref_ep + rel_t - tr.display_offset)
         phase = self.phase_panel.active_phase
 
         menu = QMenu(self)

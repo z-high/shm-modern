@@ -51,6 +51,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from shm_app.core.fit_bridge import FitDiagnosticBridge
+from shm_app.gui.ui_helpers import safe_tight_layout
 from shm_app.core.fit_models import (
     ConfidenceEllipse,
     FitDiagnosticResult,
@@ -192,6 +193,7 @@ class FitDiagnosticWindow(QDockWidget):
         self._build_tab4_spectrum()
         self._build_tab5_polarization()
         self._build_tab6_restitution()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         main_layout.addWidget(self.tabs, 1)
 
@@ -314,6 +316,7 @@ class FitDiagnosticWindow(QDockWidget):
 
         # Top Section: Two Matplotlib Canvases
         top_widget = QWidget()
+        top_widget.setMinimumHeight(140)
         top_layout = QHBoxLayout(top_widget)
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.setSpacing(6)
@@ -324,6 +327,7 @@ class FitDiagnosticWindow(QDockWidget):
         scatter_layout = QVBoxLayout(scatter_box)
         self.fig_scatter = Figure(figsize=(5, 3), facecolor="#0d1117")
         self.canvas_scatter = FigureCanvas(self.fig_scatter)
+        self.canvas_scatter.setMinimumHeight(110)
         scatter_layout.addWidget(self.canvas_scatter)
         top_layout.addWidget(scatter_box, 6)
 
@@ -333,6 +337,7 @@ class FitDiagnosticWindow(QDockWidget):
         ellipse_layout = QVBoxLayout(ellipse_box)
         self.fig_ellipse = Figure(figsize=(3, 3), facecolor="#0d1117")
         self.canvas_ellipse = FigureCanvas(self.fig_ellipse)
+        self.canvas_ellipse.setMinimumHeight(110)
         ellipse_layout.addWidget(self.canvas_ellipse)
         top_layout.addWidget(ellipse_box, 4)
 
@@ -370,8 +375,9 @@ class FitDiagnosticWindow(QDockWidget):
         bot_layout.addWidget(self.table_residuals)
 
         splitter.addWidget(bot_box)
-        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(0, 5)
         splitter.setStretchFactor(1, 5)
+        splitter.setSizes([200, 180])
 
         v_layout.addWidget(splitter)
         self.tabs.addTab(tab, "Travel Time & Geiger Residuals")
@@ -609,7 +615,7 @@ class FitDiagnosticWindow(QDockWidget):
         else:
             ax.text(0.5, 0.5, "No correlation matrix available", ha="center", va="center", color="#8b949e")
 
-        self.fig_corr.tight_layout()
+        safe_tight_layout(self.fig_corr, self.canvas_corr)
         self.canvas_corr.draw()
 
     def _update_tab2_travel_time(self, result: FitDiagnosticResult) -> None:
@@ -681,7 +687,7 @@ class FitDiagnosticWindow(QDockWidget):
             ax2.set_xlabel("Backazimuth (deg)", color="#8b949e", fontsize=8)
             ax2.set_ylabel("Residual (s)", color="#8b949e", fontsize=8)
 
-        self.fig_scatter.tight_layout()
+        safe_tight_layout(self.fig_scatter, self.canvas_scatter)
         self.canvas_scatter.draw()
 
         # 3. Render 95% Error Ellipse
@@ -724,7 +730,7 @@ class FitDiagnosticWindow(QDockWidget):
         else:
             ax_el.text(0.5, 0.5, "No Error Ellipse Data", ha="center", va="center", color="#8b949e")
 
-        self.fig_ellipse.tight_layout()
+        safe_tight_layout(self.fig_ellipse, self.canvas_ellipse)
         self.canvas_ellipse.draw()
 
     def _update_tab3_array_fk(self, result: FitDiagnosticResult) -> None:
@@ -746,7 +752,7 @@ class FitDiagnosticWindow(QDockWidget):
         ax_fk.set_xlabel("sx (s/deg)", color="#8b949e", fontsize=8)
         ax_fk.set_ylabel("sy (s/deg)", color="#8b949e", fontsize=8)
         self.fig_fk.colorbar(im, ax=ax_fk, fraction=0.046, pad=0.04)
-        self.fig_fk.tight_layout()
+        safe_tight_layout(self.fig_fk, self.canvas_fk)
         self.canvas_fk.draw()
 
         self.fig_beam_res.clear()
@@ -760,7 +766,7 @@ class FitDiagnosticWindow(QDockWidget):
         ax_b.plot(t, res_wf, color="#f85149", linestyle="--", label="Mean Residual r(t)")
         ax_b.set_xlabel("Time (s)", color="#8b949e", fontsize=8)
         ax_b.legend(loc="upper right", fontsize=7, facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3")
-        self.fig_beam_res.tight_layout()
+        safe_tight_layout(self.fig_beam_res, self.canvas_beam_res)
         self.canvas_beam_res.draw()
 
     def _update_tab4_spectrum(self, result: FitDiagnosticResult) -> None:
@@ -782,7 +788,7 @@ class FitDiagnosticWindow(QDockWidget):
         ax_s.set_xlabel("Frequency (Hz)", color="#8b949e", fontsize=8)
         ax_s.set_ylabel("Displacement (nm·s)", color="#8b949e", fontsize=8)
         ax_s.legend(loc="lower left", fontsize=7, facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3")
-        self.fig_spec.tight_layout()
+        safe_tight_layout(self.fig_spec, self.canvas_spec)
         self.canvas_spec.draw()
 
         self.fig_misfit.clear()
@@ -799,7 +805,7 @@ class FitDiagnosticWindow(QDockWidget):
         ax_m.set_xlabel("Corner Freq fc (Hz)", color="#8b949e", fontsize=8)
         ax_m.set_ylabel("Plateau Ω0 (nm·s)", color="#8b949e", fontsize=8)
         self.fig_misfit.colorbar(im, ax=ax_m, fraction=0.046, pad=0.04)
-        self.fig_misfit.tight_layout()
+        safe_tight_layout(self.fig_misfit, self.canvas_misfit)
         self.canvas_misfit.draw()
 
         self.lbl_source_params.setText(
@@ -836,7 +842,7 @@ class FitDiagnosticWindow(QDockWidget):
         ax2.set_ylabel("Vertical (Z)", color="#8b949e", fontsize=8)
         ax2.set_title("Z-N (Vertical)", color="#e6edf3", fontsize=8)
 
-        self.fig_pol.tight_layout()
+        safe_tight_layout(self.fig_pol, self.canvas_pol)
         self.canvas_pol.draw()
 
         self.lbl_pol_metrics.setText(
@@ -862,7 +868,7 @@ class FitDiagnosticWindow(QDockWidget):
         ax_r.set_xlabel("Frequency (Hz)", color="#8b949e", fontsize=8)
         ax_r.set_ylabel("Sensitivity (V / (m/s))", color="#8b949e", fontsize=8)
         ax_r.legend(loc="lower right", fontsize=7, facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3")
-        self.fig_rest.tight_layout()
+        safe_tight_layout(self.fig_rest, self.canvas_rest)
         self.canvas_rest.draw()
 
         self.fig_rf.clear()
@@ -878,8 +884,21 @@ class FitDiagnosticWindow(QDockWidget):
         ax_rf.plot(t_rf, rf_syn, color="#3fb950", linewidth=1.5, label="Synthetic Fit (94.2%)")
         ax_rf.set_xlabel("Time (s)", color="#8b949e", fontsize=8)
         ax_rf.legend(loc="upper right", fontsize=7, facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3")
-        self.fig_rf.tight_layout()
+        safe_tight_layout(self.fig_rf, self.canvas_rf)
         self.canvas_rf.draw()
+
+    def _on_tab_changed(self, idx: int) -> None:
+        tab_canvases = {
+            0: [(self.fig_corr, self.canvas_corr)],
+            1: [(self.fig_scatter, self.canvas_scatter), (self.fig_ellipse, self.canvas_ellipse)],
+            2: [(self.fig_fk, self.canvas_fk), (self.fig_beam_res, self.canvas_beam_res)],
+            3: [(self.fig_spec, self.canvas_spec), (self.fig_misfit, self.canvas_misfit)],
+            4: [(self.fig_pol, self.canvas_pol)],
+            5: [(self.fig_rest, self.canvas_rest), (self.fig_rf, self.canvas_rf)],
+        }
+        for fig, canvas in tab_canvases.get(idx, []):
+            safe_tight_layout(fig, canvas)
+            canvas.draw_idle()
 
     # ------------------------------------------------------------------
     # User Interactions & Reactive Loop

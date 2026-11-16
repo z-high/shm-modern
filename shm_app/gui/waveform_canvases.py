@@ -30,6 +30,25 @@ from shm_app.core.time_utils import format_sh_time
 CURSOR_LOCK_MODES: Tuple[str, ...] = ("CROSSHAIR", "PEAK_LOCK", "ZERO_LOCK")
 
 
+def _alloc_pixmap_for_widget(widget: QWidget) -> QPixmap:
+    dpr = max(1.0, float(widget.devicePixelRatioF()))
+    pw = max(1, int(round(widget.width() * dpr)))
+    ph = max(1, int(round(widget.height() * dpr)))
+    pm = QPixmap(pw, ph)
+    pm.setDevicePixelRatio(dpr)
+    return pm
+
+
+def _pixmap_matches_widget(pm: Optional[QPixmap], widget: QWidget) -> bool:
+    if pm is None:
+        return False
+    dpr = max(1.0, float(widget.devicePixelRatioF()))
+    return (
+        pm.deviceIndependentSize().toSize() == widget.size()
+        and abs(pm.devicePixelRatio() - dpr) < 1e-3
+    )
+
+
 def snap_time_to_feature(tr: Trace, epoch_click: float, mode: str) -> float:
     """Apply cursor lock mode ('CROSSHAIR', 'PEAK_LOCK', 'ZERO_LOCK') around epoch_click."""
     if mode == "CROSSHAIR" or tr.delta <= 0 or tr.length < 3:
@@ -39,7 +58,10 @@ def snap_time_to_feature(tr: Trace, epoch_click: float, mode: str) -> float:
     half_w = 8
     i0 = max(0, idx_c - half_w)
     i1 = min(tr.length, idx_c + half_w + 1)
-    seg = tr.data[i0:i1] - np.mean(tr.data[i0:i1])
+    if i1 - i0 < 2:
+        return epoch_click
+    raw_seg = tr.data[i0:i1]
+    seg = raw_seg - np.mean(raw_seg)
     if seg.size < 2:
         return epoch_click
     if mode == "PEAK_LOCK":
@@ -168,6 +190,7 @@ class MainTraceCanvas(QWidget):
 
     PICK_HIT_TOLERANCE_PX = 6.0
     MAG_HANDLE_H = 7.0
+    LEFT_DRAG_THRESHOLD_PX = 5.0
     RIGHT_DRAG_THRESHOLD_PX = 5.0
 
     MARGIN_LEFT = 140
@@ -202,6 +225,7 @@ class MainTraceCanvas(QWidget):
         self._right_drag_trace_idx: int = 0
         self._left_drag_start_t: Optional[float] = None
         self._left_drag_cur_t: Optional[float] = None
+        self._left_press_pos: Optional[QPointF] = None
         self._left_press_info: Optional[Tuple[int, float, float]] = None
 
         # Pick editing, right-click context menu and pan state
@@ -447,8 +471,7 @@ class MainTraceCanvas(QWidget):
         if (
             slot_i < 0
             or self._cache_dirty
-            or self._static_pixmap is None
-            or self._static_pixmap.size() != self.size()
+            or not _pixmap_matches_widget(self._static_pixmap, self)
             or not vis
         ):
             self.invalidate_cache()
@@ -589,22 +612,22 @@ class MainTraceCanvas(QWidget):
             round(self.min_slot_h, 1),
             round(self.v_offset, 1),
             self.group_by_station,
+            round(float(self.devicePixelRatioF()), 3),
         )
 
     def _ensure_static_pixmap(self) -> None:
         key = self._current_state_key()
         if (
             not self._cache_dirty
-            and self._static_pixmap is not None
-            and self._static_pixmap.size() == self.size()
+            and _pixmap_matches_widget(self._static_pixmap, self)
             and self._cache_state_key == key
         ):
             return
 
         self._cached_vis = None
         self._cached_ref_ep = None
-        if self._static_pixmap is None or self._static_pixmap.size() != self.size():
-            self._static_pixmap = QPixmap(self.size())
+        if not _pixmap_matches_widget(self._static_pixmap, self):
+            self._static_pixmap = _alloc_pixmap_for_widget(self)
 
         painter = QPainter(self._static_pixmap)
         painter.fillRect(self.rect(), self.bg_color)
@@ -729,11 +752,21 @@ class MainTraceCanvas(QWidget):
             painter.setPen(QPen(QColor("#58a6ff"), 1.2, Qt.PenStyle.DashLine))
             painter.drawRect(QRectF(x0, rect.top(), max(2.0, x1 - x0), rect.height()))
 
-        # Draw crosshair cursor
+        # Draw crosshair cursor (snapped preview in PEAK_LOCK / ZERO_LOCK so pick matches visual cursor)
         if self._hover_pos is not None and rect.contains(self._hover_pos):
-            pen_c = QPen(QColor(230, 237, 243, 120), 0, Qt.PenStyle.DotLine)
+            draw_x = self._hover_pos.x()
+            if self.cursor_lock_mode != "CROSSHAIR":
+                slot_i = self.y_to_visible_slot(self._hover_pos.y())
+                if 0 <= slot_i < len(vis):
+                    _, hover_tr = vis[slot_i]
+                    ref_ep = self.reference_epoch()
+                    hover_t = self.x_to_time(draw_x)
+                    hover_ep = ref_ep + hover_t - hover_tr.display_offset
+                    snapped_ep = self.snap_time_to_feature(hover_tr, hover_ep)
+                    draw_x = self.time_to_x(snapped_ep + hover_tr.display_offset - ref_ep)
+            pen_c = QPen(QColor(230, 237, 243, 140), 0, Qt.PenStyle.DotLine)
             painter.setPen(pen_c)
-            painter.drawLine(QPointF(self._hover_pos.x(), rect.top()), QPointF(self._hover_pos.x(), rect.bottom()))
+            painter.drawLine(QPointF(draw_x, rect.top()), QPointF(draw_x, rect.bottom()))
             painter.drawLine(QPointF(rect.left(), self._hover_pos.y()), QPointF(rect.right(), self._hover_pos.y()))
 
         painter.end()
@@ -1022,6 +1055,7 @@ class MainTraceCanvas(QWidget):
         if not rect.contains(pos):
             return
 
+        self._hover_pos = pos
         rel_t = self.x_to_time(pos.x())
         ref_ep = self.reference_epoch()
         click_ep = ref_ep + rel_t - tr.display_offset
@@ -1053,10 +1087,12 @@ class MainTraceCanvas(QWidget):
                 self._pick_drag_press_x = pos.x()
                 self._left_drag_start_t = None
                 self._left_drag_cur_t = None
+                self._left_press_pos = None
                 self._left_press_info = None
             else:
                 self._left_drag_start_t = rel_t
                 self._left_drag_cur_t = None
+                self._left_press_pos = pos
                 self._left_press_info = (orig_idx, snapped_ep, rel_t)
             if prev_mag_idx != orig_idx:
                 self.magnifierWindowChanged.emit(self.mag_trace_idx, self.mag_t_lo, self.mag_t_hi)
@@ -1106,8 +1142,8 @@ class MainTraceCanvas(QWidget):
         pos = event.position()
         if (
             self._hover_pos is not None
-            and abs(pos.x() - self._hover_pos.x()) < 1.0
-            and abs(pos.y() - self._hover_pos.y()) < 1.0
+            and abs(pos.x() - self._hover_pos.x()) < 0.1
+            and abs(pos.y() - self._hover_pos.y()) < 0.1
             and not event.buttons()
         ):
             return
@@ -1174,7 +1210,10 @@ class MainTraceCanvas(QWidget):
                     self.mag_t_hi = max(self._right_drag_start_t, rel_t)
                     self.magnifierWindowChanged.emit(self.mag_trace_idx, self.mag_t_lo, self.mag_t_hi)
             elif (event.buttons() & Qt.MouseButton.LeftButton) and self._left_drag_start_t is not None:
-                if abs(rel_t - self._left_drag_start_t) > 0.3:
+                if self._left_drag_cur_t is not None or (
+                    self._left_press_pos is not None
+                    and abs(pos.x() - self._left_press_pos.x()) > self.LEFT_DRAG_THRESHOLD_PX
+                ):
                     self._left_drag_cur_t = rel_t
 
         if not event.buttons():
@@ -1184,10 +1223,12 @@ class MainTraceCanvas(QWidget):
                 if handle is not None and handle.contains(pos):
                     self.setCursor(Qt.CursorShape.SizeHorCursor)
                     self.setToolTip("Drag to move the Magnifier window (length stays constant)")
+                elif rect.contains(pos):
+                    self.setCursor(Qt.CursorShape.CrossCursor)
+                    self._pick_tooltip_cleared()
                 else:
                     self.unsetCursor()
-                    if self._pick_tooltip_cleared():
-                        pass
+                    self._pick_tooltip_cleared()
         self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
@@ -1220,9 +1261,25 @@ class MainTraceCanvas(QWidget):
                     self.magnifierWindowChanged.emit(self.mag_trace_idx, self.mag_t_lo, self.mag_t_hi)
             elif self._left_press_info is not None:
                 orig_idx, snapped_ep, rel_t = self._left_press_info
+                rel_pos = event.position()
+                rect = self.plot_rect()
+                if 0 <= orig_idx < len(self.traces):
+                    pick_x = rel_pos.x() if rect.contains(rel_pos) else (
+                        self._left_press_pos.x() if self._left_press_pos is not None else rel_pos.x()
+                    )
+                    pick_x = max(rect.left(), min(rect.right(), pick_x))
+                    tr = self.traces[orig_idx]
+                    rel_t = self.x_to_time(pick_x)
+                    click_ep = self.reference_epoch() + rel_t - tr.display_offset
+                    snapped_ep = self.snap_time_to_feature(tr, click_ep)
+                    self._hover_pos = QPointF(
+                        pick_x,
+                        rel_pos.y() if rect.contains(rel_pos) else (self._hover_pos.y() if self._hover_pos is not None else rect.center().y()),
+                    )
                 self.traceClicked.emit(orig_idx, snapped_ep, rel_t)
             self._left_drag_start_t = None
             self._left_drag_cur_t = None
+            self._left_press_pos = None
             self._left_press_info = None
         elif event.button() == Qt.MouseButton.RightButton:
             if self._right_press_pos is not None and not self._right_moved:
@@ -1344,20 +1401,20 @@ class MagnifierCanvas(QWidget):
             tr.filter_name if tr else "",
             len(tr.picks) if tr else 0,
             tuple((p.name, p.onset, p.quality, p.sign, p.spec) for p in tr.picks) if tr else (),
+            round(float(self.devicePixelRatioF()), 3),
         )
 
     def _ensure_static_pixmap(self) -> None:
         key = self._current_state_key()
         if (
             not self._cache_dirty
-            and self._static_pixmap is not None
-            and self._static_pixmap.size() == self.size()
+            and _pixmap_matches_widget(self._static_pixmap, self)
             and self._cache_state_key == key
         ):
             return
 
-        if self._static_pixmap is None or self._static_pixmap.size() != self.size():
-            self._static_pixmap = QPixmap(self.size())
+        if not _pixmap_matches_widget(self._static_pixmap, self):
+            self._static_pixmap = _alloc_pixmap_for_widget(self)
 
         painter = QPainter(self._static_pixmap)
         painter.fillRect(self.rect(), QColor("#0d1117"))
@@ -1531,6 +1588,7 @@ class MagnifierCanvas(QWidget):
         pos = event.position()
         if not r.contains(pos):
             return
+        self._hover_x = pos.x()
         rel_t = self.x_to_time(pos.x())
         if event.button() == Qt.MouseButton.LeftButton:
             ep = self.ref_epoch + rel_t - self.trace.display_offset
@@ -1550,7 +1608,13 @@ class MagnifierCanvas(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         pos = event.position()
-        if self._hover_x is not None and abs(pos.x() - self._hover_x) < 1.0 and not event.buttons():
+        r = self.plot_rect()
+        if not event.buttons():
+            if r.contains(pos):
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                self.unsetCursor()
+        if self._hover_x is not None and abs(pos.x() - self._hover_x) < 0.1 and not event.buttons():
             return
         self._hover_x = pos.x()
         if (event.buttons() & Qt.MouseButton.RightButton) and self._drag_start_rel is not None:
