@@ -6,10 +6,13 @@ matching shmath.c, fkwid.c, shcorr.c, earthloc.c, seismics.c, and cblib.c.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
+import os
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 
+from shm_app import SHM_DEFAULT_ROOT
 from shm_app.core.config_station import SHMConfig, get_config
 from shm_app.core.fit_models import (
     ConfidenceEllipse,
@@ -77,6 +80,329 @@ MB_SIGMA_GRID = np.array(
     dtype=np.float64,
 )
 
+CALC_STARTPOS = 26
+
+
+@dataclass(frozen=True)
+class SlownessCalibrationEntry:
+    """Single empirical slowness-azimuth calibration vector."""
+
+    s_meas: float
+    az_meas: float
+    s_corr: float
+    az_corr: float
+    comment: str = ""
+
+
+class SlownessCalibrationTable:
+    """Empirical slowness/backazimuth calibration table (e.g. ``calib_grf.dat``).
+
+    Supports both:
+    - Legacy SHM format (``CALC_STARTPOS=26``: 26-char prefix followed by
+      ``s_beam az_beam s_corr az_corr`` and optional trailing text).
+    - Delta format (``# slowness_in azimuth_in d_slowness d_azimuth``).
+
+    Interpolation is performed in 2D Cartesian slowness space
+    ``(sx, sy) = (s * sin(az), s * cos(az))`` using inverse-distance weighting
+    (IDW) over the nearest calibration vectors, naturally handling angular
+    wrap-around across 0/360 degrees.
+    """
+
+    def __init__(
+        self,
+        entries: Sequence[SlownessCalibrationEntry],
+        source_path: str = "",
+    ) -> None:
+        self.entries: List[SlownessCalibrationEntry] = list(entries)
+        self.source_path: str = source_path
+
+        if self.entries:
+            s_m = np.array([e.s_meas for e in self.entries], dtype=np.float64)
+            az_m_r = np.radians([e.az_meas for e in self.entries])
+            s_c = np.array([e.s_corr for e in self.entries], dtype=np.float64)
+            az_c_r = np.radians([e.az_corr for e in self.entries])
+
+            self._u_meas = s_m * np.sin(az_m_r)
+            self._v_meas = s_m * np.cos(az_m_r)
+            self._u_corr = s_c * np.sin(az_c_r)
+            self._v_corr = s_c * np.cos(az_c_r)
+            self._du = self._u_corr - self._u_meas
+            self._dv = self._v_corr - self._v_meas
+        else:
+            empty = np.zeros(0, dtype=np.float64)
+            self._u_meas = empty
+            self._v_meas = empty
+            self._u_corr = empty
+            self._v_corr = empty
+            self._du = empty
+            self._dv = empty
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    @classmethod
+    def from_text(
+        cls,
+        text: str,
+        fmt: str = "auto",
+        source_path: str = "",
+    ) -> "SlownessCalibrationTable":
+        """Parse calibration entries from legacy ``calib_grf.dat`` or delta-format text."""
+        fmt_mode = fmt.strip().lower()
+        header_hint: Optional[str] = None
+        entries: List[SlownessCalibrationEntry] = []
+
+        for raw_line in text.splitlines():
+            line = raw_line.rstrip("\r\n")
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("!"):
+                continue
+            if stripped.startswith("#"):
+                hdr = stripped[1:].lower()
+                if any(k in hdr for k in ("d_slowness", "d_azimuth", "dslow", "daz", "delta")):
+                    header_hint = "delta"
+                elif any(k in hdr for k in ("s_corr", "az_corr", "scorr", "azcorr")):
+                    header_hint = "abs"
+                continue
+
+            entry = cls._parse_line(line, fmt_mode=fmt_mode, header_hint=header_hint)
+            if entry is not None:
+                entries.append(entry)
+
+        return cls(entries=entries, source_path=source_path)
+
+    @staticmethod
+    def _parse_line(
+        line: str,
+        fmt_mode: str = "auto",
+        header_hint: Optional[str] = None,
+    ) -> Optional[SlownessCalibrationEntry]:
+        if fmt_mode == "legacy":
+            if len(line) <= CALC_STARTPOS:
+                return None
+            toks = line[CALC_STARTPOS:].split()
+            if len(toks) < 4:
+                return None
+            try:
+                s0, a0, sc, ac = (float(toks[0]), float(toks[1]), float(toks[2]), float(toks[3]))
+            except ValueError:
+                return None
+            return SlownessCalibrationEntry(
+                s_meas=s0,
+                az_meas=a0 % 360.0,
+                s_corr=sc,
+                az_corr=ac % 360.0,
+                comment=line[:CALC_STARTPOS].strip(),
+            )
+
+        if fmt_mode == "delta":
+            clean = line.split("#", 1)[0].split("!", 1)[0].strip()
+            toks = clean.split()
+            if len(toks) < 4:
+                return None
+            try:
+                s0, a0, ds, daz = (float(toks[0]), float(toks[1]), float(toks[2]), float(toks[3]))
+            except ValueError:
+                return None
+            return SlownessCalibrationEntry(
+                s_meas=s0,
+                az_meas=a0 % 360.0,
+                s_corr=max(0.0, s0 + ds),
+                az_corr=(a0 + daz) % 360.0,
+                comment="",
+            )
+
+        # Auto-detection: check if line starts directly with 4 float tokens (delta/compact format)
+        clean = line.split("#", 1)[0].split("!", 1)[0].strip()
+        toks = clean.split()
+        direct_floats: Optional[Tuple[float, float, float, float]] = None
+        if len(toks) >= 4:
+            try:
+                direct_floats = (float(toks[0]), float(toks[1]), float(toks[2]), float(toks[3]))
+            except ValueError:
+                direct_floats = None
+
+        if direct_floats is not None:
+            s0, a0, v3, v4 = direct_floats
+            if header_hint == "abs":
+                return SlownessCalibrationEntry(
+                    s_meas=s0,
+                    az_meas=a0 % 360.0,
+                    s_corr=v3,
+                    az_corr=v4 % 360.0,
+                )
+            return SlownessCalibrationEntry(
+                s_meas=s0,
+                az_meas=a0 % 360.0,
+                s_corr=max(0.0, s0 + v3),
+                az_corr=(a0 + v4) % 360.0,
+            )
+
+        # Otherwise fall back to legacy CALC_STARTPOS=26 format
+        if len(line) > CALC_STARTPOS:
+            legacy_toks = line[CALC_STARTPOS:].split()
+            if len(legacy_toks) >= 4:
+                try:
+                    s0, a0, sc, ac = (
+                        float(legacy_toks[0]),
+                        float(legacy_toks[1]),
+                        float(legacy_toks[2]),
+                        float(legacy_toks[3]),
+                    )
+                    return SlownessCalibrationEntry(
+                        s_meas=s0,
+                        az_meas=a0 % 360.0,
+                        s_corr=sc,
+                        az_corr=ac % 360.0,
+                        comment=line[:CALC_STARTPOS].strip(),
+                    )
+                except ValueError:
+                    return None
+        return None
+
+    @classmethod
+    def from_file(cls, filepath: str, fmt: str = "auto") -> "SlownessCalibrationTable":
+        """Load slowness calibration table from disk."""
+        if not os.path.isfile(filepath):
+            raise FileNotFoundError(f"Slowness calibration file not found: {filepath}")
+        with open(filepath, "r", encoding="latin-1", errors="ignore") as fh:
+            text = fh.read()
+        return cls.from_text(text, fmt=fmt, source_path=filepath)
+
+    def calibrate(
+        self,
+        slowness_meas: float,
+        azim_meas: float,
+        k: int = 8,
+        power: float = 2.0,
+    ) -> Tuple[float, float, float, float]:
+        """Interpolate empirical correction at ``(slowness_meas, azim_meas)``.
+
+        Returns ``(slowness_cal, azim_cal, d_slowness, d_azim)`` where:
+        - ``slowness_cal`` is in s/deg,
+        - ``azim_cal`` is in [0, 360) deg,
+        - ``d_slowness = slowness_cal - slowness_meas``,
+        - ``d_azim`` is wrapped into [-180, 180) deg.
+        """
+        s_in = float(slowness_meas)
+        az_in = float(azim_meas) % 360.0
+        if not self.entries:
+            return s_in, az_in, 0.0, 0.0
+
+        az_r = math.radians(az_in)
+        u_q = s_in * math.sin(az_r)
+        v_q = s_in * math.cos(az_r)
+
+        d2 = (self._u_meas - u_q) ** 2 + (self._v_meas - v_q) ** 2
+        exact_mask = d2 <= 1e-12
+        if np.any(exact_mask):
+            du_interp = float(np.mean(self._du[exact_mask]))
+            dv_interp = float(np.mean(self._dv[exact_mask]))
+        else:
+            n_pts = self._u_meas.size
+            k_eff = min(max(1, int(k)), n_pts)
+            if k_eff < n_pts:
+                idx = np.argpartition(d2, k_eff - 1)[:k_eff]
+            else:
+                idx = np.arange(n_pts)
+            dists = np.sqrt(np.maximum(1e-24, d2[idx]))
+            weights = 1.0 / np.maximum(1e-12, dists ** float(power))
+            w_sum = float(np.sum(weights))
+            if w_sum <= 1e-30:
+                du_interp = float(np.mean(self._du[idx]))
+                dv_interp = float(np.mean(self._dv[idx]))
+            else:
+                weights = weights / w_sum
+                du_interp = float(np.sum(weights * self._du[idx]))
+                dv_interp = float(np.sum(weights * self._dv[idx]))
+
+        u_cal = u_q + du_interp
+        v_cal = v_q + dv_interp
+        s_cal = math.hypot(u_cal, v_cal)
+        az_cal = math.degrees(math.atan2(u_cal, v_cal)) % 360.0 if s_cal > 1e-12 else az_in
+        d_slo = s_cal - s_in
+        d_az = ((az_cal - az_in + 180.0) % 360.0) - 180.0
+        return float(s_cal), float(az_cal), float(d_slo), float(d_az)
+
+
+def load_calibration_for_array(
+    stations_or_name: Union[str, Sequence[str]],
+    inputs_dir: Optional[str] = None,
+    config: Optional[SHMConfig] = None,
+) -> Optional[SlownessCalibrationTable]:
+    """Look up and load an empirical slowness calibration table via ``calib_lookup.txt``.
+
+    Returns ``None`` gracefully if ``calib_lookup.txt`` or the target calibration
+    file is missing, or if no matching array/station entry is found.
+    """
+    inp_dir = inputs_dir or (config.inputs_dir if config is not None else os.path.join(SHM_DEFAULT_ROOT, "inputs"))
+    if not inp_dir or not os.path.isdir(inp_dir):
+        return None
+
+    lookup_path = os.path.join(inp_dir, "calib_lookup.txt")
+    if not os.path.isfile(lookup_path):
+        return None
+
+    query_set: set[str] = set()
+    if isinstance(stations_or_name, str):
+        nm = stations_or_name.strip().upper()
+        if nm:
+            query_set.add(nm)
+            if config is not None and nm in getattr(config, "station_groups", {}):
+                query_set.update(s.upper() for s in config.station_groups[nm])
+    else:
+        for s in stations_or_name:
+            su = str(s).strip().upper()
+            if su:
+                query_set.add(su)
+
+    if not query_set:
+        return None
+
+    try:
+        with open(lookup_path, "r", encoding="latin-1", errors="ignore") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return None
+
+    for raw in lines:
+        s = raw.strip()
+        if not s or s.startswith("!") or s.startswith("#"):
+            continue
+        parts = s.split()
+        if len(parts) < 2:
+            continue
+        stat_tokens = {tok.strip().upper() for tok in parts[0].split(",") if tok.strip()}
+        cal_filename = parts[1].strip()
+        matched = bool(query_set & stat_tokens)
+        if not matched and "GRF" in query_set and "grf" in cal_filename.lower():
+            matched = True
+        if matched:
+            cal_path = cal_filename if os.path.isabs(cal_filename) else os.path.join(inp_dir, cal_filename)
+            if os.path.isfile(cal_path):
+                return SlownessCalibrationTable.from_file(cal_path)
+            return None
+    return None
+
+
+def _resolve_calib_table(
+    calib_table: Optional[SlownessCalibrationTable],
+    apply_calibration: Optional[bool],
+    stations: Optional[Sequence[str]] = None,
+    config: Optional[SHMConfig] = None,
+) -> Optional[SlownessCalibrationTable]:
+    if apply_calibration is False:
+        return None
+    if calib_table is not None:
+        return calib_table if len(calib_table) > 0 else None
+    if apply_calibration is True and stations:
+        tbl = load_calibration_for_array(stations, config=config)
+        if tbl is not None and len(tbl) > 0:
+            return tbl
+    return None
+
 
 def plane_wave_locate(
     arrival_times: List[float],
@@ -85,6 +411,10 @@ def plane_wave_locate(
     elev_m: Optional[List[float]] = None,
     vp_kms: Optional[List[float]] = None,
     dt: float = 0.05,
+    calib_table: Optional[SlownessCalibrationTable] = None,
+    apply_calibration: Optional[bool] = None,
+    stations: Optional[Sequence[str]] = None,
+    config: Optional[SHMConfig] = None,
 ) -> Dict[str, Any]:
     """Fit plane-wave backazimuth (deg) and slowness (s/deg) with uncertainties and station residuals
     matching mt_locate in shmath.c.
@@ -172,15 +502,46 @@ def plane_wave_locate(
     t_pred = xc * sx + yc * sy
     residuals = tc_work - t_pred
 
-    return {
-        "azimuth": float(azimuth % 360.0),
+    raw_az = float(azimuth % 360.0)
+    raw_slo = float(slowness)
+    out: Dict[str, Any] = {
+        "azimuth": raw_az,
         "d_azimuth": float(azimerr),
-        "slowness": float(slowness),
+        "slowness": raw_slo,
         "d_slowness": float(slowerr),
         "residuals": [float(r) for r in residuals],
         "sx": float(sx),
         "sy": float(sy),
+        "calib_applied": False,
     }
+
+    active_table = _resolve_calib_table(calib_table, apply_calibration, stations=stations, config=config)
+    if active_table is not None:
+        cal_slo, cal_az, d_slo, d_az = active_table.calibrate(raw_slo, raw_az)
+        cal_az_r = math.radians(cal_az)
+        cal_s_km = cal_slo / DEG_TO_KM
+        cal_sx = -cal_s_km * math.sin(cal_az_r)
+        cal_sy = -cal_s_km * math.cos(cal_az_r)
+        out.update(
+            {
+                "azimuth": cal_az,
+                "slowness": cal_slo,
+                "sx": float(cal_sx),
+                "sy": float(cal_sy),
+                "calib_applied": True,
+                "raw_azimuth": raw_az,
+                "raw_slowness": raw_slo,
+                "raw_sx": float(sx),
+                "raw_sy": float(sy),
+                "cal_azimuth": cal_az,
+                "cal_slowness": cal_slo,
+                "cal_sx": float(cal_sx),
+                "cal_sy": float(cal_sy),
+                "calib_d_slowness": float(d_slo),
+                "calib_d_azimuth": float(d_az),
+            }
+        )
+    return out
 
 
 def beam_delays_sec(
@@ -364,6 +725,8 @@ def compute_fk_analysis(
     grid_points: int = 41,
     config: Optional[SHMConfig] = None,
     progress_callback: Optional[Callable[[int, int], bool]] = None,
+    calib_table: Optional[SlownessCalibrationTable] = None,
+    apply_calibration: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Wideband coherent Frequency-Wavenumber (FK) analysis with 9-point 2D quadratic sub-grid
     peak interpolation matching fkwid.c.
@@ -464,7 +827,7 @@ def compute_fk_analysis(
     app_vel = (DEG_TO_KM / slowness) if slowness > 1e-6 else 999.9
     power_db = 10.0 * math.log10(max(1e-6, peak_power))
 
-    return {
+    out: Dict[str, Any] = {
         "azimuth": baz_deg,
         "slowness": slowness,
         "apparent_velocity_kms": app_vel,
@@ -474,7 +837,37 @@ def compute_fk_analysis(
         "sy": sy_peak,
         "s_axis": s_axis,
         "grid": semblance_grid,
+        "calib_applied": False,
     }
+
+    active_table = _resolve_calib_table(calib_table, apply_calibration, stations=stations, config=cfg)
+    if active_table is not None:
+        cal_slo, cal_az, d_slo, d_az = active_table.calibrate(slowness, baz_deg)
+        cal_az_r = math.radians(cal_az)
+        cal_sx = cal_slo * math.sin(cal_az_r)
+        cal_sy = cal_slo * math.cos(cal_az_r)
+        cal_app_vel = (DEG_TO_KM / cal_slo) if cal_slo > 1e-6 else 999.9
+        out.update(
+            {
+                "azimuth": cal_az,
+                "slowness": cal_slo,
+                "apparent_velocity_kms": cal_app_vel,
+                "sx": float(cal_sx),
+                "sy": float(cal_sy),
+                "calib_applied": True,
+                "raw_azimuth": baz_deg,
+                "raw_slowness": slowness,
+                "raw_sx": sx_peak,
+                "raw_sy": sy_peak,
+                "cal_azimuth": cal_az,
+                "cal_slowness": cal_slo,
+                "cal_sx": float(cal_sx),
+                "cal_sy": float(cal_sy),
+                "calib_d_slowness": float(d_slo),
+                "calib_d_azimuth": float(d_az),
+            }
+        )
+    return out
 
 
 def locate_by_slowness_azimuth(
@@ -486,6 +879,8 @@ def locate_by_slowness_azimuth(
     depth_km: float = 33.0,
     config: Optional[SHMConfig] = None,
     ttt: Optional[TravelTimeManager] = None,
+    calib_table: Optional[SlownessCalibrationTable] = None,
+    apply_calibration: Optional[bool] = None,
 ) -> AnalysisParamSet:
     """Invert observed array slowness & backazimuth for epicentral distance, (lat, lon), origin time,
     and Flinn-Engdahl region matching Locate -> By Slowness in cblib.c / earthloc.c.
@@ -494,19 +889,66 @@ def locate_by_slowness_azimuth(
     tm = ttt or get_ttt_manager(cfg.inputs_dir)
     stat = cfg.get_station(station_code)
 
-    dist_deg = tm.distance_from_slowness(phase_name, slowness_s_deg, depth_km)
-    if dist_deg is None:
-        dist_deg = max(1.0, (11.0 - slowness_s_deg) * 10.0)
+    raw_slo = float(slowness_s_deg)
+    raw_baz = float(baz_deg) % 360.0
 
-    tt_sec = tm.travel_time(phase_name, dist_deg, depth_km) or (dist_deg * slowness_s_deg)
+    active_table = _resolve_calib_table(
+        calib_table,
+        apply_calibration,
+        stations=[station_code],
+        config=cfg,
+    )
+
+    eff_slo = raw_slo
+    eff_baz = raw_baz
+    res_meta: Optional[Dict[str, float]] = None
+    comment_str = ""
+
+    if active_table is not None:
+        raw_dist = tm.distance_from_slowness(phase_name, raw_slo, depth_km)
+        if raw_dist is None:
+            raw_dist = max(1.0, (11.0 - raw_slo) * 10.0)
+        raw_lat, raw_lon = sphere_add(stat.lat, stat.lon, raw_dist, raw_baz)
+
+        cal_slo, cal_baz, d_slo, d_az = active_table.calibrate(raw_slo, raw_baz)
+        eff_slo = cal_slo
+        eff_baz = cal_baz
+        comment_str = (
+            f"Calibrated slo {raw_slo:.2f}->{cal_slo:.2f} s/deg, "
+            f"baz {raw_baz:.1f}->{cal_baz:.1f} deg"
+        )
+    else:
+        raw_dist = 0.0
+        raw_lat, raw_lon = 0.0, 0.0
+
+    dist_deg = tm.distance_from_slowness(phase_name, eff_slo, depth_km)
+    if dist_deg is None:
+        dist_deg = max(1.0, (11.0 - eff_slo) * 10.0)
+
+    tt_sec = tm.travel_time(phase_name, dist_deg, depth_km) or (dist_deg * eff_slo)
     orig_epoch = onset_epoch - tt_sec
-    lat, lon = sphere_add(stat.lat, stat.lon, dist_deg, baz_deg)
+    lat, lon = sphere_add(stat.lat, stat.lon, dist_deg, eff_baz)
     igreg, grname, isreg, srname = cfg.fer.lookup(lat, lon)
+
+    if active_table is not None:
+        res_meta = {
+            "calib_applied": 1.0,
+            "raw_slowness": raw_slo,
+            "raw_azimuth": raw_baz,
+            "raw_distance": float(raw_dist),
+            "raw_lat": float(raw_lat),
+            "raw_lon": float(raw_lon),
+            "cal_slowness": float(eff_slo),
+            "cal_azimuth": float(eff_baz),
+            "cal_distance": float(dist_deg),
+            "cal_lat": float(lat),
+            "cal_lon": float(lon),
+        }
 
     return AnalysisParamSet(
         distance=dist_deg,
-        azimuth=baz_deg,
-        slowness=slowness_s_deg,
+        azimuth=eff_baz,
+        slowness=eff_slo,
         depth=depth_km,
         origin=format_sh_time(orig_epoch),
         lat=lat,
@@ -519,6 +961,8 @@ def locate_by_slowness_azimuth(
         ref_lat=stat.lat,
         ref_lon=stat.lon,
         source=station_code,
+        comment=comment_str,
+        residuals=res_meta,
     )
 
 
@@ -1290,3 +1734,557 @@ def compute_trace_window_magnitudes(
         "ms": ms,
         "mbb": mbb,
     }
+
+
+# ---------------------------------------------------------------------------
+# M-15: Beamforming Channel Residuals, Coherence & 2D Array Response Function
+# ---------------------------------------------------------------------------
+
+POOR_ELEMENT_CC_THRESHOLD = 0.70
+
+
+def compute_beam_diagnostics(
+    traces: Sequence[Trace],
+    azimuth_deg: float,
+    slowness_s_deg: float,
+    t_lo: Optional[float] = None,
+    t_hi: Optional[float] = None,
+    ref_station: str = "CENTRE",
+    config: Optional[SHMConfig] = None,
+) -> Dict[str, Any]:
+    """Compute aligned channel waveforms, beam ``b(t)``, channel residual waveforms
+    ``r_m(t) = u_m(t + tau_m) - b(t)``, cross-correlation coefficients ``CC_m in [-1, 1]``,
+    RMS residual envelope, and poor-element flags (``CC_m < 0.70``).
+    """
+    if not traces:
+        raise ValueError("Cannot compute beam diagnostics from empty trace list")
+
+    cfg = config or get_config()
+    trace_list = list(traces)
+    stations = [tr.station for tr in trace_list]
+    rel_coords = cfg.relative_xy_km(stations, ref_station=ref_station)
+    x_km = [c[0] for c in rel_coords]
+    y_km = [c[1] for c in rel_coords]
+    elev_m = [c[2] for c in rel_coords]
+    vp_kms = [c[3] for c in rel_coords]
+
+    delays = beam_delays_sec(x_km, y_km, azimuth_deg, slowness_s_deg, elev_m=elev_m, vp_kms=vp_kms)
+    t0, _dt, grid_t, aligned = resample_traces_to_common_grid(
+        trace_list,
+        offsets_sec=delays,
+        include_display_offset=False,
+        shift_grid_bounds=False,
+    )
+
+    t_rel_full = grid_t - t0
+    if t_lo is not None and t_hi is not None:
+        lo_v = min(float(t_lo), float(t_hi))
+        hi_v = max(float(t_lo), float(t_hi))
+        # Support either relative seconds or absolute POSIX epoch seconds
+        t_cmp = grid_t if (lo_v > 1e7 and t0 > 1e7) else t_rel_full
+        mask = (t_cmp >= lo_v - 1e-9) & (t_cmp <= hi_v + 1e-9)
+        if int(np.count_nonzero(mask)) >= 3:
+            t_rel = t_rel_full[mask]
+            aligned_segs = [a[mask] for a in aligned]
+        else:
+            t_rel = t_rel_full
+            aligned_segs = aligned
+    else:
+        t_rel = t_rel_full
+        aligned_segs = aligned
+
+    mat = np.vstack(aligned_segs)  # (M, L)
+    beam = np.mean(mat, axis=0)
+    res_mat = mat - beam[None, :]
+    mean_residual = np.sqrt(np.mean(res_mat ** 2, axis=0))
+
+    b_zm = beam - np.mean(beam)
+    norm_b = float(np.linalg.norm(b_zm))
+
+    cc_list: List[float] = []
+    channel_rms: List[float] = []
+    channel_names: List[str] = []
+    channel_ids: List[str] = []
+    poor_indices: List[int] = []
+    poor_channels: List[str] = []
+
+    for idx, tr in enumerate(trace_list):
+        u_zm = mat[idx] - np.mean(mat[idx])
+        norm_u = float(np.linalg.norm(u_zm))
+        if norm_u > 1e-30 and norm_b > 1e-30:
+            cc_val = float(np.clip(np.dot(u_zm, b_zm) / (norm_u * norm_b), -1.0, 1.0))
+        else:
+            cc_val = 0.0
+        rms_val = float(np.sqrt(np.mean(res_mat[idx] ** 2)))
+
+        cc_list.append(cc_val)
+        channel_rms.append(rms_val)
+        channel_names.append(tr.station)
+        channel_ids.append(f"{tr.station}.{tr.comp or 'Z'}")
+        if cc_val < POOR_ELEMENT_CC_THRESHOLD:
+            poor_indices.append(idx)
+            poor_channels.append(tr.station)
+
+    return {
+        "beam_time": t_rel,
+        "beam_waveform": beam,
+        "aligned_waveforms": mat,
+        "channel_residuals": res_mat,
+        "mean_residual": mean_residual,
+        "channel_rms": channel_rms,
+        "channel_cc": cc_list,
+        "channel_names": channel_names,
+        "channel_ids": channel_ids,
+        "poor_channels": poor_channels,
+        "poor_indices": poor_indices,
+        "mean_cc": float(np.mean(cc_list)) if cc_list else 0.0,
+        "delays_sec": [float(d) for d in delays],
+        "azimuth_deg": float(azimuth_deg % 360.0),
+        "slowness_s_deg": float(slowness_s_deg),
+    }
+
+
+def compute_array_response_function(
+    x_km: Sequence[float],
+    y_km: Sequence[float],
+    slowness_max: float = 20.0,
+    n_grid: int = 101,
+    freq_hz: Union[float, Sequence[float]] = 1.0,
+) -> Dict[str, Any]:
+    """Compute the 2D Array Response Function (ARF) on a symmetric ``(sx, sy)`` slowness grid:
+
+        |A(k)|^2 = (1 / M^2) * | sum_m exp(i * k . x_m) |^2
+
+    with ``k . x_m = 2 * pi * f * (sx * x_deg_m + sy * y_deg_m)``.
+    """
+    x_arr = np.asarray(x_km, dtype=np.float64)
+    y_arr = np.asarray(y_km, dtype=np.float64)
+    if x_arr.size == 0 or x_arr.size != y_arr.size:
+        raise ValueError("x_km and y_km must be non-empty sequences of equal length")
+
+    m_stat = x_arr.size
+    x_deg = x_arr / DEG_TO_KM
+    y_deg = y_arr / DEG_TO_KM
+
+    g_size = max(3, int(n_grid))
+    s_max = float(slowness_max)
+    s_axis = np.linspace(-s_max, s_max, g_size, dtype=np.float64)
+    sx_grid, sy_grid = np.meshgrid(s_axis, s_axis)
+
+    tau = sx_grid[:, :, None] * x_deg[None, None, :] + sy_grid[:, :, None] * y_deg[None, None, :]
+
+    if isinstance(freq_hz, (int, float)):
+        freqs = [float(freq_hz)]
+    else:
+        freqs = [float(f) for f in freq_hz]
+        if not freqs:
+            freqs = [1.0]
+
+    arf_sum = np.zeros((g_size, g_size), dtype=np.float64)
+    inv_m2 = 1.0 / float(m_stat * m_stat)
+    for f_val in freqs:
+        omega = 2.0 * math.pi * f_val
+        resp = np.sum(np.exp(1j * omega * tau), axis=2)
+        arf_sum += (np.abs(resp) ** 2) * inv_m2
+
+    arf_grid = arf_sum / float(len(freqs))
+    arf_db = 10.0 * np.log10(np.maximum(1e-6, arf_grid))
+
+    return {
+        "s_axis": s_axis,
+        "sx_grid": sx_grid,
+        "sy_grid": sy_grid,
+        "arf_grid": arf_grid,
+        "arf_db": arf_db,
+        "freq_hz": freq_hz,
+        "slowness_max": s_max,
+        "peak_value": float(np.max(arf_grid)),
+    }
+
+
+def build_fk_fit_diagnostic(
+    fk_result: Dict[str, Any],
+    beam_diag: Optional[Dict[str, Any]] = None,
+    arf_result: Optional[Dict[str, Any]] = None,
+    calib_info: Optional[Dict[str, Any]] = None,
+    fit_type: FitType = FitType.FK_SEMBLANCE,
+) -> FitDiagnosticResult:
+    """Build a ``FitDiagnosticResult`` from FK/plane-wave results, beam diagnostics,
+    2D ARF, and optional calibration metadata for ``FitDiagnosticWindow`` Tab 3.
+    """
+    src_cal = calib_info if calib_info is not None else fk_result
+    calib_applied = bool(src_cal.get("calib_applied", False))
+
+    cur_slo = float(fk_result.get("slowness", 0.0))
+    cur_baz = float(fk_result.get("azimuth", 0.0)) % 360.0
+    cur_sx = float(fk_result.get("sx", cur_slo * math.sin(math.radians(cur_baz))))
+    cur_sy = float(fk_result.get("sy", cur_slo * math.cos(math.radians(cur_baz))))
+
+    if calib_applied:
+        raw_slo = float(src_cal.get("raw_slowness", cur_slo))
+        raw_baz = float(src_cal.get("raw_azimuth", src_cal.get("raw_baz", cur_baz))) % 360.0
+        raw_sx = float(src_cal.get("raw_sx", raw_slo * math.sin(math.radians(raw_baz))))
+        raw_sy = float(src_cal.get("raw_sy", raw_slo * math.cos(math.radians(raw_baz))))
+        cal_slo = float(src_cal.get("cal_slowness", cur_slo))
+        cal_baz = float(src_cal.get("cal_azimuth", src_cal.get("cal_baz", cur_baz))) % 360.0
+        cal_sx = float(src_cal.get("cal_sx", cal_slo * math.sin(math.radians(cal_baz))))
+        cal_sy = float(src_cal.get("cal_sy", cal_slo * math.cos(math.radians(cal_baz))))
+    else:
+        raw_slo, raw_baz, raw_sx, raw_sy = cur_slo, cur_baz, cur_sx, cur_sy
+        cal_slo, cal_baz, cal_sx, cal_sy = cur_slo, cur_baz, cur_sx, cur_sy
+
+    residual_entries: List[ResidualEntry] = []
+    channel_cc: List[float] = []
+    channel_names: List[str] = []
+
+    if beam_diag is not None:
+        channel_cc = [float(c) for c in beam_diag.get("channel_cc", [])]
+        channel_names = [str(n) for n in beam_diag.get("channel_names", [])]
+        ch_rms_list = [float(r) for r in beam_diag.get("channel_rms", [0.0] * len(channel_cc))]
+        for idx, (st_name, cc_val) in enumerate(zip(channel_names, channel_cc)):
+            res_val = 1.0 - cc_val
+            is_poor = cc_val < POOR_ELEMENT_CC_THRESHOLD
+            ch_rms = ch_rms_list[idx] if idx < len(ch_rms_list) else 0.0
+            residual_entries.append(
+                ResidualEntry(
+                    identifier=f"{st_name}.Z.BEAM",
+                    observed=1.0,
+                    calculated=cc_val,
+                    residual=res_val,
+                    normalized_residual=res_val / 0.30,
+                    weight=0.0 if is_poor else 1.0,
+                    uncertainty=0.30,
+                    station=st_name,
+                    phase="BEAM",
+                    channel="Z",
+                    is_outlier=is_poor,
+                    extra_attributes={
+                        "predicted": cc_val,
+                        "cc": cc_val,
+                        "channel_rms": ch_rms,
+                    },
+                )
+            )
+
+    res_vals = [e.residual for e in residual_entries] if residual_entries else [
+        1.0 - float(fk_result.get("semblance", 1.0))
+    ]
+    rmse = compute_rmse(res_vals)
+    mad_val = compute_mad(res_vals)
+    outlier_count = sum(1 for e in residual_entries if e.is_outlier)
+    dof = max(1, len(res_vals) - 2)
+    chi2_red = compute_reduced_chi2(res_vals, uncertainties=[0.30] * len(res_vals), dof=dof)
+
+    d_slo = float(fk_result.get("d_slowness", 0.5))
+    d_baz = float(fk_result.get("d_azimuth", 3.0))
+    params: Dict[str, ParameterUncertainty] = {
+        "slowness": ParameterUncertainty(
+            name="slowness",
+            value=cal_slo if calib_applied else cur_slo,
+            standard_error=d_slo,
+            confidence_interval_95=(
+                max(0.0, (cal_slo if calib_applied else cur_slo) - 1.96 * d_slo),
+                (cal_slo if calib_applied else cur_slo) + 1.96 * d_slo,
+            ),
+            unit="s/deg",
+        ),
+        "backazimuth": ParameterUncertainty(
+            name="backazimuth",
+            value=cal_baz if calib_applied else cur_baz,
+            standard_error=d_baz,
+            confidence_interval_95=(
+                ((cal_baz if calib_applied else cur_baz) - 1.96 * d_baz) % 360.0,
+                ((cal_baz if calib_applied else cur_baz) + 1.96 * d_baz) % 360.0,
+            ),
+            unit="deg",
+        ),
+    }
+    if "semblance" in fk_result:
+        semb = float(fk_result["semblance"])
+        params["semblance"] = ParameterUncertainty(
+            name="semblance",
+            value=semb,
+            standard_error=0.0,
+            confidence_interval_95=(semb, semb),
+            unit="",
+        )
+
+    s_axis_arr = np.asarray(fk_result.get("s_axis", np.array([])), dtype=np.float64)
+    fk_grid_arr = np.asarray(fk_result.get("grid", np.array([])), dtype=np.float64)
+    arf_grid_arr = (
+        np.asarray(arf_result.get("arf_grid", np.array([])), dtype=np.float64)
+        if arf_result is not None
+        else np.array([], dtype=np.float64)
+    )
+    if s_axis_arr.size == 0 and arf_result is not None and "s_axis" in arf_result:
+        s_axis_arr = np.asarray(arf_result["s_axis"], dtype=np.float64)
+
+    overlay_curves: Dict[str, np.ndarray] = {
+        "s_axis": s_axis_arr,
+        "fk_grid": fk_grid_arr,
+        "arf_grid": arf_grid_arr,
+        "beam_time": (
+            np.asarray(beam_diag.get("beam_time", np.array([])), dtype=np.float64)
+            if beam_diag is not None
+            else np.array([], dtype=np.float64)
+        ),
+        "beam_waveform": (
+            np.asarray(beam_diag.get("beam_waveform", np.array([])), dtype=np.float64)
+            if beam_diag is not None
+            else np.array([], dtype=np.float64)
+        ),
+        "mean_residual": (
+            np.asarray(beam_diag.get("mean_residual", np.array([])), dtype=np.float64)
+            if beam_diag is not None
+            else np.array([], dtype=np.float64)
+        ),
+        "channel_residuals": (
+            np.asarray(beam_diag.get("channel_residuals", np.array([])), dtype=np.float64)
+            if beam_diag is not None
+            else np.array([], dtype=np.float64)
+        ),
+    }
+
+    context_data: Dict[str, Any] = {
+        "calib_applied": calib_applied,
+        "raw_sx": raw_sx,
+        "raw_sy": raw_sy,
+        "cal_sx": cal_sx,
+        "cal_sy": cal_sy,
+        "raw_slowness": raw_slo,
+        "raw_baz": raw_baz,
+        "cal_slowness": cal_slo,
+        "cal_baz": cal_baz,
+        "channel_cc": channel_cc,
+        "channel_names": channel_names,
+        "poor_channels": list(beam_diag.get("poor_channels", [])) if beam_diag is not None else [],
+    }
+
+    return FitDiagnosticResult(
+        fit_type=fit_type,
+        title="Array FK & Beamforming Diagnostics",
+        converged=True,
+        iterations=1,
+        dof=dof,
+        rmse=round(rmse, 4),
+        wrmse=round(rmse, 4),
+        mad=round(mad_val, 4),
+        chi2_reduced=round(chi2_red, 4),
+        parameters=params,
+        residuals=residual_entries,
+        outlier_count=outlier_count,
+        overlay_curves=overlay_curves,
+        context_data=context_data,
+    )
+
+
+# ---------------------------------------------------------------------------
+# M-18: Automated Phase Identification
+# ---------------------------------------------------------------------------
+
+DEFAULT_IDENTIFY_PHASES: Tuple[str, ...] = (
+    "P",
+    "Pdiff",
+    "PKPdf",
+    "PKPab",
+    "PKPbc",
+    "pP",
+    "sP",
+    "PP",
+    "PPP",
+    "PcP",
+    "S",
+    "Sdiff",
+    "SKSdf",
+    "sS",
+    "SS",
+    "ScS",
+)
+
+
+def identify_phase(
+    t_obs_rel_sec: float,
+    slowness_meas_s_deg: float,
+    dist_deg: float,
+    depth_km: float = 10.0,
+    baz_meas_deg: Optional[float] = None,
+    baz_theo_deg: Optional[float] = None,
+    sigma_t: float = 2.0,
+    sigma_s: float = 1.0,
+    w_t: float = 1.0,
+    w_s: float = 1.0,
+    candidate_phases: Optional[Sequence[str]] = None,
+    ttt: Optional[TravelTimeManager] = None,
+    sigma_az: float = 10.0,
+    w_az: float = 0.25,
+) -> List[Dict[str, Any]]:
+    """Identify seismic phases by matching observed relative travel time ``t_obs_rel_sec``
+    and measured horizontal slowness ``slowness_meas_s_deg`` (plus optional backazimuth)
+    against 1D velocity-model tables in ``TravelTimeManager``.
+
+    Evaluates composite misfit:
+        chi2_p = w_t * ((t_obs - T_p) / sigma_t)^2 + w_s * ((s_meas - p_p) / sigma_s)^2 [+ az term]
+    and returns candidate dicts sorted by ascending ``chi2`` with normalized softmax probabilities.
+    """
+    tm = ttt or get_ttt_manager()
+    phases = list(candidate_phases) if candidate_phases is not None else list(DEFAULT_IDENTIFY_PHASES)
+
+    sig_t = max(1e-6, float(sigma_t))
+    sig_s = max(1e-6, float(sigma_s))
+    sig_az = max(1e-6, float(sigma_az))
+    wt = max(0.0, float(w_t))
+    ws = max(0.0, float(w_s))
+    waz = max(0.0, float(w_az))
+
+    use_baz = baz_meas_deg is not None and baz_theo_deg is not None and waz > 0.0
+    if use_baz:
+        baz_resid = ((float(baz_meas_deg) - float(baz_theo_deg) + 180.0) % 360.0) - 180.0
+        chi2_baz = waz * ((baz_resid / sig_az) ** 2)
+    else:
+        baz_resid = 0.0
+        chi2_baz = 0.0
+
+    candidates: List[Dict[str, Any]] = []
+    for ph in phases:
+        t_pred = tm.travel_time(ph, float(dist_deg), float(depth_km))
+        if t_pred is None or t_pred <= 0.0:
+            continue
+
+        s_pred = tm.slowness(ph, float(dist_deg), float(depth_km))
+        if ws > 0.0 and s_pred is None:
+            continue
+
+        t_resid = float(t_obs_rel_sec) - float(t_pred)
+        s_resid = (float(slowness_meas_s_deg) - float(s_pred)) if s_pred is not None else 0.0
+
+        chi2 = wt * ((t_resid / sig_t) ** 2)
+        if ws > 0.0 and s_pred is not None:
+            chi2 += ws * ((s_resid / sig_s) ** 2)
+        chi2 += chi2_baz
+
+        entry: Dict[str, Any] = {
+            "phase": ph,
+            "chi2": float(chi2),
+            "t_pred": float(t_pred),
+            "s_pred": float(s_pred) if s_pred is not None else None,
+            "t_resid": float(t_resid),
+            "s_resid": float(s_resid),
+            "probability": 0.0,
+        }
+        if use_baz:
+            entry["baz_resid"] = float(baz_resid)
+        candidates.append(entry)
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda item: item["chi2"])
+    min_chi2 = candidates[0]["chi2"]
+    raw_likes = [math.exp(-0.5 * min(500.0, c["chi2"] - min_chi2)) for c in candidates]
+    like_sum = sum(raw_likes)
+    if like_sum > 0.0:
+        for c, lk in zip(candidates, raw_likes):
+            c["probability"] = float(lk / like_sum)
+    else:
+        candidates[0]["probability"] = 1.0
+
+    return candidates
+
+
+def identify_trace_picks(
+    traces: Sequence[Trace],
+    origin_epoch: float,
+    dist_deg: float,
+    depth_km: float = 10.0,
+    baz_theo_deg: Optional[float] = None,
+    default_slowness: Optional[float] = None,
+    default_baz: Optional[float] = None,
+    update_pick_names: bool = False,
+    max_chi2: Optional[float] = None,
+    sigma_t: float = 2.0,
+    sigma_s: float = 1.0,
+    w_t: float = 1.0,
+    w_s: float = 1.0,
+    candidate_phases: Optional[Sequence[str]] = None,
+    ttt: Optional[TravelTimeManager] = None,
+    config: Optional[SHMConfig] = None,
+) -> List[Dict[str, Any]]:
+    """Identify phase picks across a list of traces relative to a known event origin.
+
+    Uses calibrated slowness/azimuth (``pk.l_slowness`` / ``pk.l_azim``) when present,
+    falling back to measured pick slowness/azimuth, trace slowness/azimuth, or the
+    supplied ``default_slowness`` / ``default_baz``. When no slowness is available,
+    falls back to travel-time-only matching (``w_s=0.0``).
+    """
+    cfg = config or get_config()
+    tm = ttt or get_ttt_manager(cfg.inputs_dir)
+    results: List[Dict[str, Any]] = []
+
+    for tr in traces:
+        for pk in tr.picks:
+            if not pk.onset:
+                continue
+            t_obs_rel = float(pk.onset_epoch) - float(origin_epoch)
+
+            if pk.l_slowness > 0.0:
+                slo_val: Optional[float] = float(pk.l_slowness)
+            elif pk.slowness > 0.0:
+                slo_val = float(pk.slowness)
+            elif tr.slowness > 0.0:
+                slo_val = float(tr.slowness)
+            else:
+                slo_val = default_slowness
+
+            if pk.l_azim > 0.0:
+                baz_val: Optional[float] = float(pk.l_azim)
+            elif pk.beam_azim > 0.0:
+                baz_val = float(pk.beam_azim)
+            elif tr.azimuth > 0.0:
+                baz_val = float(tr.azimuth)
+            else:
+                baz_val = default_baz
+
+            eff_ws = w_s if (slo_val is not None and slo_val > 0.0) else 0.0
+            slo_arg = float(slo_val) if slo_val is not None else 0.0
+
+            cands = identify_phase(
+                t_obs_rel_sec=t_obs_rel,
+                slowness_meas_s_deg=slo_arg,
+                dist_deg=dist_deg,
+                depth_km=depth_km,
+                baz_meas_deg=baz_val,
+                baz_theo_deg=baz_theo_deg,
+                sigma_t=sigma_t,
+                sigma_s=sigma_s,
+                w_t=w_t,
+                w_s=eff_ws,
+                candidate_phases=candidate_phases,
+                ttt=tm,
+            )
+            if not cands:
+                continue
+
+            best = cands[0]
+            old_name = pk.name
+            accepted = (max_chi2 is None) or (best["chi2"] <= float(max_chi2))
+            if update_pick_names and accepted:
+                pk.name = best["phase"]
+                pk.resid = best["t_resid"]
+
+            results.append(
+                {
+                    "station": tr.station,
+                    "comp": tr.comp,
+                    "old_phase": old_name,
+                    "identified_phase": best["phase"],
+                    "chi2": best["chi2"],
+                    "probability": best["probability"],
+                    "t_resid": best["t_resid"],
+                    "s_resid": best["s_resid"],
+                    "updated": bool(update_pick_names and accepted),
+                    "candidates": cands,
+                    "pick": pk,
+                }
+            )
+    return results
+

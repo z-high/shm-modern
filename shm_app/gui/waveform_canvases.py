@@ -26,8 +26,81 @@ from PyQt6.QtWidgets import QSizePolicy, QWidget
 
 from shm_app.core.models import PhasePick, Trace
 from shm_app.core.time_utils import format_sh_time
+from shm_app.processing.trace_ops import hilbert_transform
 
 CURSOR_LOCK_MODES: Tuple[str, ...] = ("CROSSHAIR", "PEAK_LOCK", "ZERO_LOCK")
+MAGNIFIER_CURSOR_MODES: Tuple[str, ...] = ("STANDARD", "HILBERT", "REFERENCE")
+
+_NAMED_OVERLAY_COLORS = {
+    "red": "#f85149",
+    "green": "#3fb950",
+    "blue": "#58a6ff",
+    "yellow": "#d29922",
+    "amber": "#d29922",
+    "orange": "#ffa657",
+    "purple": "#bc8cff",
+    "magenta": "#bc8cff",
+    "cyan": "#39c5cf",
+}
+_FALLBACK_OVERLAY_PALETTE = ("#f85149", "#3fb950", "#58a6ff", "#ffa657", "#bc8cff", "#39c5cf")
+
+
+def _resolve_overlay_filter_color(color_spec: str, filter_name: str = "") -> QColor:
+    """Resolve overlay filter color name/hex or deterministic fallback palette color."""
+    spec = (color_spec or "").strip()
+    if spec:
+        low = spec.lower()
+        if low in _NAMED_OVERLAY_COLORS:
+            return QColor(_NAMED_OVERLAY_COLORS[low])
+        qc = QColor(spec)
+        if qc.isValid():
+            return qc
+    h = sum(ord(ch) for ch in (filter_name or "FLT"))
+    return QColor(_FALLBACK_OVERLAY_PALETTE[h % len(_FALLBACK_OVERLAY_PALETTE)])
+
+
+def _draw_pick_uncertainty_interval(
+    painter: QPainter,
+    x_lo_raw: float,
+    x_hi_raw: float,
+    y_top: float,
+    height: float,
+    plot_left: float,
+    plot_right: float,
+    base_color: QColor,
+) -> None:
+    """Render shaded [tau - sigma_t, tau + sigma_t] interval and bounded vertical tick marks."""
+    if x_hi_raw < plot_left or x_lo_raw > plot_right:
+        return
+    bx0 = max(plot_left, x_lo_raw)
+    bx1 = min(plot_right, x_hi_raw)
+    band_h = max(2.0, height - 4.0)
+    fill_col = QColor(base_color.red(), base_color.green(), base_color.blue(), 36)
+    painter.fillRect(QRectF(bx0, y_top + 2.0, max(1.0, bx1 - bx0), band_h), fill_col)
+
+    y_mid = y_top + 0.5 * height
+    tick_half = max(3.0, min(14.0, 0.28 * height))
+    tick_top = max(y_top + 2.0, y_mid - tick_half)
+    tick_bot = min(y_top + height - 2.0, y_mid + tick_half)
+
+    bar_col = QColor(base_color.red(), base_color.green(), base_color.blue(), 190)
+    painter.setPen(QPen(bar_col, 1.1))
+    if bx1 > bx0 + 0.5:
+        painter.drawLine(QPointF(bx0, y_mid), QPointF(bx1, y_mid))
+
+    tick_pen = QPen(bar_col.lighter(115), 1.3)
+    painter.setPen(tick_pen)
+    cap = min(3.0, max(1.0, 0.25 * (bx1 - bx0)))
+    if plot_left <= x_lo_raw <= plot_right:
+        painter.drawLine(QPointF(x_lo_raw, tick_top), QPointF(x_lo_raw, tick_bot))
+        if cap >= 1.5:
+            painter.drawLine(QPointF(x_lo_raw, tick_top), QPointF(x_lo_raw + cap, tick_top))
+            painter.drawLine(QPointF(x_lo_raw, tick_bot), QPointF(x_lo_raw + cap, tick_bot))
+    if plot_left <= x_hi_raw <= plot_right:
+        painter.drawLine(QPointF(x_hi_raw, tick_top), QPointF(x_hi_raw, tick_bot))
+        if cap >= 1.5:
+            painter.drawLine(QPointF(x_hi_raw, tick_top), QPointF(x_hi_raw - cap, tick_top))
+            painter.drawLine(QPointF(x_hi_raw, tick_bot), QPointF(x_hi_raw - cap, tick_bot))
 
 
 def _alloc_pixmap_for_widget(widget: QWidget) -> QPixmap:
@@ -179,6 +252,9 @@ class MainTraceCanvas(QWidget):
     cursorModeCycled = pyqtSignal(str)  # new cursor lock mode
     pickDeleteRequested = pyqtSignal(int, str)  # (trace_idx, phase_name)
     pickMoved = pyqtSignal(int, str, float)  # (trace_idx, phase_name, new_epoch)
+    pickChanged = pyqtSignal(int, object)  # (trace_idx, PhasePick)
+    overlayFilterRequested = pyqtSignal(int)  # trace_idx
+    clearOverlayFilterRequested = pyqtSignal(int)  # trace_idx
     contextMenuRequested = pyqtSignal(int, float, int, int)  # (trace_idx, rel_t, global_x, global_y)
     verticalRangeChanged = pyqtSignal(int, int)  # (max_offset_px, page_px)
     verticalOffsetChanged = pyqtSignal(int)  # current vertical offset in px
@@ -189,6 +265,7 @@ class MainTraceCanvas(QWidget):
     viewChanged = pyqtSignal()  # time window changed by pan / history navigation
 
     PICK_HIT_TOLERANCE_PX = 6.0
+    ERROR_BAR_HIT_TOLERANCE_PX = 5.0
     MAG_HANDLE_H = 7.0
     LEFT_DRAG_THRESHOLD_PX = 5.0
     RIGHT_DRAG_THRESHOLD_PX = 5.0
@@ -212,6 +289,7 @@ class MainTraceCanvas(QWidget):
         self.view_t_lo: Optional[float] = None  # relative to reference start_epoch
         self.view_t_hi: Optional[float] = None
         self.title: str = "SeismicHandler Motif (SHM)"
+        self.show_pick_error_bars: bool = True
 
         # Magnifier window highlight state
         self.mag_trace_idx: int = 0
@@ -233,6 +311,7 @@ class MainTraceCanvas(QWidget):
         self._pick_drag: Optional[Tuple[int, object]] = None
         self._pick_drag_epoch: Optional[float] = None
         self._pick_drag_press_x: float = 0.0
+        self._error_bar_drag: Optional[Tuple[int, object]] = None  # (trace_idx, PhasePick)
         self._right_press_pos: Optional[QPointF] = None
         self._right_moved: bool = False
         self._pan_state: Optional[Tuple[float, float, float]] = None  # (press_x, lo, hi)
@@ -446,6 +525,12 @@ class MainTraceCanvas(QWidget):
     def _slot_index(self, orig_idx: int) -> int:
         return next((i for i, (o, _) in enumerate(self.visible_indexed_traces()) if o == orig_idx), -1)
 
+    def set_show_pick_error_bars(self, show: bool) -> None:
+        val = bool(show)
+        if val != self.show_pick_error_bars:
+            self.show_pick_error_bars = val
+            self.invalidate_cache()
+
     def pick_at(self, pos: QPointF) -> Optional[Tuple[int, object]]:
         """Return (trace_idx, PhasePick) of the pick marker within tolerance of pos, if any."""
         vis = self.visible_indexed_traces()
@@ -463,6 +548,35 @@ class MainTraceCanvas(QWidget):
             if d <= self.PICK_HIT_TOLERANCE_PX and (best is None or d < best[0]):
                 best = (d, pk)
         return (orig_idx, best[1]) if best else None
+
+    def pick_error_bar_at(self, pos: QPointF) -> Optional[Tuple[int, object, str]]:
+        """Return (trace_idx, PhasePick, 'left'|'right') if pos is near an error-bar edge."""
+        if not self.show_pick_error_bars:
+            return None
+        vis = self.visible_indexed_traces()
+        rect = self.plot_rect()
+        if not vis or not rect.contains(pos):
+            return None
+        orig_idx, tr = vis[self.y_to_visible_slot(pos.y())]
+        ref_ep = self.reference_epoch()
+        best: Optional[Tuple[float, int, object, str]] = None
+        for pk in tr.picks:
+            if not pk.onset:
+                continue
+            rel_pk = pk.onset_epoch + tr.display_offset - ref_ep
+            px = self.time_to_x(rel_pk)
+            if abs(px - pos.x()) <= self.PICK_HIT_TOLERANCE_PX:
+                continue
+            sigma = pk.sigma_t(tr.delta)
+            for side, edge_x in (
+                ("left", self.time_to_x(rel_pk - sigma)),
+                ("right", self.time_to_x(rel_pk + sigma)),
+            ):
+                if rect.left() <= edge_x <= rect.right() and abs(edge_x - px) > self.PICK_HIT_TOLERANCE_PX:
+                    d = abs(edge_x - pos.x())
+                    if d <= self.ERROR_BAR_HIT_TOLERANCE_PX and (best is None or d < best[0]):
+                        best = (d, orig_idx, pk, side)
+        return (best[1], best[2], best[3]) if best else None
 
     def invalidate_slot(self, orig_idx: int) -> None:
         """Redraw only a single trace slot in the cached backing store if possible."""
@@ -519,6 +633,7 @@ class MainTraceCanvas(QWidget):
         painter.setPen(QPen(QColor("#30363d"), 1.2))
         painter.drawRect(rect)
         painter.end()
+        self._cache_state_key = self._current_state_key()
         self.update()
 
     def visible_indexed_traces(self) -> List[Tuple[int, Trace]]:
@@ -609,9 +724,21 @@ class MainTraceCanvas(QWidget):
             round(self.view_t_hi or 0.0, 4),
             self.title,
             self.cursor_lock_mode,
+            self.show_pick_error_bars,
             round(self.min_slot_h, 1),
             round(self.v_offset, 1),
             self.group_by_station,
+            tuple(
+                (
+                    orig_idx,
+                    tr.selected,
+                    tr.filter_name,
+                    getattr(tr, "overlay_filter_name", "NONE"),
+                    getattr(tr, "overlay_filter_color", ""),
+                    tuple((p.name, p.onset, p.quality, p.sign, p.spec) for p in tr.picks),
+                )
+                for orig_idx, tr in vis
+            ),
             round(float(self.devicePixelRatioF()), 3),
         )
 
@@ -849,14 +976,48 @@ class MainTraceCanvas(QWidget):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             line1,
         )
+        ov_name = (getattr(tr, "overlay_filter_name", "") or "").strip()
+        has_ov = bool(ov_name and ov_name.upper() != "NONE")
         if slot_h >= 26:
-            painter.setPen(QColor("#8b949e"))
             sub_lbl = tr.filter_name if tr.filter_name != "NONE" else f"dt={tr.delta:g}s"
+            sub_w = self.MARGIN_LEFT - 14
+            if has_ov:
+                badge_text = f"[{ov_name[:12]}]"
+                fm = painter.fontMetrics()
+                badge_w = min(self.MARGIN_LEFT - 24, fm.horizontalAdvance(badge_text) + 10)
+                badge_h = min(16.0, max(12.0, slot_h * 0.38))
+                badge_y = y_top + slot_h * 0.5 + max(0.0, (slot_h * 0.45 - badge_h) * 0.5)
+                badge_x = self.MARGIN_LEFT - 6 - badge_w
+                badge_rect = QRectF(badge_x, badge_y, badge_w, badge_h)
+                badge_col = _resolve_overlay_filter_color(getattr(tr, "overlay_filter_color", ""), ov_name)
+                painter.save()
+                painter.setPen(QPen(badge_col, 1.0))
+                painter.setBrush(QColor(badge_col.red(), badge_col.green(), badge_col.blue(), 45))
+                painter.drawRoundedRect(badge_rect, 4.0, 4.0)
+                painter.setPen(badge_col.lighter(125))
+                painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
+                painter.restore()
+                sub_w = max(16.0, badge_x - 12.0)
+            painter.setPen(QColor("#8b949e"))
             painter.drawText(
-                QRectF(10, y_top + slot_h * 0.5, self.MARGIN_LEFT - 14, slot_h * 0.45),
+                QRectF(10, y_top + slot_h * 0.5, sub_w, slot_h * 0.45),
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                 sub_lbl[:16],
             )
+        elif has_ov:
+            badge_text = f"[{ov_name[:10]}]"
+            fm = painter.fontMetrics()
+            badge_w = min(self.MARGIN_LEFT * 0.48, fm.horizontalAdvance(badge_text) + 8)
+            badge_h = max(11.0, slot_h - 4.0)
+            badge_rect = QRectF(self.MARGIN_LEFT - 6 - badge_w, y_top + 2.0, badge_w, badge_h)
+            badge_col = _resolve_overlay_filter_color(getattr(tr, "overlay_filter_color", ""), ov_name)
+            painter.save()
+            painter.setPen(QPen(badge_col, 1.0))
+            painter.setBrush(QColor(badge_col.red(), badge_col.green(), badge_col.blue(), 45))
+            painter.drawRoundedRect(badge_rect, 3.0, 3.0)
+            painter.setPen(badge_col.lighter(125))
+            painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
+            painter.restore()
 
         # Determine visible sample range
         tr_rel_start = tr.start_epoch + tr.display_offset - ref_ep
@@ -917,13 +1078,26 @@ class MainTraceCanvas(QWidget):
                     painter.drawLine(QPointF(px, y_top + 2), QPointF(px, y_top + slot_h - 2))
                     painter.drawText(QPointF(px + 2, y_top + slot_h - 4), f"({ph_name})")
 
-        # Draw manual/auto phase picks
+        # Draw manual/auto phase picks and [±sigma_t] uncertainty error bars
         if tr.picks:
             pick_pen = QPen(self.pick_color, 1.5)
             for pk in tr.picks:
                 if not pk.onset:
                     continue
                 rel_pk = pk.onset_epoch + tr.display_offset - ref_ep
+                if self.show_pick_error_bars:
+                    sigma = pk.sigma_t(tr.delta)
+                    if rel_pk + sigma >= t_lo and rel_pk - sigma <= t_hi:
+                        _draw_pick_uncertainty_interval(
+                            painter,
+                            self.time_to_x(rel_pk - sigma),
+                            self.time_to_x(rel_pk + sigma),
+                            y_top,
+                            slot_h,
+                            rect.left(),
+                            rect.right(),
+                            self.pick_color,
+                        )
                 if t_lo <= rel_pk <= t_hi:
                     px = self.time_to_x(rel_pk)
                     painter.setPen(pick_pen)
@@ -1090,10 +1264,19 @@ class MainTraceCanvas(QWidget):
                 self._left_press_pos = None
                 self._left_press_info = None
             else:
-                self._left_drag_start_t = rel_t
-                self._left_drag_cur_t = None
-                self._left_press_pos = pos
-                self._left_press_info = (orig_idx, snapped_ep, rel_t)
+                eb_hit = self.pick_error_bar_at(pos) if self.show_pick_error_bars else None
+                if eb_hit is not None:
+                    self._error_bar_drag = (eb_hit[0], eb_hit[1])
+                    self._left_drag_start_t = None
+                    self._left_drag_cur_t = None
+                    self._left_press_pos = None
+                    self._left_press_info = None
+                    self.setCursor(Qt.CursorShape.SizeHorCursor)
+                else:
+                    self._left_drag_start_t = rel_t
+                    self._left_drag_cur_t = None
+                    self._left_press_pos = pos
+                    self._left_press_info = (orig_idx, snapped_ep, rel_t)
             if prev_mag_idx != orig_idx:
                 self.magnifierWindowChanged.emit(self.mag_trace_idx, self.mag_t_lo, self.mag_t_hi)
             self.update()
@@ -1182,6 +1365,17 @@ class MainTraceCanvas(QWidget):
             self.update()
             return
 
+        # Dragging pick uncertainty error-bar edge
+        if self._error_bar_drag is not None and (event.buttons() & Qt.MouseButton.LeftButton):
+            oi, pk = self._error_bar_drag
+            if 0 <= oi < len(self.traces):
+                tr = self.traces[oi]
+                hover_ep = self.reference_epoch() + self.x_to_time(pos.x()) - tr.display_offset
+                sigma_sec = abs(hover_ep - pk.onset_epoch)
+                pk.set_quality(PhasePick.quality_from_sigma_t(sigma_sec))
+                self.invalidate_slot(oi)
+            return
+
         if (
             (event.buttons() & Qt.MouseButton.RightButton)
             and self._right_press_pos is not None
@@ -1219,8 +1413,16 @@ class MainTraceCanvas(QWidget):
         if not event.buttons():
             self._update_hover_pick(pos)
             if self._hover_pick is None:
+                eb_hit = self.pick_error_bar_at(pos)
                 handle = self._mag_handle_rect()
-                if handle is not None and handle.contains(pos):
+                if eb_hit is not None:
+                    _oi, eb_pk, _side = eb_hit
+                    self.setCursor(Qt.CursorShape.SizeHorCursor)
+                    self.setToolTip(
+                        f"{eb_pk.name} uncertainty Q={eb_pk.quality} (±{eb_pk.sigma_t(self.traces[_oi].delta):.2g}s)\n"
+                        "Drag error-bar edge to adjust pick uncertainty"
+                    )
+                elif handle is not None and handle.contains(pos):
                     self.setCursor(Qt.CursorShape.SizeHorCursor)
                     self.setToolTip("Drag to move the Magnifier window (length stays constant)")
                 elif rect.contains(pos):
@@ -1250,6 +1452,19 @@ class MainTraceCanvas(QWidget):
                     self.pickMoved.emit(oi, pk.name, self._pick_drag_epoch)
                 self._pick_drag = None
                 self._pick_drag_epoch = None
+                self.update()
+                return
+            if self._error_bar_drag is not None:
+                oi, pk = self._error_bar_drag
+                if 0 <= oi < len(self.traces):
+                    tr = self.traces[oi]
+                    hover_ep = self.reference_epoch() + self.x_to_time(event.position().x()) - tr.display_offset
+                    sigma_sec = abs(hover_ep - pk.onset_epoch)
+                    pk.set_quality(PhasePick.quality_from_sigma_t(sigma_sec))
+                    self.invalidate_slot(oi)
+                    self.pickChanged.emit(oi, pk)
+                self._error_bar_drag = None
+                self.unsetCursor()
                 self.update()
                 return
             if self._left_drag_start_t is not None and self._left_drag_cur_t is not None:
@@ -1324,8 +1539,12 @@ class MagnifierCanvas(QWidget):
     """
 
     pickPlaced = pyqtSignal(int, float)  # (trace_idx, epoch_time)
+    pickChanged = pyqtSignal(int, object)  # (trace_idx, PhasePick)
     amplitudeMeasured = pyqtSignal(int, float, float)  # (trace_idx, rel_t_lo, rel_t_hi)
     cursorModeCycled = pyqtSignal(str)  # new cursor lock mode
+    cursorOverlayModeChanged = pyqtSignal(str)  # new overlay mode ('STANDARD', 'HILBERT', 'REFERENCE')
+
+    ERROR_BAR_HIT_TOLERANCE_PX = 7.0
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1340,11 +1559,23 @@ class MagnifierCanvas(QWidget):
         self.t_lo: float = 0.0
         self.t_hi: float = 30.0
         self.cursor_lock_mode: str = "CROSSHAIR"
+        self.cursor_overlay_mode: str = "STANDARD"
+        self.show_pick_error_bars: bool = True
         self.depth_phase_cursors: List[Tuple[str, float]] = []  # [(phase, offset_sec), ...]
+
+        self._reference_waveform: Optional[np.ndarray] = None
+        self._reference_delta: float = 0.05
+        self._reference_center_rel_sec: float = 0.0
+        self._ref_version: int = 0
+        self._hilbert_cache_key: Optional[Tuple] = None
+        self._hilbert_cache_data: Optional[np.ndarray] = None
+        self._hilbert_cache_delta: float = 0.05
+        self._hilbert_cache_center_rel_sec: float = 0.0
 
         self._drag_start_rel: Optional[float] = None
         self._drag_cur_rel: Optional[float] = None
         self._hover_x: Optional[float] = None
+        self._error_bar_drag: Optional[PhasePick] = None
 
         self._static_pixmap: Optional[QPixmap] = None
         self._cache_dirty: bool = True
@@ -1356,10 +1587,84 @@ class MagnifierCanvas(QWidget):
         self._cache_dirty = True
         self.update()
 
+    def set_show_pick_error_bars(self, show: bool) -> None:
+        val = bool(show)
+        if val != self.show_pick_error_bars:
+            self.show_pick_error_bars = val
+            self.invalidate_cache()
+
     def set_cursor_lock_mode(self, mode: str) -> None:
         if mode in CURSOR_LOCK_MODES and mode != self.cursor_lock_mode:
             self.cursor_lock_mode = mode
             self.invalidate_cache()
+
+    def set_cursor_overlay_mode(self, mode: str) -> None:
+        m = (mode or "STANDARD").strip().upper()
+        if m == "CROSSHAIR":
+            m = "STANDARD"
+        if m in MAGNIFIER_CURSOR_MODES and m != self.cursor_overlay_mode:
+            self.cursor_overlay_mode = m
+            self._hilbert_cache_key = None
+            self.cursorOverlayModeChanged.emit(m)
+            self.invalidate_cache()
+
+    def set_cursor_mode(self, mode: str) -> None:
+        """Unified cursor mode setter supporting both CURSOR_LOCK_MODES and MAGNIFIER_CURSOR_MODES."""
+        m = (mode or "").strip().upper()
+        if m in CURSOR_LOCK_MODES:
+            self.set_cursor_lock_mode(m)
+        elif m in MAGNIFIER_CURSOR_MODES:
+            self.set_cursor_overlay_mode(m)
+
+    def set_reference_waveform(
+        self,
+        trace_or_array,
+        delta: Optional[float] = None,
+        center_rel_sec: float = 0.0,
+    ) -> None:
+        """Set reference waveform (Trace or 1D numpy array) for REFERENCE / HILBERT cursor overlays."""
+        if trace_or_array is None:
+            self._reference_waveform = None
+            self._ref_version += 1
+            self._hilbert_cache_key = None
+            self.invalidate_cache()
+            return
+        if isinstance(trace_or_array, Trace):
+            arr = np.asarray(trace_or_array.data, dtype=np.float64)
+            dt = float(delta) if (delta is not None and delta > 0) else float(trace_or_array.delta)
+        else:
+            arr = np.asarray(trace_or_array, dtype=np.float64).ravel()
+            default_dt = self.trace.delta if (self.trace is not None and self.trace.delta > 0) else 0.05
+            dt = float(delta) if (delta is not None and delta > 0) else float(default_dt)
+        self._reference_waveform = arr.copy()
+        self._reference_delta = max(1e-6, dt)
+        self._reference_center_rel_sec = float(center_rel_sec)
+        self._ref_version += 1
+        self._hilbert_cache_key = None
+        self.invalidate_cache()
+
+    def capture_reference_window(
+        self,
+        t_lo: Optional[float] = None,
+        t_hi: Optional[float] = None,
+        center_rel_sec: Optional[float] = None,
+    ) -> bool:
+        """Capture the current magnifier window (or [t_lo, t_hi]) as the reference waveform."""
+        if self.trace is None or self.trace.length < 2 or self.trace.delta <= 0:
+            return False
+        lo = self.t_lo if t_lo is None else float(t_lo)
+        hi = self.t_hi if t_hi is None else float(t_hi)
+        if hi < lo:
+            lo, hi = hi, lo
+        tr_rel_start = self.trace.start_epoch + self.trace.display_offset - self.ref_epoch
+        i0 = max(0, int(math.floor((lo - tr_rel_start) / max(1e-9, self.trace.delta))))
+        i1 = min(self.trace.length, int(math.ceil((hi - tr_rel_start) / max(1e-9, self.trace.delta))) + 1)
+        if i1 - i0 < 2:
+            return False
+        seg = self.trace.data[i0:i1].copy()
+        c_sec = 0.5 * (seg.size - 1) * self.trace.delta if center_rel_sec is None else float(center_rel_sec)
+        self.set_reference_waveform(seg, delta=self.trace.delta, center_rel_sec=c_sec)
+        return True
 
     def set_magnifier_view(
         self,
@@ -1374,6 +1679,7 @@ class MagnifierCanvas(QWidget):
         self.ref_epoch = ref_epoch
         self.t_lo = t_lo
         self.t_hi = max(t_lo + 0.5, t_hi)
+        self._hilbert_cache_key = None
         self.invalidate_cache()
 
     def plot_rect(self) -> QRectF:
@@ -1398,11 +1704,90 @@ class MagnifierCanvas(QWidget):
             round(self.t_lo, 4),
             round(self.t_hi, 4),
             self.cursor_lock_mode,
+            self.cursor_overlay_mode,
+            self.show_pick_error_bars,
+            self._ref_version,
             tr.filter_name if tr else "",
+            getattr(tr, "overlay_filter_name", "NONE") if tr else "",
+            getattr(tr, "overlay_filter_color", "") if tr else "",
             len(tr.picks) if tr else 0,
             tuple((p.name, p.onset, p.quality, p.sign, p.spec) for p in tr.picks) if tr else (),
             round(float(self.devicePixelRatioF()), 3),
         )
+
+    def _get_cursor_overlay_waveform(self) -> Optional[Tuple[np.ndarray, float, float]]:
+        """Return (samples, dt, center_rel_sec) for HILBERT or REFERENCE cursor overlay."""
+        mode = self.cursor_overlay_mode
+        if mode == "REFERENCE":
+            if self._reference_waveform is None or self._reference_waveform.size < 2:
+                return None
+            return (self._reference_waveform, self._reference_delta, self._reference_center_rel_sec)
+
+        if mode != "HILBERT":
+            return None
+
+        if self._reference_waveform is not None and self._reference_waveform.size >= 2:
+            hkey = ("REF", self._ref_version, self._reference_delta, self._reference_waveform.size)
+            if self._hilbert_cache_key != hkey:
+                seg = self._reference_waveform - float(np.mean(self._reference_waveform))
+                self._hilbert_cache_data = hilbert_transform(seg)
+                self._hilbert_cache_delta = self._reference_delta
+                self._hilbert_cache_center_rel_sec = self._reference_center_rel_sec
+                self._hilbert_cache_key = hkey
+            if self._hilbert_cache_data is not None:
+                return (self._hilbert_cache_data, self._hilbert_cache_delta, self._hilbert_cache_center_rel_sec)
+            return None
+
+        if self.trace is None or self.trace.length < 2 or self.trace.delta <= 0:
+            return None
+
+        tr = self.trace
+        tr_rel_start = tr.start_epoch + tr.display_offset - self.ref_epoch
+        # Prefer segment around an in-view pick (e.g. P onset), else current magnifier window
+        ref_pk: Optional[PhasePick] = None
+        for pk in tr.picks:
+            if pk.onset:
+                rel_pk = pk.onset_epoch + tr.display_offset - self.ref_epoch
+                if self.t_lo <= rel_pk <= self.t_hi:
+                    ref_pk = pk
+                    break
+        if ref_pk is None:
+            for pk in tr.picks:
+                if pk.onset:
+                    ref_pk = pk
+                    break
+
+        if ref_pk is not None:
+            rel_pk = ref_pk.onset_epoch + tr.display_offset - self.ref_epoch
+            half_w = min(5.0, max(1.0, 0.25 * (self.t_hi - self.t_lo)))
+            w_lo = rel_pk - half_w
+            w_hi = rel_pk + half_w
+            i0 = max(0, int(math.floor((w_lo - tr_rel_start) / tr.delta)))
+            i1 = min(tr.length, int(math.ceil((w_hi - tr_rel_start) / tr.delta)) + 1)
+            if i1 - i0 >= 2:
+                center_rel = rel_pk - (tr_rel_start + i0 * tr.delta)
+            else:
+                i0 = max(0, int(math.floor((self.t_lo - tr_rel_start) / tr.delta)))
+                i1 = min(tr.length, int(math.ceil((self.t_hi - tr_rel_start) / tr.delta)) + 1)
+                center_rel = 0.5 * max(0, i1 - i0 - 1) * tr.delta
+        else:
+            i0 = max(0, int(math.floor((self.t_lo - tr_rel_start) / tr.delta)))
+            i1 = min(tr.length, int(math.ceil((self.t_hi - tr_rel_start) / tr.delta)) + 1)
+            center_rel = 0.5 * max(0, i1 - i0 - 1) * tr.delta
+
+        if i1 - i0 < 2:
+            return None
+
+        hkey = ("TRACE", id(tr), tr.length, i0, i1, round(center_rel, 4))
+        if self._hilbert_cache_key != hkey:
+            seg = tr.data[i0:i1] - float(np.mean(tr.data[i0:i1]))
+            self._hilbert_cache_data = hilbert_transform(seg)
+            self._hilbert_cache_delta = tr.delta
+            self._hilbert_cache_center_rel_sec = center_rel
+            self._hilbert_cache_key = hkey
+        if self._hilbert_cache_data is not None:
+            return (self._hilbert_cache_data, self._hilbert_cache_delta, self._hilbert_cache_center_rel_sec)
+        return None
 
     def _ensure_static_pixmap(self) -> None:
         key = self._current_state_key()
@@ -1438,9 +1823,15 @@ class MagnifierCanvas(QWidget):
         i1 = min(tr.length, int(math.ceil((self.t_hi - tr_rel_start) / max(1e-9, tr.delta))) + 1)
 
         painter.setPen(QColor("#ffd700"))
+        ov_tag = (
+            f"+{tr.overlay_filter_name}"
+            if getattr(tr, "overlay_filter_name", "NONE") not in ("", "NONE")
+            else ""
+        )
+        mode_tag = f"  Cursor: {self.cursor_overlay_mode}" if self.cursor_overlay_mode != "STANDARD" else ""
         hdr = (
-            f"MAGNIFIER: #{self.trace_idx + 1} {tr.station} {tr.channel3} [{tr.filter_name}]  "
-            f"[{self.t_lo:.2f}..{self.t_hi:.2f}s]  Lock: {self.cursor_lock_mode}  "
+            f"MAGNIFIER: #{self.trace_idx + 1} {tr.station} {tr.channel3} [{tr.filter_name}{ov_tag}]  "
+            f"[{self.t_lo:.2f}..{self.t_hi:.2f}s]  Lock: {self.cursor_lock_mode}{mode_tag}  "
             f"(L-click: Pick | M-click: Lock | R-drag: Amp)"
         )
         painter.drawText(QRectF(72, 2, r.width(), 18), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, hdr)
@@ -1494,18 +1885,33 @@ class MagnifierCanvas(QWidget):
             painter.drawPoints(poly)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
 
-        # Draw picks on this trace
+        # Draw picks and [±sigma_t] uncertainty error bars on this trace
         if tr.picks:
             pick_pen = QPen(QColor("#ff7b72"), 1.8)
             for pk in tr.picks:
                 if not pk.onset:
                     continue
                 rel_pk = pk.onset_epoch + tr.display_offset - self.ref_epoch
+                sigma = pk.sigma_t(tr.delta)
+                if self.show_pick_error_bars and (rel_pk + sigma >= self.t_lo and rel_pk - sigma <= self.t_hi):
+                    _draw_pick_uncertainty_interval(
+                        painter,
+                        self.time_to_x(rel_pk - sigma),
+                        self.time_to_x(rel_pk + sigma),
+                        r.top(),
+                        r.height(),
+                        r.left(),
+                        r.right(),
+                        QColor("#ff7b72"),
+                    )
                 if self.t_lo <= rel_pk <= self.t_hi:
                     px = self.time_to_x(rel_pk)
                     painter.setPen(pick_pen)
                     painter.drawLine(QPointF(px, r.top()), QPointF(px, r.bottom()))
-                    painter.drawText(QPointF(px + 4, r.top() + 14), f"{pk.spec}{pk.sign_char}{pk.name} (Q{pk.quality})")
+                    painter.drawText(
+                        QPointF(px + 4, r.top() + 14),
+                        f"{pk.spec}{pk.sign_char}{pk.name} (Q{pk.quality} ±{sigma:.2g}s)",
+                    )
 
         painter.end()
         self._cache_dirty = False
@@ -1533,7 +1939,7 @@ class MagnifierCanvas(QWidget):
             painter.setPen(QPen(QColor("#3fb950"), 1.2, Qt.PenStyle.DashLine))
             painter.drawRect(QRectF(x0, r.top(), max(2.0, x1 - x0), r.height()))
 
-        # Draw hover cursor and depth-phase check cursors if enabled
+        # Draw hover cursor, Hilbert/Reference overlay waveform, and depth-phase check cursors
         if self._hover_x is not None and r.left() <= self._hover_x <= r.right():
             hover_t = self.x_to_time(self._hover_x)
             if self.cursor_lock_mode != "CROSSHAIR":
@@ -1541,6 +1947,50 @@ class MagnifierCanvas(QWidget):
                 snapped_ep = snap_time_to_feature(self.trace, hover_ep, self.cursor_lock_mode)
                 hover_t = snapped_ep + self.trace.display_offset - self.ref_epoch
             draw_x = self.time_to_x(hover_t)
+
+            ov = self._get_cursor_overlay_waveform()
+            if ov is not None:
+                ov_arr, ov_dt, ov_center = ov
+                if ov_arr.size >= 2 and ov_dt > 0:
+                    ov_dm = ov_arr - float(np.mean(ov_arr))
+                    ov_max = float(np.max(np.abs(ov_dm)))
+                    if ov_max > 1e-12:
+                        y_mid = r.center().y()
+                        ov_scale_y = 0.36 * r.height() / ov_max
+                        ov_rel_start = hover_t - ov_center
+                        ov_poly = _build_trace_polygon(
+                            ov_dm,
+                            0,
+                            ov_dm.size,
+                            ov_rel_start,
+                            ov_dt,
+                            self.t_lo,
+                            self.t_hi,
+                            r.left(),
+                            r.width(),
+                            y_mid,
+                            ov_scale_y,
+                            r.top() + 1.0,
+                            r.bottom() - 1.0,
+                            0.0,
+                        )
+                        if ov_poly.count() >= 2:
+                            painter.save()
+                            painter.setClipRect(r)
+                            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                            if self.cursor_overlay_mode == "HILBERT":
+                                ov_col = QColor(210, 168, 255, 205)
+                                badge = "HILBERT 90°"
+                            else:
+                                ov_col = QColor(63, 185, 80, 195)
+                                badge = "REF"
+                            painter.setPen(QPen(ov_col, 1.6))
+                            painter.drawPolyline(ov_poly)
+                            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+                            painter.setPen(ov_col)
+                            painter.drawText(QPointF(draw_x + 4, r.bottom() - 18), badge)
+                            painter.restore()
+
             painter.setPen(QPen(QColor("#e6edf3"), 0, Qt.PenStyle.DotLine))
             painter.drawLine(QPointF(draw_x, r.top()), QPointF(draw_x, r.bottom()))
             if self.depth_phase_cursors:
@@ -1560,6 +2010,7 @@ class MagnifierCanvas(QWidget):
 
     def leaveEvent(self, event) -> None:
         self._hover_x = None
+        self.unsetCursor()
         self.update()
         super().leaveEvent(event)
 
@@ -1581,6 +2032,31 @@ class MagnifierCanvas(QWidget):
                 best = (d, pk)
         return best[1] if best else None
 
+    def pick_error_bar_at(self, pos: QPointF) -> Optional[Tuple[PhasePick, str]]:
+        """Return (PhasePick, 'left'|'right') if pos is near an error-bar ±sigma_t boundary."""
+        if not self.show_pick_error_bars or self.trace is None or not self.trace.picks:
+            return None
+        r = self.plot_rect()
+        if not r.contains(pos):
+            return None
+        best: Optional[Tuple[float, PhasePick, str]] = None
+        for pk in self.trace.picks:
+            if not pk.onset:
+                continue
+            rel_pk = pk.onset_epoch + self.trace.display_offset - self.ref_epoch
+            px = self.time_to_x(rel_pk)
+            sigma = pk.sigma_t(self.trace.delta)
+            for side, edge_x in (
+                ("left", self.time_to_x(rel_pk - sigma)),
+                ("right", self.time_to_x(rel_pk + sigma)),
+            ):
+                if r.left() <= edge_x <= r.right() and abs(edge_x - px) >= 3.0:
+                    d = abs(edge_x - pos.x())
+                    if d <= self.ERROR_BAR_HIT_TOLERANCE_PX and d < abs(pos.x() - px):
+                        if best is None or d < best[0]:
+                            best = (d, pk, side)
+        return (best[1], best[2]) if best else None
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if self.trace is None:
             return
@@ -1591,6 +2067,13 @@ class MagnifierCanvas(QWidget):
         self._hover_x = pos.x()
         rel_t = self.x_to_time(pos.x())
         if event.button() == Qt.MouseButton.LeftButton:
+            if self.show_pick_error_bars:
+                eb_hit = self.pick_error_bar_at(pos)
+                if eb_hit is not None:
+                    self._error_bar_drag = eb_hit[0]
+                    self.setCursor(Qt.CursorShape.SizeHorCursor)
+                    self.update()
+                    return
             ep = self.ref_epoch + rel_t - self.trace.display_offset
             snapped_ep = snap_time_to_feature(self.trace, ep, self.cursor_lock_mode)
             self.pickPlaced.emit(self.trace_idx, snapped_ep)
@@ -1610,18 +2093,53 @@ class MagnifierCanvas(QWidget):
         pos = event.position()
         r = self.plot_rect()
         if not event.buttons():
-            if r.contains(pos):
+            eb_hit = self.pick_error_bar_at(pos) if self.show_pick_error_bars else None
+            if eb_hit is not None:
+                eb_pk, _side = eb_hit
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                dt = self.trace.delta if self.trace else 0.05
+                self.setToolTip(
+                    f"{eb_pk.name} uncertainty Q={eb_pk.quality} (±{eb_pk.sigma_t(dt):.2g}s)\n"
+                    "Drag error-bar edge to adjust pick uncertainty"
+                )
+            elif r.contains(pos):
                 self.setCursor(Qt.CursorShape.CrossCursor)
+                self.setToolTip("")
             else:
                 self.unsetCursor()
-        if self._hover_x is not None and abs(pos.x() - self._hover_x) < 0.1 and not event.buttons():
-            return
+                self.setToolTip("")
+            if self._hover_x is not None and abs(pos.x() - self._hover_x) < 0.1:
+                return
+
         self._hover_x = pos.x()
+
+        if self._error_bar_drag is not None and (event.buttons() & Qt.MouseButton.LeftButton):
+            if self.trace is not None:
+                hover_t = self.x_to_time(pos.x())
+                hover_ep = self.ref_epoch + hover_t - self.trace.display_offset
+                sigma_sec = abs(hover_ep - self._error_bar_drag.onset_epoch)
+                self._error_bar_drag.set_quality(PhasePick.quality_from_sigma_t(sigma_sec))
+                self.invalidate_cache()
+            return
+
         if (event.buttons() & Qt.MouseButton.RightButton) and self._drag_start_rel is not None:
             self._drag_cur_rel = self.x_to_time(pos.x())
         self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._error_bar_drag is not None:
+            pk = self._error_bar_drag
+            if self.trace is not None:
+                hover_t = self.x_to_time(event.position().x())
+                hover_ep = self.ref_epoch + hover_t - self.trace.display_offset
+                sigma_sec = abs(hover_ep - pk.onset_epoch)
+                pk.set_quality(PhasePick.quality_from_sigma_t(sigma_sec))
+                self.invalidate_cache()
+                self.pickChanged.emit(self.trace_idx, pk)
+            self._error_bar_drag = None
+            self.unsetCursor()
+            self.update()
+            return
         if event.button() == Qt.MouseButton.RightButton and self._drag_start_rel is not None and self._drag_cur_rel is not None:
             if self.trace is not None:
                 tr_rel_start = self.trace.start_epoch + self.trace.display_offset - self.ref_epoch

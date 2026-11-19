@@ -6,10 +6,21 @@ shmath.c, pmotion.c, and polfil.c.
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 
+from shm_app.core.fit_models import (
+    FitDiagnosticResult,
+    FitType,
+    ParameterUncertainty,
+    ResidualEntry,
+)
 from shm_app.core.models import Trace
+from shm_app.seismology.diagnostics import (
+    compute_mad,
+    compute_normality_stats,
+    compute_reduced_chi2,
+)
 
 
 def rotate_2d(
@@ -128,6 +139,27 @@ def rotate_STS2_zne_to_uvw(tr_z: Trace, tr_n: Trace, tr_e: Trace, inverse: bool 
     return t1, t2, t3
 
 
+def _polarization_window_indices(
+    lth: int,
+    dt: float,
+    t_lo: Optional[float],
+    t_hi: Optional[float],
+) -> Tuple[int, int]:
+    """Resolve sample slice [i0, i1) for polarization analysis."""
+    if lth <= 0:
+        return 0, 0
+    if t_lo is not None and t_hi is not None and dt > 0:
+        lo = min(float(t_lo), float(t_hi))
+        hi = max(float(t_lo), float(t_hi))
+        i0 = max(0, int(round(lo / dt)))
+        i1 = min(lth, int(round(hi / dt)) + 1)
+    else:
+        i0, i1 = 0, lth
+    if i1 <= i0 + 1:
+        i0, i1 = 0, lth
+    return i0, i1
+
+
 def compute_mdir(
     tr_z: Trace,
     tr_n: Trace,
@@ -136,18 +168,26 @@ def compute_mdir(
     t_hi: Optional[float] = None,
 ) -> Dict[str, float]:
     """Compute 3D covariance eigendecomposition (MDIR) for P-wave backazimuth, incidence angle,
-    and rectilinearity matching mt_mdir in shmath.c.
+    rectilinearity, trajectory misfit RMS, and Jurkevics confidence cones.
     """
     lth = min(tr_z.length, tr_n.length, tr_e.length)
-    dt = tr_z.delta
-    if t_lo is not None and t_hi is not None and dt > 0:
-        i0 = max(0, int(round(t_lo / dt)))
-        i1 = min(lth, int(round(t_hi / dt)) + 1)
-    else:
-        i0, i1 = 0, lth
+    dt = tr_z.delta if tr_z.delta > 0 else 0.05
+    i0, i1 = _polarization_window_indices(lth, dt, t_lo, t_hi)
 
-    if i1 <= i0 + 1:
-        i0, i1 = 0, lth
+    if i1 <= i0:
+        return {
+            "azimuth": 0.0,
+            "incidence": 0.0,
+            "rectilinearity": 0.0,
+            "planarity": 0.0,
+            "lambda1": 0.0,
+            "lambda2": 0.0,
+            "lambda3": 0.0,
+            "rms_pol": 0.0,
+            "rms_pol_norm": 0.0,
+            "sigma_theta_deg": 0.0,
+            "sigma_phi_deg": 0.0,
+        }
 
     z = tr_z.data[i0:i1] - np.mean(tr_z.data[i0:i1])
     n = tr_n.data[i0:i1] - np.mean(tr_n.data[i0:i1])
@@ -176,6 +216,19 @@ def compute_mdir(
     rectilinearity = 1.0 - (lam2 + lam3) / (2.0 * lam1) if lam1 > 1e-30 else 0.0
     planarity = 1.0 - (2.0 * lam3) / (lam1 + lam2) if (lam1 + lam2) > 1e-30 else 0.0
 
+    # Orthogonal trajectory distance d_k = ||u_k - (u_k . v1) v1|| = sqrt(||u_k||^2 - (u_k . v1)^2)
+    u_sq = np.sum(mat ** 2, axis=0)
+    proj = v1 @ mat
+    perp = mat - np.outer(v1, proj)
+    d_k_sq = np.sum(perp ** 2, axis=0)
+    rms_pol = float(np.sqrt(np.mean(d_k_sq)))
+    rms_total = float(np.sqrt(np.mean(u_sq)))
+    rms_pol_norm = (rms_pol / rms_total) if rms_total > 1e-15 else 0.0
+
+    # Jurkevics (1988) confidence cones
+    sigma_theta_deg = math.degrees(math.atan(math.sqrt(lam2 / max(lam1, 1e-15))))
+    sigma_phi_deg = math.degrees(math.atan(math.sqrt(lam3 / max(lam1, 1e-15))))
+
     return {
         "azimuth": baz_deg,
         "incidence": incidence_deg,
@@ -184,7 +237,224 @@ def compute_mdir(
         "lambda1": lam1,
         "lambda2": lam2,
         "lambda3": lam3,
+        "rms_pol": rms_pol,
+        "rms_pol_norm": rms_pol_norm,
+        "sigma_theta_deg": sigma_theta_deg,
+        "sigma_phi_deg": sigma_phi_deg,
     }
+
+
+def analyze_polarization_diagnostic(
+    tr_z: Trace,
+    tr_n: Trace,
+    tr_e: Trace,
+    t_lo: Optional[float] = None,
+    t_hi: Optional[float] = None,
+) -> FitDiagnosticResult:
+    """Compute M-16 3C polarization trajectory diagnostics and package as FitDiagnosticResult."""
+    lth = min(tr_z.length, tr_n.length, tr_e.length)
+    dt = tr_z.delta if tr_z.delta > 0 else 0.05
+    i0, i1 = _polarization_window_indices(lth, dt, t_lo, t_hi)
+
+    mdir = compute_mdir(tr_z, tr_n, tr_e, t_lo=t_lo, t_hi=t_hi)
+    baz = mdir["azimuth"]
+    incidence = mdir["incidence"]
+    rect = mdir["rectilinearity"]
+    plan = mdir["planarity"]
+    lam1 = mdir["lambda1"]
+    lam2 = mdir["lambda2"]
+    lam3 = mdir["lambda3"]
+    rms_pol = mdir["rms_pol"]
+    rms_pol_norm = mdir["rms_pol_norm"]
+    sigma_theta_deg = mdir["sigma_theta_deg"]
+    sigma_phi_deg = mdir["sigma_phi_deg"]
+
+    if i1 <= i0:
+        empty = np.array([], dtype=np.float64)
+        return FitDiagnosticResult(
+            fit_type=FitType.POLARIZATION_3C,
+            title=f"3C Polarization Analysis ({tr_z.station})",
+            converged=False,
+            iterations=1,
+            dof=1,
+            rmse=0.0,
+            wrmse=0.0,
+            nrmse=0.0,
+            overlay_curves={
+                "z": empty,
+                "n": empty,
+                "e": empty,
+                "l": empty,
+                "q": empty,
+                "t": empty,
+                "time_rel": empty,
+            },
+            context_data={
+                "baz": 0.0,
+                "incidence": 0.0,
+                "rectilinearity": 0.0,
+                "planarity": 0.0,
+                "sigma_theta_deg": 0.0,
+                "sigma_phi_deg": 0.0,
+                "rms_pol": 0.0,
+                "rms_pol_norm": 0.0,
+                "lambda1": 0.0,
+                "lambda2": 0.0,
+                "lambda3": 0.0,
+            },
+        )
+
+    z_win = np.asarray(tr_z.data[i0:i1] - np.mean(tr_z.data[i0:i1]), dtype=np.float64)
+    n_win = np.asarray(tr_n.data[i0:i1] - np.mean(tr_n.data[i0:i1]), dtype=np.float64)
+    e_win = np.asarray(tr_e.data[i0:i1] - np.mean(tr_e.data[i0:i1]), dtype=np.float64)
+    time_rel = np.arange(i0, i1, dtype=np.float64) * dt
+
+    # Rotate demeaned windowed traces into ray-aligned (L, Q, T)
+    tz_w = Trace(data=z_win, delta=dt, station=tr_z.station, comp="Z")
+    tn_w = Trace(data=n_win, delta=dt, station=tr_n.station, comp="N")
+    te_w = Trace(data=e_win, delta=dt, station=tr_e.station, comp="E")
+    tl_w, tq_w, tt_w = rotate_3d_lqt(tz_w, tn_w, te_w, baz, incidence)
+    l_arr = tl_w.data
+    q_arr = tq_w.data
+    t_arr = tt_w.data
+
+    # Orthogonal trajectory misfit samples d_k = sqrt(q_k^2 + t_k^2)
+    u_norm = np.sqrt(z_win ** 2 + n_win ** 2 + e_win ** 2)
+    l_abs = np.abs(l_arr)
+    d_k = np.sqrt(np.maximum(0.0, q_arr ** 2 + t_arr ** 2))
+
+    n_samples = int(z_win.size)
+    dof = max(1, n_samples - 3)
+    tot_energy = lam1 + lam2 + lam3
+    r_squared = (lam1 / tot_energy) if tot_energy > 1e-30 else 0.0
+    sigma_scale = max(rms_pol, 1e-12)
+    chi2_red = compute_reduced_chi2(d_k, uncertainties=np.full(n_samples, sigma_scale), dof=dof)
+    mad_val = compute_mad(d_k)
+    cond_num = math.sqrt(lam1 / max(lam3, 1e-15)) if lam1 > 1e-30 else 1.0
+    norm_stats = compute_normality_stats(d_k)
+
+    # Sample up to 200 residual entries evenly across the window for diagnostics table
+    max_entries = 200
+    step = max(1, int(math.ceil(n_samples / max_entries)))
+    outlier_thresh = max(3.0 * sigma_scale, 1e-9)
+    residual_entries: List[ResidualEntry] = []
+    for idx in range(0, n_samples, step):
+        dk_val = float(d_k[idx])
+        norm_res = dk_val / sigma_scale if sigma_scale > 1e-12 else 0.0
+        is_out = dk_val > outlier_thresh and rms_pol > 1e-12
+        residual_entries.append(
+            ResidualEntry(
+                identifier=f"{tr_z.station}.3C.t={time_rel[idx]:.2f}s",
+                observed=float(u_norm[idx]),
+                calculated=float(l_abs[idx]),
+                residual=dk_val,
+                normalized_residual=float(norm_res),
+                weight=1.0,
+                uncertainty=float(sigma_scale),
+                distance_deg=float(tr_z.distance),
+                azimuth_deg=round(baz, 2),
+                station=tr_z.station,
+                phase="POL",
+                channel="3C",
+                is_outlier=is_out,
+            )
+        )
+
+    outlier_count = int(sum(1 for r in residual_entries if r.is_outlier))
+
+    parameters: Dict[str, ParameterUncertainty] = {
+        "baz": ParameterUncertainty(
+            name="baz",
+            value=baz,
+            standard_error=sigma_theta_deg,
+            confidence_interval_95=(baz - 1.96 * sigma_theta_deg, baz + 1.96 * sigma_theta_deg),
+            unit="deg",
+        ),
+        "incidence": ParameterUncertainty(
+            name="incidence",
+            value=incidence,
+            standard_error=sigma_phi_deg,
+            confidence_interval_95=(
+                max(0.0, incidence - 1.96 * sigma_phi_deg),
+                min(90.0, incidence + 1.96 * sigma_phi_deg),
+            ),
+            unit="deg",
+        ),
+        "rectilinearity": ParameterUncertainty(
+            name="rectilinearity",
+            value=rect,
+            standard_error=rms_pol_norm,
+            confidence_interval_95=(
+                max(0.0, rect - 1.96 * rms_pol_norm),
+                min(1.0, rect + 1.96 * rms_pol_norm),
+            ),
+            unit="",
+        ),
+        "planarity": ParameterUncertainty(
+            name="planarity",
+            value=plan,
+            standard_error=0.0,
+            confidence_interval_95=(plan, plan),
+            unit="",
+        ),
+        "rms_pol": ParameterUncertainty(
+            name="rms_pol",
+            value=rms_pol,
+            standard_error=rms_pol_norm,
+            confidence_interval_95=(max(0.0, rms_pol * (1.0 - 1.96 * rms_pol_norm)), rms_pol * (1.0 + 1.96 * rms_pol_norm)),
+            unit="",
+        ),
+    }
+
+    p_cnt = len(parameters)
+    corr_mat = np.eye(p_cnt, dtype=np.float64)
+
+    return FitDiagnosticResult(
+        fit_type=FitType.POLARIZATION_3C,
+        title=f"3C Polarization Analysis ({tr_z.station})",
+        converged=bool(lam1 > 1e-30),
+        iterations=1,
+        dof=dof,
+        rmse=rms_pol,
+        wrmse=rms_pol,
+        nrmse=rms_pol_norm,
+        mad=mad_val,
+        chi2_reduced=chi2_red,
+        r_squared=r_squared,
+        condition_number=cond_num,
+        parameters=parameters,
+        correlation_matrix=corr_mat,
+        residuals=residual_entries,
+        outlier_count=outlier_count,
+        overlay_curves={
+            "z": z_win,
+            "n": n_win,
+            "e": e_win,
+            "l": l_arr,
+            "q": q_arr,
+            "t": t_arr,
+            "time_rel": time_rel,
+        },
+        normality_p_value=norm_stats.get("p_value", 1.0),
+        skewness=norm_stats.get("skewness", 0.0),
+        kurtosis=norm_stats.get("kurtosis", 0.0),
+        context_data={
+            "baz": baz,
+            "incidence": incidence,
+            "rectilinearity": rect,
+            "planarity": plan,
+            "sigma_theta_deg": sigma_theta_deg,
+            "sigma_phi_deg": sigma_phi_deg,
+            "rms_pol": rms_pol,
+            "rms_pol_norm": rms_pol_norm,
+            "lambda1": lam1,
+            "lambda2": lam2,
+            "lambda3": lam3,
+            "station": tr_z.station,
+            "t_lo": float(time_rel[0]) if time_rel.size > 0 else 0.0,
+            "t_hi": float(time_rel[-1]) if time_rel.size > 0 else 0.0,
+        },
+    )
 
 
 def apply_polarization_filter(

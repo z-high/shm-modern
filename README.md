@@ -103,6 +103,8 @@ shm-modern/
 
 This program is free software: you can redistribute it and/or modify it under the terms of the **GNU General Public License (Version 3 or later)** as published by the Free Software Foundation. See [`LICENSE`](LICENSE) for the full text.
 
+This software is provided "as is", without warranty of any kind, as specified in Sections 15 and 16 of the GPL-3.0.
+
 ### Original Work & Attribution
 Based on the concepts, algorithms, and file formats of **SeismicHandler (`SH` / `SHM`)**:
 - **Original Author:** Dr. Klaus Stammler

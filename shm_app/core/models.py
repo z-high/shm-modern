@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional, Tuple
 import numpy as np
 
 from shm_app.core.time_utils import format_sh_time, parse_sh_time
@@ -12,6 +13,22 @@ from shm_app.core.time_utils import format_sh_time, parse_sh_time
 # Phase weight table from cblib.c: index = quality (0..10) -> weight (9,9,4,3,2,2,1,1,0,0,0)
 QUALITY_TO_WEIGHT = [9, 9, 4, 3, 2, 2, 1, 1, 0, 0, 0]
 WEIGHT_TO_QUALITY = {4: 2, 3: 3, 2: 4, 1: 6, 0: 8, 9: 0}
+QUALITY_SIGMA_SEC = [0.02, 0.05, 0.10, 0.20, 0.50, 1.0, 2.0, 4.0, 8.0, 15.0]
+
+
+def quality_from_sigma_t(sigma_sec: float) -> int:
+    """Map timing uncertainty sigma_t (seconds) to nearest pick quality level 0..9."""
+    try:
+        val = float(sigma_sec)
+    except (TypeError, ValueError):
+        return 4
+    if math.isnan(val):
+        return 4
+    if val <= 0.0:
+        return 0
+    if math.isinf(val):
+        return len(QUALITY_SIGMA_SEC) - 1
+    return min(range(len(QUALITY_SIGMA_SEC)), key=lambda idx: abs(QUALITY_SIGMA_SEC[idx] - val))
 
 # Canonical SHM event-type codes and Parameter Box labels
 SHM_EVENT_TYPES = (
@@ -82,6 +99,8 @@ class StationInfo:
 @dataclass
 class PhasePick:
     """Phase reading matching TPiPhase in phaseinf.h and .evt descriptors."""
+
+    QUALITY_SIGMA_SEC: ClassVar[List[float]] = QUALITY_SIGMA_SEC
 
     name: str = "P"
     onset: str = ""  # SH time string DD-MMM-YYYY_HH:MM:SS.SSS
@@ -166,6 +185,19 @@ class PhasePick:
         """Update weight and synchronize quality."""
         self.weight = int(w)
         self.quality = WEIGHT_TO_QUALITY.get(self.weight, 4)
+
+    def sigma_t(self, dt: float = 0.05) -> float:
+        """Return 1-sigma timing uncertainty (seconds) from quality (0..9) or dt*2^(q/2) fallback."""
+        q = max(0, min(9, int(self.quality)))
+        if 0 <= q < len(self.QUALITY_SIGMA_SEC):
+            return float(self.QUALITY_SIGMA_SEC[q])
+        dt_eff = max(1e-4, float(dt))
+        return max(dt_eff, dt_eff * (2.0 ** (q / 2.0)))
+
+    @staticmethod
+    def quality_from_sigma_t(sigma_sec: float) -> int:
+        """Inverse mapping from timing uncertainty sigma_sec to nearest quality level 0..9."""
+        return quality_from_sigma_t(sigma_sec)
 
 
 @dataclass
@@ -253,6 +285,9 @@ class Trace:
     comment: str = ""  # S021
     opinfo: str = ""  # S023
     filter_name: str = "NONE"
+    overlay_filter_name: str = "NONE"
+    overlay_filter_color: str = ""
+    filter_history: List[str] = field(default_factory=list)
     hidden: bool = False
     selected: bool = False
     picks: List[PhasePick] = field(default_factory=list)
@@ -329,6 +364,9 @@ class Trace:
         new_tr.picks = [copy.deepcopy(p) for p in self.picks] if copy_picks else []
         new_tr.theo_picks = dict(self.theo_picks)
         new_tr.extra_headers = dict(self.extra_headers)
+        new_tr.filter_history = list(self.filter_history)
+        new_tr.overlay_filter_name = str(self.overlay_filter_name)
+        new_tr.overlay_filter_color = str(self.overlay_filter_color)
         return new_tr
 
     def get_pick(self, phase_name: str) -> Optional[PhasePick]:

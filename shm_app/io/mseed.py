@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import math
 import os
 import struct
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from shm_app.core.config_station import SHMConfig, get_config
@@ -495,10 +495,37 @@ def read_mseed_bytes(
         chan2 = channel[1:2] if len(channel) >= 2 else "H"
         comp = channel[2:3] if len(channel) >= 3 else "Z"
         stream_str = f"{station.lower()}-{chan1.lower()}{chan2.lower()}-{comp.lower()}"
-        calib = calib_override if (calib_override is not None and calib_override > 0) else cfg.get_sensitivity(stream_str, merged_start)
+        ch_meta = (
+            cfg.get_channel_metadata(network, station, locid, channel, merged_start)
+            if hasattr(cfg, "get_channel_metadata")
+            else None
+        )
+        if calib_override is not None and calib_override > 0:
+            calib = calib_override
+        elif ch_meta is not None and hasattr(cfg, "_stationxml_calib_nm_per_count"):
+            sxml_calib = cfg._stationxml_calib_nm_per_count(ch_meta)
+            calib = sxml_calib if (sxml_calib is not None and sxml_calib > 0) else cfg.get_sensitivity(stream_str, merged_start)
+        else:
+            calib = cfg.get_sensitivity(stream_str, merged_start)
         scaled_data = full_data * calib
 
         stat_info = cfg.get_station(station)
+        if ch_meta is not None and (ch_meta.latitude != 0.0 or ch_meta.longitude != 0.0):
+            tr_lat = float(ch_meta.latitude)
+            tr_lon = float(ch_meta.longitude)
+        else:
+            tr_lat = stat_info.lat
+            tr_lon = stat_info.lon
+        tr_inst = (ch_meta.sensor_description if (ch_meta is not None and ch_meta.sensor_description) else stat_info.instrument)
+        extra_headers: Dict[str, Any] = {}
+        if ch_meta is not None:
+            extra_headers["azimuth"] = float(ch_meta.azimuth)
+            extra_headers["dip"] = float(ch_meta.dip)
+            extra_headers["station_lat"] = float(tr_lat)
+            extra_headers["station_lon"] = float(tr_lon)
+            extra_headers["station_elev"] = float(ch_meta.elevation)
+            extra_headers["channel_depth_m"] = float(ch_meta.depth)
+
         tr = Trace(
             data=scaled_data,
             delta=dt,
@@ -510,9 +537,10 @@ def read_mseed_bytes(
             locid=locid,
             start_epoch=merged_start,
             calib=calib,
-            lat=stat_info.lat,
-            lon=stat_info.lon,
-            instype=stat_info.instrument,
+            lat=tr_lat,
+            lon=tr_lon,
+            instype=tr_inst,
+            extra_headers=extra_headers,
             source_path=source_path,
         )
         out_traces.append(tr)

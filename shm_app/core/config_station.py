@@ -11,6 +11,12 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 from shm_app import SHM_DEFAULT_ROOT
 from shm_app.core.models import StationInfo
 from shm_app.core.time_utils import parse_sh_time
+from shm_app.io.stationxml import (
+    StationXMLChannel,
+    StationXMLInventory,
+    parse_iso_epoch,
+    parse_stationxml,
+)
 
 DEFAULT_REF_STATION = "GRFO"
 DEFAULT_REF_LAT = 49.6919
@@ -196,6 +202,7 @@ class SHMConfig:
         self.sensitivities: List[Tuple[str, float, float, float]] = []
         self.filter_rules: List[Tuple[str, float, float, str]] = []
         self.station_groups: Dict[str, List[str]] = {}
+        self.stationxml_channels: List[StationXMLChannel] = []
         self.fer = FlinnEngdahlLookup(self.inputs_dir, shm_root=self.shm_root)
 
         self.load_all()
@@ -398,6 +405,170 @@ class SHMConfig:
         if stat_code in self.stations:
             return "GRSN"
         return "STS2"
+
+    @staticmethod
+    def _stationxml_calib_nm_per_count(ch: StationXMLChannel) -> Optional[float]:
+        """Convert StationXML sensitivity (counts per physical unit) to SHM calib (nm/s per count)."""
+        sens_val: Optional[float] = None
+        in_units = ""
+        if ch.instrument_sensitivity is not None and ch.instrument_sensitivity.value > 0.0:
+            sens_val = float(ch.instrument_sensitivity.value)
+            in_units = (ch.instrument_sensitivity.input_units or "").strip().upper()
+        elif ch.stages:
+            prod = 1.0
+            has_gain = False
+            for stg in ch.stages:
+                if stg.stage_gain is not None and stg.stage_gain.value > 0.0:
+                    prod *= float(stg.stage_gain.value)
+                    has_gain = True
+            if has_gain and prod > 0.0:
+                sens_val = prod
+                in_units = (ch.stages[0].input_units or "").strip().upper()
+
+        if sens_val is None or sens_val <= 0.0:
+            return None
+
+        if in_units in ("NM/S", "NM/SEC", "NM"):
+            return 1.0 / sens_val
+        if in_units in ("UM/S", "UM/SEC", "UM"):
+            return 1e3 / sens_val
+        if in_units in ("MM/S", "MM/SEC", "MM"):
+            return 1e6 / sens_val
+        if in_units in ("CM/S", "CM/SEC", "CM"):
+            return 1e7 / sens_val
+        return 1e9 / sens_val
+
+    def load_stationxml(self, path_or_xml: str) -> StationXMLInventory:
+        """Parse FDSN StationXML and merge stations, epoch sensitivities, and channel metadata."""
+        inv = parse_stationxml(path_or_xml)
+
+        for sta in inv.stations:
+            code = sta.code.strip().upper()
+            if not code:
+                continue
+            sensor_inst = ""
+            for ch in sta.channels:
+                if ch.sensor_description:
+                    sensor_inst = ch.sensor_description
+                    break
+            existing = self.stations.get(code)
+            if existing is not None:
+                if sta.latitude != 0.0 or sta.longitude != 0.0:
+                    existing.lat = sta.latitude
+                    existing.lon = sta.longitude
+                    existing.elevation = sta.elevation
+                if sta.name and sta.name != code:
+                    existing.name = sta.name
+                if sensor_inst:
+                    existing.instrument = sensor_inst
+            else:
+                self.stations[code] = StationInfo(
+                    code=code,
+                    name=sta.name or code,
+                    instrument=sensor_inst or "STS-2",
+                    lat=sta.latitude,
+                    lon=sta.longitude,
+                    elevation=sta.elevation,
+                )
+
+        new_sens: List[Tuple[str, float, float, float]] = []
+        for ch in inv.channels:
+            key = (ch.network.upper(), ch.station.upper(), ch.location.strip().upper(), ch.code.upper(), ch.start_date, ch.end_date)
+            replaced = False
+            for idx, cur in enumerate(self.stationxml_channels):
+                cur_key = (cur.network.upper(), cur.station.upper(), cur.location.strip().upper(), cur.code.upper(), cur.start_date, cur.end_date)
+                if cur_key == key:
+                    self.stationxml_channels[idx] = ch
+                    replaced = True
+                    break
+            if not replaced:
+                self.stationxml_channels.append(ch)
+
+            calib = self._stationxml_calib_nm_per_count(ch)
+            if calib is not None:
+                pat = ch.stream_name
+                t_from = ch.start_epoch if ch.start_epoch is not None else 0.0
+                t_to = ch.end_epoch if ch.end_epoch is not None else 4102444800.0
+                self.sensitivities = [
+                    entry for entry in self.sensitivities
+                    if not (entry[0] == pat and abs(entry[1] - t_from) < 1e-6 and abs(entry[2] - t_to) < 1e-6)
+                ]
+                new_sens.append((pat, t_from, t_to, calib))
+
+        if new_sens:
+            # Sort newest epochs first so epoch=None resolves to the most recent active epoch
+            new_sens.sort(key=lambda item: (item[2], item[1]), reverse=True)
+            self.sensitivities = new_sens + self.sensitivities
+
+        return inv
+
+    def get_channel_metadata(
+        self,
+        net: str,
+        sta: str,
+        loc: str = "",
+        cha: str = "",
+        epoch: Optional[Union[float, str]] = None,
+    ) -> Optional[StationXMLChannel]:
+        """Query stored StationXML channel orientation and response metadata by NSLC and optional epoch."""
+        epoch_val: Optional[float]
+        if isinstance(epoch, str):
+            epoch_val = parse_iso_epoch(epoch)
+            if epoch_val is None:
+                try:
+                    epoch_val = parse_sh_time(epoch)
+                except ValueError:
+                    epoch_val = None
+        else:
+            epoch_val = float(epoch) if epoch is not None else None
+
+        net_u = (net or "").strip().upper()
+        sta_u = (sta or "").strip().upper()
+        loc_norm = "" if (loc or "").strip() in ("", "--") else (loc or "").strip().upper()
+        cha_u = (cha or "").strip().upper()
+
+        matches: List[StationXMLChannel] = []
+        for ch in self.stationxml_channels:
+            if net_u and net_u != "*" and ch.network.upper() != net_u:
+                continue
+            if sta_u and sta_u != "*" and ch.station.upper() != sta_u:
+                continue
+            ch_loc = "" if ch.location.strip() in ("", "--") else ch.location.strip().upper()
+            if loc_norm != "*" and ch_loc != loc_norm:
+                continue
+            if cha_u and cha_u != "*" and ch.code.upper() != cha_u:
+                continue
+            if ch.matches_epoch(epoch_val):
+                matches.append(ch)
+
+        if not matches and loc_norm == "":
+            for ch in self.stationxml_channels:
+                if net_u and net_u != "*" and ch.network.upper() != net_u:
+                    continue
+                if sta_u and sta_u != "*" and ch.station.upper() != sta_u:
+                    continue
+                if cha_u and cha_u != "*" and ch.code.upper() != cha_u:
+                    continue
+                if ch.matches_epoch(epoch_val):
+                    matches.append(ch)
+
+        if not matches:
+            return None
+
+        if epoch_val is None:
+            matches.sort(
+                key=lambda c: (
+                    1 if c.end_epoch is None else 0,
+                    c.start_epoch if c.start_epoch is not None else float("-inf"),
+                ),
+                reverse=True,
+            )
+        else:
+            matches.sort(
+                key=lambda c: c.start_epoch if c.start_epoch is not None else float("-inf"),
+                reverse=True,
+            )
+        return matches[0]
 
     def relative_xy_km(self, stations: List[str], ref_station: str = "CENTRE") -> List[Tuple[float, float, float, float]]:
         """Return [(x_km, y_km, elev_m, vp_kms), ...] for a list of station codes relative to ref_station."""

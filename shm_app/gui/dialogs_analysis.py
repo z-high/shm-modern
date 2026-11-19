@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -29,9 +30,12 @@ from PyQt6.QtWidgets import (
 )
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.collections import LineCollection
+from matplotlib.colors import LinearSegmentedColormap, Normalize
 from matplotlib.figure import Figure
 
 from shm_app.core.config_station import SHMConfig, get_config
+from shm_app.core.fit_models import FitDiagnosticResult
 from shm_app.core.models import Trace
 from shm_app.gui.help_texts import register_tutorial_help
 from shm_app.gui.ui_helpers import add_dark_colorbar, apply_c_locale, disable_button_autodefault
@@ -40,15 +44,29 @@ from shm_app.processing.filters import (
     evaluate_stage_freq,
     load_named_filter,
 )
-from shm_app.processing.polarization import compute_mdir, rotate_3d_lqt
+from shm_app.processing.polarization import (
+    analyze_polarization_diagnostic,
+    compute_mdir,
+    rotate_3d_lqt,
+)
 from shm_app.processing.spectrum import (
+    build_brune_fit_diagnostic,
     compute_fft_spectrum,
     compute_mem_spectrum,
     compute_spectrogram,
     compute_welch_power_spectrum,
     fit_log_log_spectrum,
+    invert_brune_spectrum,
 )
-from shm_app.seismology.array_loc import compute_fk_analysis, compute_vespagram
+from shm_app.seismology.array_loc import (
+    SlownessCalibrationTable,
+    build_fk_fit_diagnostic,
+    compute_array_response_function,
+    compute_beam_diagnostics,
+    compute_fk_analysis,
+    compute_vespagram,
+    load_calibration_for_array,
+)
 
 
 class FilterDialog(QDialog):
@@ -57,13 +75,15 @@ class FilterDialog(QDialog):
     def __init__(self, dt: float = 0.05, config: Optional[SHMConfig] = None, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Filter Waveforms (Simulation & Butterworth Designer)")
-        self.resize(760, 540)
+        self.resize(780, 560)
         self.dt = dt if dt > 0 else 0.05
         self.config = config or get_config()
         self.selected_filter_expr: str = "WWSSN_SP"
         self.selected_mode: str = "AUTO"
         self.use_lpc: bool = False
         self.demean_first: bool = True
+        self.autocut: bool = False
+        self.zero_phase: bool = False
 
         layout = QVBoxLayout(self)
 
@@ -113,7 +133,7 @@ class FilterDialog(QDialog):
         but_form.addRow("High Corner Freq f2:", self.but_f2)
 
         self.but_order = QSpinBox()
-        self.but_order.setRange(1, 8)
+        self.but_order.setRange(1, 16)
         self.but_order.setValue(3)
         self.but_order.valueChanged.connect(self._update_preview)
         but_form.addRow("Poles / Order:", self.but_order)
@@ -143,19 +163,28 @@ class FilterDialog(QDialog):
         self.tabs.currentChanged.connect(self._on_tab_changed)
         layout.addWidget(self.tabs)
 
-        # Execution options
-        opt_h = QHBoxLayout()
+        # Execution options (two compact rows so checkboxes never clip horizontally)
+        opt_grid = QGridLayout()
+        opt_grid.setSpacing(6)
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["AUTO", "FFT (Pole-Zero)", "RECURSIVE (IIR)"])
         self.chk_demean = QCheckBox("Demean First")
         self.chk_demean.setChecked(True)
         self.chk_lpc = QCheckBox("Burg AR(20) LPC Startup")
-        opt_h.addWidget(QLabel("Implementation:"))
-        opt_h.addWidget(self.mode_combo)
-        opt_h.addWidget(self.chk_demean)
-        opt_h.addWidget(self.chk_lpc)
-        opt_h.addStretch(1)
-        layout.addLayout(opt_h)
+        self.chk_autocut = QCheckBox("Autocut ringing transient")
+        self.chk_autocut.setChecked(False)
+        self.chk_zero_phase = QCheckBox("Zero-phase (sosfiltfilt)")
+        self.chk_zero_phase.setChecked(False)
+        self.chk_zero_phase.toggled.connect(self._update_preview)
+
+        opt_grid.addWidget(QLabel("Implementation:"), 0, 0)
+        opt_grid.addWidget(self.mode_combo, 0, 1)
+        opt_grid.addWidget(self.chk_demean, 0, 2)
+        opt_grid.addWidget(self.chk_lpc, 0, 3)
+        opt_grid.addWidget(self.chk_autocut, 1, 1, 1, 2)
+        opt_grid.addWidget(self.chk_zero_phase, 1, 3)
+        opt_grid.setColumnStretch(4, 1)
+        layout.addLayout(opt_grid)
 
         # Live Bode frequency response plot
         self.fig = Figure(figsize=(6, 2.5), dpi=90, facecolor="#10141d")
@@ -182,17 +211,30 @@ class FilterDialog(QDialog):
         register_tutorial_help(self.but_type, "Butterworth Filter Type", "dlg_filter_butter", "", "Select BP, LP, HP, or BS response")
         register_tutorial_help(self.but_f1, "Lower / Corner Frequency", "dlg_filter_butter", "", "Cutoff frequency f1 in Hz")
         register_tutorial_help(self.but_f2, "Upper Corner Frequency", "dlg_filter_butter", "", "Upper cutoff frequency f2 in Hz")
-        register_tutorial_help(self.but_order, "Filter Order (Poles)", "dlg_filter_butter", "", "Butterworth pole count / steepness")
+        register_tutorial_help(self.but_order, "Filter Order (Poles)", "dlg_filter_butter", "", "Butterworth pole count / steepness (1..16 via SOS)")
         register_tutorial_help(self.file_search, "Filter Bank Search", "dlg_filter_presets", "", "Filter .FLF / .FLR bank entries by name")
         register_tutorial_help(self.file_list, "Filter Bank (.FLF / .FLR)", "dlg_filter_presets", "", "SHM standard filter files from filter/")
         register_tutorial_help(self.mode_combo, "Filter Implementation", "dlg_filter_options", "", "AUTO, FFT zero-phase, or Recursive IIR")
         register_tutorial_help(self.chk_demean, "Demean First", "dlg_filter_options", "", "Remove DC offset prior to filtering")
         register_tutorial_help(self.chk_lpc, "Burg AR(20) Startup", "dlg_filter_options", "", "Extrapolate trace start via Burg AR(20) to reduce transients")
+        register_tutorial_help(self.chk_autocut, "Autocut Ringing Transient", "dlg_filter_options", "", "Automatically trim initial filter settling ringing transient")
+        register_tutorial_help(self.chk_zero_phase, "Zero-Phase (sosfiltfilt)", "dlg_filter_options", "", "Apply forward-backward zero-phase SOS filtering")
 
         disable_button_autodefault(self)
         apply_c_locale(self)
         self._update_butter_controls()
         self._update_preview()
+
+    def get_filter_options(self) -> Dict[str, Any]:
+        """Return currently configured/applied filter parameters."""
+        return {
+            "filter_expr": self.selected_filter_expr,
+            "mode": self.selected_mode,
+            "use_lpc": self.use_lpc,
+            "demean_first": self.demean_first,
+            "autocut": self.autocut,
+            "zero_phase": self.zero_phase,
+        }
 
     def _update_butter_controls(self) -> None:
         ft = self.but_type.currentText().split()[0]
@@ -275,6 +317,8 @@ class FilterDialog(QDialog):
     def _update_preview(self) -> None:
         expr = self._current_expr()
         self.selected_filter_expr = expr or "NONE"
+        self.autocut = self.chk_autocut.isChecked() if hasattr(self, "chk_autocut") else False
+        self.zero_phase = self.chk_zero_phase.isChecked() if hasattr(self, "chk_zero_phase") else False
         self.expr_lbl.setText(f"Filter: {expr if expr else '(none selected)'}")
 
         self.fig.clear()
@@ -288,8 +332,12 @@ class FilterDialog(QDialog):
         for stg in stages:
             resp *= evaluate_stage_freq(stg, omega)
 
-        amp = np.maximum(1e-12, np.abs(resp))
-        ph_deg = np.degrees(np.angle(resp))
+        if self.zero_phase and stages and all(s.store_id == 3 for s in stages):
+            amp = np.maximum(1e-12, np.abs(resp) ** 2)
+            ph_deg = np.zeros_like(amp)
+        else:
+            amp = np.maximum(1e-12, np.abs(resp))
+            ph_deg = np.degrees(np.angle(resp))
 
         ax1.loglog(freqs, amp, color="#58a6ff", lw=1.6)
         ax1.set_title("Amplitude Response |H(f)|", color="#e6edf3", fontsize=9)
@@ -313,11 +361,113 @@ class FilterDialog(QDialog):
         self.selected_mode = "FFT" if m_txt.startswith("FFT") else ("REC" if m_txt.startswith("REC") else "AUTO")
         self.use_lpc = self.chk_lpc.isChecked()
         self.demean_first = self.chk_demean.isChecked()
+        self.autocut = self.chk_autocut.isChecked()
+        self.zero_phase = self.chk_zero_phase.isChecked()
         self.accept()
 
     def _on_unfilter(self) -> None:
         self.selected_filter_expr = "NONE"
+        self.autocut = False
+        self.zero_phase = False
         self.accept()
+
+
+
+def _compute_fk_bundle(
+    traces: List[Trace],
+    t_lo: Optional[float],
+    t_hi: Optional[float],
+    f_lo: float,
+    f_hi: float,
+    max_slowness: float,
+    grid_points: int,
+    config: Optional[SHMConfig],
+    calib_table: Optional[SlownessCalibrationTable] = None,
+    apply_calibration: bool = False,
+    progress_callback: Optional[Callable[[int, int], bool]] = None,
+    is_cancelled: Optional[Callable[[], bool]] = None,
+) -> Dict[str, Any]:
+    """Run FK slowness grid search plus beam diagnostics, 2D ARF, and FitDiagnosticResult."""
+    cfg = config or get_config()
+    res = compute_fk_analysis(
+        traces,
+        t_lo=t_lo,
+        t_hi=t_hi,
+        f_lo=f_lo,
+        f_hi=f_hi,
+        max_slowness=max_slowness,
+        grid_points=grid_points,
+        config=cfg,
+        progress_callback=progress_callback,
+        calib_table=calib_table if apply_calibration else None,
+        apply_calibration=bool(apply_calibration),
+    )
+    if not res or (is_cancelled is not None and is_cancelled()):
+        return {}
+
+    # Always preserve raw peak fields so toggling calibration can switch cleanly without re-gridding
+    if "raw_azimuth" not in res:
+        res["raw_azimuth"] = float(res["azimuth"])
+        res["raw_slowness"] = float(res["slowness"])
+        res["raw_sx"] = float(res["sx"])
+        res["raw_sy"] = float(res["sy"])
+
+    if calib_table is not None and len(calib_table) > 0 and not res.get("calib_applied", False):
+        p_slo, p_az, _, _ = calib_table.calibrate(res["raw_slowness"], res["raw_azimuth"])
+        res["preview_cal_slowness"] = float(p_slo)
+        res["preview_cal_azimuth"] = float(p_az)
+
+    beam_diag: Optional[Dict[str, Any]] = None
+    try:
+        beam_diag = compute_beam_diagnostics(
+            traces,
+            azimuth_deg=float(res["azimuth"]),
+            slowness_s_deg=float(res["slowness"]),
+            t_lo=t_lo,
+            t_hi=t_hi,
+            config=cfg,
+        )
+    except Exception:
+        beam_diag = None
+
+    if is_cancelled is not None and is_cancelled():
+        return {}
+
+    arf_result: Optional[Dict[str, Any]] = None
+    try:
+        rel_coords = cfg.relative_xy_km([t.station for t in traces], ref_station="CENTRE")
+        x_km = [c[0] for c in rel_coords]
+        y_km = [c[1] for c in rel_coords]
+        f_mid = max(0.05, 0.5 * (float(f_lo) + float(f_hi)))
+        n_arf = len(res["s_axis"]) if "s_axis" in res else max(11, int(grid_points) | 1)
+        arf_result = compute_array_response_function(
+            x_km,
+            y_km,
+            slowness_max=float(max_slowness),
+            n_grid=n_arf,
+            freq_hz=f_mid,
+        )
+    except Exception:
+        arf_result = None
+
+    if is_cancelled is not None and is_cancelled():
+        return {}
+
+    diag: Optional[FitDiagnosticResult] = None
+    try:
+        diag = build_fk_fit_diagnostic(
+            res,
+            beam_diag=beam_diag,
+            arf_result=arf_result,
+            calib_info=res,
+        )
+    except Exception:
+        diag = None
+
+    res["beam_diagnostics"] = beam_diag
+    res["arf_result"] = arf_result
+    res["fit_diagnostic"] = diag
+    return res
 
 
 class FKWorker(QThread):
@@ -336,6 +486,8 @@ class FKWorker(QThread):
         grid_points: int,
         config: Optional[SHMConfig],
         parent: Optional[QWidget] = None,
+        calib_table: Optional[SlownessCalibrationTable] = None,
+        apply_calibration: bool = False,
     ) -> None:
         super().__init__(parent)
         self.traces = traces
@@ -346,6 +498,8 @@ class FKWorker(QThread):
         self.max_slowness = max_slowness
         self.grid_points = grid_points
         self.config = config
+        self.calib_table = calib_table
+        self.apply_calibration = apply_calibration
         self._is_cancelled = False
 
     def cancel(self) -> None:
@@ -360,7 +514,7 @@ class FKWorker(QThread):
                 self.progress.emit(pct)
                 return True
 
-            res = compute_fk_analysis(
+            res = _compute_fk_bundle(
                 self.traces,
                 t_lo=self.t_lo,
                 t_hi=self.t_hi,
@@ -369,7 +523,10 @@ class FKWorker(QThread):
                 max_slowness=self.max_slowness,
                 grid_points=self.grid_points,
                 config=self.config,
+                calib_table=self.calib_table,
+                apply_calibration=self.apply_calibration,
                 progress_callback=cb,
+                is_cancelled=lambda: self._is_cancelled,
             )
             if not self._is_cancelled and res:
                 self.finishedResult.emit(res)
@@ -383,6 +540,7 @@ class FKAnalysisDialog(QDialog):
 
     adoptParameters = pyqtSignal(float, float)  # (azimuth_deg, slowness_s_deg)
     adoptAndLocate = pyqtSignal(float, float)  # (azimuth_deg, slowness_s_deg)
+    fitDiagnosticReady = pyqtSignal(object)  # FitDiagnosticResult
 
     def __init__(
         self,
@@ -394,17 +552,23 @@ class FKAnalysisDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Array Frequency-Wavenumber (FK) Analysis")
-        self.resize(740, 620)
+        self.resize(880, 650)
         self.traces = traces
         self.t_lo = t_lo
         self.t_hi = t_hi
         self.config = config or get_config()
-        self.last_result: Optional[Dict] = None
+        self.last_result: Optional[Dict[str, Any]] = None
+        self.last_diagnostic: Optional[FitDiagnosticResult] = None
         self.worker: Optional[FKWorker] = None
+
+        stations = [t.station for t in self.traces if getattr(t, "station", "")]
+        self.calib_table: Optional[SlownessCalibrationTable] = (
+            load_calibration_for_array(stations, config=self.config) if stations else None
+        )
 
         layout = QVBoxLayout(self)
 
-        # Controls bar (two compact rows so spinboxes fit inside dialog width cleanly)
+        # Controls bar
         ctrl_grid = QGridLayout()
         ctrl_grid.setSpacing(6)
         self.flo_spin = QDoubleSpinBox()
@@ -430,6 +594,18 @@ class FKAnalysisDialog(QDialog):
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(self.cancel_fk)
 
+        self.chk_apply_calib = QCheckBox("Apply Slowness Calibration")
+        has_calib = self.calib_table is not None and len(self.calib_table) > 0
+        self.chk_apply_calib.setEnabled(has_calib)
+        self.chk_apply_calib.setChecked(has_calib)
+        self.chk_apply_calib.toggled.connect(self._on_calib_toggled)
+        self.calib_status_lbl = QLabel(
+            f"Calibration table loaded ({len(self.calib_table)} entries)"
+            if has_calib
+            else "No array slowness calibration table found"
+        )
+        self.calib_status_lbl.setStyleSheet("color: #8b949e; font-size: 11px;")
+
         ctrl_grid.addWidget(QLabel("Freq Lo:"), 0, 0)
         ctrl_grid.addWidget(self.flo_spin, 0, 1)
         ctrl_grid.addWidget(QLabel("Freq Hi:"), 0, 2)
@@ -440,6 +616,8 @@ class FKAnalysisDialog(QDialog):
         ctrl_grid.addWidget(self.grid_spin, 1, 3)
         ctrl_grid.addWidget(self.btn_run, 0, 4, 1, 1)
         ctrl_grid.addWidget(self.btn_cancel, 1, 4, 1, 1)
+        ctrl_grid.addWidget(self.chk_apply_calib, 2, 0, 1, 3)
+        ctrl_grid.addWidget(self.calib_status_lbl, 2, 3, 1, 3)
         ctrl_grid.setColumnStretch(5, 1)
         layout.addLayout(ctrl_grid)
 
@@ -454,7 +632,12 @@ class FKAnalysisDialog(QDialog):
         self.res_label.setWordWrap(True)
         layout.addWidget(self.res_label)
 
-        self.fig = Figure(figsize=(6.5, 4.8), dpi=95, facecolor="#10141d")
+        self.diag_label = QLabel("Beam Coherence / Poor Channels (CC < 0.70): —")
+        self.diag_label.setStyleSheet("color: #8b949e;")
+        self.diag_label.setWordWrap(True)
+        layout.addWidget(self.diag_label)
+
+        self.fig = Figure(figsize=(7.6, 4.6), dpi=95, facecolor="#10141d")
         self.canvas = FigureCanvas(self.fig)
         layout.addWidget(self.canvas)
 
@@ -476,6 +659,7 @@ class FKAnalysisDialog(QDialog):
             (self.fhi_spin, "High Frequency Cutoff"),
             (self.max_slo_spin, "Max Slowness Search Bound"),
             (self.grid_spin, "FK Slowness Grid Size"),
+            (self.chk_apply_calib, "Apply empirical slowness/backazimuth calibration (calib_grf.dat)"),
             (self.chk_auto_locate, "Compute epicenter from slowness when adopting"),
         ]:
             register_tutorial_help(w, t, "dlg_fk_params", "", t)
@@ -486,11 +670,95 @@ class FKAnalysisDialog(QDialog):
         if len(self.traces) >= 3:
             self.run_fk(sync=True)
 
+    def _on_calib_toggled(self, checked: bool) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            return
+        if self.last_result is None or len(self.traces) < 3:
+            return
+
+        res = dict(self.last_result)
+        raw_az = float(res.get("raw_azimuth", res["azimuth"]))
+        raw_slo = float(res.get("raw_slowness", res["slowness"]))
+        raw_sx = float(res.get("raw_sx", raw_slo * math.sin(math.radians(raw_az))))
+        raw_sy = float(res.get("raw_sy", raw_slo * math.cos(math.radians(raw_az))))
+
+        deg_to_km = 111.19492664455873
+        if checked and self.calib_table is not None and len(self.calib_table) > 0:
+            cal_slo, cal_az, d_slo, d_az = self.calib_table.calibrate(raw_slo, raw_az)
+            cal_az_r = math.radians(cal_az)
+            cal_sx = float(cal_slo * math.sin(cal_az_r))
+            cal_sy = float(cal_slo * math.cos(cal_az_r))
+            res.update(
+                {
+                    "azimuth": float(cal_az),
+                    "slowness": float(cal_slo),
+                    "apparent_velocity_kms": (deg_to_km / cal_slo) if cal_slo > 1e-6 else 999.9,
+                    "sx": cal_sx,
+                    "sy": cal_sy,
+                    "calib_applied": True,
+                    "raw_azimuth": raw_az,
+                    "raw_slowness": raw_slo,
+                    "raw_sx": raw_sx,
+                    "raw_sy": raw_sy,
+                    "cal_azimuth": float(cal_az),
+                    "cal_slowness": float(cal_slo),
+                    "cal_sx": cal_sx,
+                    "cal_sy": cal_sy,
+                    "calib_d_slowness": float(d_slo),
+                    "calib_d_azimuth": float(d_az),
+                }
+            )
+        else:
+            if self.calib_table is not None and len(self.calib_table) > 0:
+                p_slo, p_az, _, _ = self.calib_table.calibrate(raw_slo, raw_az)
+                res["preview_cal_slowness"] = float(p_slo)
+                res["preview_cal_azimuth"] = float(p_az)
+            res.update(
+                {
+                    "azimuth": raw_az,
+                    "slowness": raw_slo,
+                    "apparent_velocity_kms": (deg_to_km / raw_slo) if raw_slo > 1e-6 else 999.9,
+                    "sx": raw_sx,
+                    "sy": raw_sy,
+                    "calib_applied": False,
+                    "raw_azimuth": raw_az,
+                    "raw_slowness": raw_slo,
+                    "raw_sx": raw_sx,
+                    "raw_sy": raw_sy,
+                }
+            )
+
+        try:
+            beam_diag = compute_beam_diagnostics(
+                self.traces,
+                azimuth_deg=float(res["azimuth"]),
+                slowness_s_deg=float(res["slowness"]),
+                t_lo=self.t_lo,
+                t_hi=self.t_hi,
+                config=self.config,
+            )
+        except Exception:
+            beam_diag = None
+        arf_res = res.get("arf_result")
+        try:
+            diag = build_fk_fit_diagnostic(
+                res,
+                beam_diag=beam_diag,
+                arf_result=arf_res,
+                calib_info=res,
+            )
+        except Exception:
+            diag = None
+        res["beam_diagnostics"] = beam_diag
+        res["fit_diagnostic"] = diag
+        self._on_fk_finished(res)
+
     def run_fk(self, sync: bool = True) -> None:
         if len(self.traces) < 3:
             self.res_label.setText("Need at least 3 array traces in workspace for FK analysis.")
             return
 
+        apply_cal = bool(self.chk_apply_calib.isChecked() and self.calib_table is not None)
         if not sync:
             if self.worker is not None and self.worker.isRunning():
                 self.worker.cancel()
@@ -499,7 +767,7 @@ class FKAnalysisDialog(QDialog):
             self.btn_cancel.setEnabled(True)
             self.progress_bar.setValue(0)
             self.progress_bar.setVisible(True)
-            self.res_label.setText("Computing FK grid search in background...")
+            self.res_label.setText("Computing FK grid search, ARF, and beam diagnostics in background...")
 
             self.worker = FKWorker(
                 self.traces,
@@ -511,13 +779,15 @@ class FKAnalysisDialog(QDialog):
                 grid_points=self.grid_spin.value(),
                 config=self.config,
                 parent=self,
+                calib_table=self.calib_table,
+                apply_calibration=apply_cal,
             )
             self.worker.progress.connect(self._on_fk_progress)
             self.worker.finishedResult.connect(self._on_fk_finished)
             self.worker.error.connect(self._on_fk_error)
             self.worker.start()
         else:
-            res = compute_fk_analysis(
+            res = _compute_fk_bundle(
                 self.traces,
                 t_lo=self.t_lo,
                 t_hi=self.t_hi,
@@ -526,6 +796,8 @@ class FKAnalysisDialog(QDialog):
                 max_slowness=self.max_slo_spin.value(),
                 grid_points=self.grid_spin.value(),
                 config=self.config,
+                calib_table=self.calib_table,
+                apply_calibration=apply_cal,
             )
             self._on_fk_finished(res)
 
@@ -539,13 +811,57 @@ class FKAnalysisDialog(QDialog):
         if not res:
             return
         self.last_result = res
-        self.res_label.setText(
-            f"Peak Backazimuth: {res['azimuth']:.1f} deg   |   Slowness: {res['slowness']:.2f} s/deg   |   "
-            f"Apparent Vel: {res['apparent_velocity_kms']:.2f} km/s   |   Semblance: {res['semblance']:.3f} ({res['power_db']:.1f} dB)"
-        )
+        self.last_diagnostic = res.get("fit_diagnostic")
+
+        raw_az = float(res.get("raw_azimuth", res["azimuth"]))
+        raw_slo = float(res.get("raw_slowness", res["slowness"]))
+        calib_applied = bool(res.get("calib_applied", False))
+        if calib_applied:
+            cal_az = float(res.get("cal_azimuth", res["azimuth"]))
+            cal_slo = float(res.get("cal_slowness", res["slowness"]))
+            self.res_label.setText(
+                f"Raw BAZ: {raw_az:.1f} deg | Raw Slow: {raw_slo:.2f} s/deg   ->   "
+                f"Cal BAZ: {cal_az:.1f} deg | Cal Slow: {cal_slo:.2f} s/deg   |   "
+                f"App Vel: {res['apparent_velocity_kms']:.2f} km/s   |   "
+                f"Semblance: {res['semblance']:.3f} ({res['power_db']:.1f} dB)"
+            )
+        else:
+            cal_note = ""
+            if "preview_cal_azimuth" in res and "preview_cal_slowness" in res:
+                cal_note = (
+                    f"   |   Calibrated (off): {res['preview_cal_azimuth']:.1f} deg, "
+                    f"{res['preview_cal_slowness']:.2f} s/deg"
+                )
+            self.res_label.setText(
+                f"Raw BAZ: {raw_az:.1f} deg | Raw Slow: {raw_slo:.2f} s/deg{cal_note}   |   "
+                f"App Vel: {res['apparent_velocity_kms']:.2f} km/s   |   "
+                f"Semblance: {res['semblance']:.3f} ({res['power_db']:.1f} dB)"
+            )
+
+        beam_diag = res.get("beam_diagnostics")
+        if beam_diag:
+            mean_cc = float(beam_diag.get("mean_cc", 0.0))
+            ch_names = beam_diag.get("channel_names", [])
+            ch_cc = beam_diag.get("channel_cc", [])
+            poor_pairs = [(n, c) for n, c in zip(ch_names, ch_cc) if c < 0.70]
+            if poor_pairs:
+                poor_str = ", ".join(f"{n} (CC={c:.2f})" for n, c in poor_pairs)
+                self.diag_label.setText(
+                    f"Beam Mean CC: {mean_cc:.3f}   |   Poor channels (CC < 0.70): {poor_str}"
+                )
+                self.diag_label.setStyleSheet("color: #f85149; font-weight: bold;")
+            else:
+                self.diag_label.setText(
+                    f"Beam Mean CC: {mean_cc:.3f}   |   Poor channels (CC < 0.70): None ({len(ch_names)} coherent)"
+                )
+                self.diag_label.setStyleSheet("color: #3fb950;")
+        else:
+            self.diag_label.setText("Beam Coherence / Poor Channels (CC < 0.70): N/A")
+            self.diag_label.setStyleSheet("color: #8b949e;")
 
         self.fig.clear()
-        ax = self.fig.add_subplot(111, facecolor="#0d1117")
+        arf_res = res.get("arf_result")
+        ax = self.fig.add_subplot(121 if arf_res is not None else 111, facecolor="#0d1117")
         s_ax = res["s_axis"]
         grid = res["grid"]
         im = ax.contourf(s_ax, s_ax, grid, levels=20, cmap="inferno")
@@ -559,19 +875,52 @@ class FKAnalysisDialog(QDialog):
         ax.axhline(0, color="#8b949e", lw=0.7)
         ax.axvline(0, color="#8b949e", lw=0.7)
 
-        # Plot interpolated peak vector
-        ax.plot([0, res["sx"]], [0, res["sy"]], color="#58a6ff", lw=1.8)
-        ax.plot(res["sx"], res["sy"], marker="*", markersize=14, color="#3fb950", label="FK Peak")
+        raw_sx = float(res.get("raw_sx", res["sx"]))
+        raw_sy = float(res.get("raw_sy", res["sy"]))
+        if calib_applied:
+            ax.plot([0, raw_sx], [0, raw_sy], color="#8b949e", lw=1.2, ls=":")
+            ax.plot(raw_sx, raw_sy, marker="o", markersize=8, color="#ffa657", label="Raw FK Peak")
+            ax.annotate(
+                "",
+                xy=(res["sx"], res["sy"]),
+                xytext=(raw_sx, raw_sy),
+                arrowprops=dict(arrowstyle="->", color="#58a6ff", lw=1.8),
+            )
+            ax.plot(res["sx"], res["sy"], marker="*", markersize=14, color="#3fb950", label="Calibrated Peak")
+            ax.legend(loc="upper right", fontsize=7, facecolor="#161b22", labelcolor="#e6edf3")
+        else:
+            ax.plot([0, res["sx"]], [0, res["sy"]], color="#58a6ff", lw=1.8)
+            ax.plot(res["sx"], res["sy"], marker="*", markersize=14, color="#3fb950", label="FK Peak")
+
         ax.set_xlabel("East Slowness Sx (s/deg)", color="#e6edf3")
         ax.set_ylabel("North Slowness Sy (s/deg)", color="#e6edf3")
         ax.set_title(
             f"Wideband FK Slowness Map ({self.flo_spin.value():.1f}-{self.fhi_spin.value():.1f} Hz)",
             color="#e6edf3",
+            fontsize=9,
         )
         ax.tick_params(colors="#8b949e")
         ax.set_aspect("equal")
+
+        if arf_res is not None:
+            ax_arf = self.fig.add_subplot(122, facecolor="#0d1117")
+            arf_s = arf_res["s_axis"]
+            arf_db = np.clip(arf_res["arf_db"], -25.0, 0.0)
+            im_arf = ax_arf.contourf(arf_s, arf_s, arf_db, levels=16, cmap="viridis")
+            add_dark_colorbar(self.fig, im_arf, ax_arf, "ARF |A(k)|^2 (dB)")
+            ax_arf.axhline(0, color="#8b949e", lw=0.7)
+            ax_arf.axvline(0, color="#8b949e", lw=0.7)
+            ax_arf.set_xlabel("East Slowness Sx (s/deg)", color="#e6edf3")
+            ax_arf.set_ylabel("North Slowness Sy (s/deg)", color="#e6edf3")
+            ax_arf.set_title("Array Response Function (ARF)", color="#e6edf3", fontsize=9)
+            ax_arf.tick_params(colors="#8b949e")
+            ax_arf.set_aspect("equal")
+
         self.fig.tight_layout()
         self.canvas.draw_idle()
+
+        if self.last_diagnostic is not None:
+            self.fitDiagnosticReady.emit(self.last_diagnostic)
 
     def _on_fk_error(self, err: str) -> None:
         self.btn_run.setEnabled(True)
@@ -609,6 +958,7 @@ class FKAnalysisDialog(QDialog):
             else:
                 self.adoptParameters.emit(az, slo)
             self.accept()
+
 
 
 class VespagramWorker(QThread):
@@ -859,15 +1209,80 @@ class VespagramDialog(QDialog):
             self.accept()
 
 
-class SpectrumDialog(QDialog):
-    """Interactive spectral analysis (FFT, Welch PSD, Burg MEM) and spectrogram.
+class BruneInversionWorker(QThread):
+    finishedResult = pyqtSignal(dict)
+    error = pyqtSignal(str)
 
-    Spectra are computed from a time window of a trace (the yellow Magnifier window). Every call to
-    ``add_curve`` adds one more curve in a new colour to the same graph, so windows (or traces) can
-    be compared directly.
-    """
+    def __init__(
+        self,
+        trace: Trace,
+        t_lo: Optional[float],
+        t_hi: Optional[float],
+        noise_lo: Optional[float],
+        noise_hi: Optional[float],
+        model: str = "brune",
+        f_lo: float = 0.1,
+        f_hi: Optional[float] = None,
+        t_star_init: float = 0.02,
+        fit_t_star: bool = True,
+        distance_km: float = 100.0,
+        vel_kms: float = 3.5,
+        phase: str = "P",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.trace = trace
+        self.t_lo = t_lo
+        self.t_hi = t_hi
+        self.noise_lo = noise_lo
+        self.noise_hi = noise_hi
+        self.model = model
+        self.f_lo = f_lo
+        self.f_hi = f_hi
+        self.t_star_init = t_star_init
+        self.fit_t_star = fit_t_star
+        self.distance_km = distance_km
+        self.vel_kms = vel_kms
+        self.phase = phase
+        self._is_cancelled = False
+
+    def cancel(self) -> None:
+        self._is_cancelled = True
+
+    def run(self) -> None:
+        try:
+            if self._is_cancelled:
+                return
+            inv_res = invert_brune_spectrum(
+                self.trace,
+                t_lo=self.t_lo,
+                t_hi=self.t_hi,
+                noise_lo=self.noise_lo,
+                noise_hi=self.noise_hi,
+                model=self.model,
+                f_lo=self.f_lo,
+                f_hi=self.f_hi,
+                t_star_init=self.t_star_init,
+                fit_t_star=self.fit_t_star,
+                distance_m=max(100.0, float(self.distance_km) * 1000.0),
+                vel_m_s=max(100.0, float(self.vel_kms) * 1000.0),
+            )
+            if self._is_cancelled:
+                return
+            diag = build_brune_fit_diagnostic(inv_res, station=self.trace.station, phase=self.phase)
+            if not self._is_cancelled:
+                self.finishedResult.emit({"inversion": inv_res, "diagnostic": diag})
+        except Exception as exc:
+            if not self._is_cancelled:
+                self.error.emit(str(exc))
+
+
+class SpectrumDialog(QDialog):
+    """Interactive spectral analysis (FFT, Welch PSD, Burg MEM), spectrogram, and Brune/Boatwright source inversion."""
 
     CURVE_COLORS = ["#58a6ff", "#ffa657", "#3fb950", "#d2a8ff", "#ff7b72", "#f2cc60", "#56d4dd", "#ff9bce"]
+
+    fitDiagnosticReady = pyqtSignal(object)  # FitDiagnosticResult
 
     def __init__(
         self,
@@ -879,12 +1294,15 @@ class SpectrumDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Spectrum & Spectrogram")
-        self.resize(820, 600)
+        self.resize(880, 660)
         # Each curve: dict(trace=<snapshot>, t_lo, t_hi (trace-relative s), label, color)
         self.curves: List[dict] = []
         self._ax = None
         self._spec_grid: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
         self._closing = False
+        self.brune_worker: Optional[BruneInversionWorker] = None
+        self.last_brune_result: Optional[Dict[str, Any]] = None
+        self.last_brune_diagnostic: Optional[FitDiagnosticResult] = None
 
         layout = QVBoxLayout(self)
 
@@ -929,12 +1347,79 @@ class SpectrumDialog(QDialog):
         ctrl_grid.setColumnStretch(6, 1)
         layout.addLayout(ctrl_grid)
 
+        # Brune / Boatwright w^-2 Source Inversion Controls (M-09)
+        brune_grp = QGroupBox("Brune / Boatwright w^-2 Source Inversion")
+        brune_grid = QGridLayout(brune_grp)
+        brune_grid.setSpacing(6)
+
+        self.brune_model_combo = QComboBox()
+        self.brune_model_combo.addItems(["brune", "boatwright"])
+
+        self.brune_tstar_spin = QDoubleSpinBox()
+        self.brune_tstar_spin.setRange(0.0, 2.0)
+        self.brune_tstar_spin.setDecimals(3)
+        self.brune_tstar_spin.setSingleStep(0.01)
+        self.brune_tstar_spin.setValue(0.020)
+        self.brune_tstar_spin.setSuffix(" s")
+
+        self.chk_fit_tstar = QCheckBox("Fit t*")
+        self.chk_fit_tstar.setChecked(True)
+
+        self.dist_km_spin = QDoubleSpinBox()
+        self.dist_km_spin.setRange(0.1, 20000.0)
+        self.dist_km_spin.setDecimals(1)
+        self.dist_km_spin.setValue(100.0)
+        self.dist_km_spin.setSuffix(" km")
+
+        self.vel_kms_spin = QDoubleSpinBox()
+        self.vel_kms_spin.setRange(0.5, 15.0)
+        self.vel_kms_spin.setDecimals(2)
+        self.vel_kms_spin.setValue(3.50)
+        self.vel_kms_spin.setSuffix(" km/s")
+
+        self.chk_use_noise = QCheckBox("Noise Window [s]:")
+        self.chk_use_noise.setChecked(False)
+        self.noise_lo_spin = QDoubleSpinBox()
+        self.noise_lo_spin.setRange(-10000.0, 100000.0)
+        self.noise_lo_spin.setDecimals(2)
+        self.noise_lo_spin.setValue(0.0)
+        self.noise_hi_spin = QDoubleSpinBox()
+        self.noise_hi_spin.setRange(-10000.0, 100000.0)
+        self.noise_hi_spin.setDecimals(2)
+        self.noise_hi_spin.setValue(5.0)
+
+        self.btn_fit_brune = QPushButton("Fit Brune/Boatwright")
+        self.btn_fit_brune.clicked.connect(lambda: self.run_brune_inversion(sync=False))
+
+        brune_grid.addWidget(QLabel("Model:"), 0, 0)
+        brune_grid.addWidget(self.brune_model_combo, 0, 1)
+        brune_grid.addWidget(QLabel("t*:"), 0, 2)
+        brune_grid.addWidget(self.brune_tstar_spin, 0, 3)
+        brune_grid.addWidget(self.chk_fit_tstar, 0, 4)
+        brune_grid.addWidget(QLabel("Distance:"), 0, 5)
+        brune_grid.addWidget(self.dist_km_spin, 0, 6)
+        brune_grid.addWidget(QLabel("Velocity:"), 0, 7)
+        brune_grid.addWidget(self.vel_kms_spin, 0, 8)
+
+        brune_grid.addWidget(self.chk_use_noise, 1, 0, 1, 2)
+        brune_grid.addWidget(self.noise_lo_spin, 1, 2, 1, 2)
+        brune_grid.addWidget(QLabel("to"), 1, 4)
+        brune_grid.addWidget(self.noise_hi_spin, 1, 5, 1, 2)
+        brune_grid.addWidget(self.btn_fit_brune, 1, 7, 1, 2)
+        brune_grid.setColumnStretch(9, 1)
+        layout.addWidget(brune_grp)
+
         self.fit_label = QLabel("")
         self.fit_label.setStyleSheet("color: #ffa657; font-weight: bold;")
         self.fit_label.setWordWrap(True)
         layout.addWidget(self.fit_label)
 
-        self.fig = Figure(figsize=(7.2, 4.5), dpi=95, facecolor="#10141d")
+        self.brune_label = QLabel("Brune/Boatwright Source Fit: Click 'Fit Brune/Boatwright' to invert source parameters.")
+        self.brune_label.setStyleSheet("color: #3fb950; font-weight: bold;")
+        self.brune_label.setWordWrap(True)
+        layout.addWidget(self.brune_label)
+
+        self.fig = Figure(figsize=(7.2, 4.2), dpi=95, facecolor="#10141d")
         self.canvas = FigureCanvas(self.fig)
         layout.addWidget(self.canvas)
 
@@ -955,6 +1440,10 @@ class SpectrumDialog(QDialog):
         register_tutorial_help(self.fit_f1, "Spectral Fit Low Freq (Hz)", "dlg_spec_method", "", "Lower frequency for log-log spectral fit")
         register_tutorial_help(self.fit_f2, "Spectral Fit High Freq (Hz)", "dlg_spec_method", "", "Upper frequency for log-log spectral fit")
         register_tutorial_help(self.chk_fit, "Show Log-Log Fit Lines", "dlg_spec_method", "", "Overlay corner-frequency fit model")
+        register_tutorial_help(self.brune_model_combo, "Source Spectrum Model", "dlg_spec_method", "", "Select Brune (gamma=1) or Boatwright (gamma=2) w^-2 model")
+        register_tutorial_help(self.brune_tstar_spin, "Attenuation t*", "dlg_spec_method", "", "Initial or fixed attenuation operator t* in seconds")
+        register_tutorial_help(self.dist_km_spin, "Epicentral Distance (km)", "dlg_spec_method", "", "Hypocentral/epicentral distance for seismic moment M0")
+        register_tutorial_help(self.vel_kms_spin, "Phase Velocity (km/s)", "dlg_spec_method", "", "Wave speed for M0, source radius r0, and stress drop")
 
         disable_button_autodefault(self)
         apply_c_locale(self)
@@ -1002,15 +1491,137 @@ class SpectrumDialog(QDialog):
                 "color": color,
             }
         )
+        if getattr(trace, "distance", 0.0) > 0.0 and len(self.curves) == 1:
+            self.dist_km_spin.setValue(max(0.1, float(trace.distance) * 111.19492664455873))
+        if t_lo is not None and t_lo > 1.0 and len(self.curves) == 1:
+            n_lo = max(0.0, float(t_lo) - 10.0)
+            n_hi = max(n_lo + 0.5, float(t_lo) - 0.5)
+            if n_hi < t_lo:
+                self.noise_lo_spin.setValue(n_lo)
+                self.noise_hi_spin.setValue(n_hi)
         self.setWindowTitle(f"Spectrum & Spectrogram ({len(self.curves)} curve{'s' if len(self.curves) != 1 else ''})")
         self.replot()
         return True
 
     def clear_curves(self) -> None:
         self.curves.clear()
+        self.last_brune_result = None
+        self.last_brune_diagnostic = None
+        self.brune_label.setText("Brune/Boatwright Source Fit: Click 'Fit Brune/Boatwright' to invert source parameters.")
         self.setWindowTitle("Spectrum & Spectrogram")
         self._on_canvas_leave()
         self.replot()
+
+    def run_brune_inversion(self, sync: bool = False) -> None:
+        """Run non-linear Brune/Boatwright w^-2 spectral source inversion on the latest curve."""
+        if not self.curves:
+            self.brune_label.setText("Brune/Boatwright Source Fit: Add a spectrum curve first.")
+            return
+
+        c = self.curves[-1]
+        tr: Trace = c["trace"]
+        t_lo: Optional[float] = c["t_lo"]
+        t_hi: Optional[float] = c["t_hi"]
+
+        noise_lo: Optional[float] = None
+        noise_hi: Optional[float] = None
+        if self.chk_use_noise.isChecked():
+            lo_v = float(self.noise_lo_spin.value())
+            hi_v = float(self.noise_hi_spin.value())
+            if abs(hi_v - lo_v) > max(tr.delta, 1e-6):
+                noise_lo, noise_hi = min(lo_v, hi_v), max(lo_v, hi_v)
+
+        model = self.brune_model_combo.currentText().strip().lower() or "brune"
+        f_lo = min(0.1, float(self.fit_f1.value()))
+        t_star_init = float(self.brune_tstar_spin.value())
+        fit_t_star = bool(self.chk_fit_tstar.isChecked())
+        dist_km = float(self.dist_km_spin.value())
+        vel_kms = float(self.vel_kms_spin.value())
+
+        if not sync:
+            if self.brune_worker is not None and self.brune_worker.isRunning():
+                self.brune_worker.cancel()
+                self.brune_worker.wait(500)
+            self.btn_fit_brune.setEnabled(False)
+            self.brune_label.setText(f"Inverting {model.capitalize()} w^-2 source spectrum in background...")
+
+            self.brune_worker = BruneInversionWorker(
+                tr,
+                t_lo=t_lo,
+                t_hi=t_hi,
+                noise_lo=noise_lo,
+                noise_hi=noise_hi,
+                model=model,
+                f_lo=f_lo,
+                f_hi=None,
+                t_star_init=t_star_init,
+                fit_t_star=fit_t_star,
+                distance_km=dist_km,
+                vel_kms=vel_kms,
+                phase="P",
+                parent=self,
+            )
+            self.brune_worker.finishedResult.connect(self._on_brune_finished)
+            self.brune_worker.error.connect(self._on_brune_error)
+            self.brune_worker.start()
+        else:
+            inv_res = invert_brune_spectrum(
+                tr,
+                t_lo=t_lo,
+                t_hi=t_hi,
+                noise_lo=noise_lo,
+                noise_hi=noise_hi,
+                model=model,
+                f_lo=f_lo,
+                f_hi=None,
+                t_star_init=t_star_init,
+                fit_t_star=fit_t_star,
+                distance_m=max(100.0, dist_km * 1000.0),
+                vel_m_s=max(100.0, vel_kms * 1000.0),
+            )
+            diag = build_brune_fit_diagnostic(inv_res, station=tr.station, phase="P")
+            self._on_brune_finished({"inversion": inv_res, "diagnostic": diag})
+
+    def _on_brune_finished(self, payload: Dict[str, Any]) -> None:
+        self.btn_fit_brune.setEnabled(True)
+        if getattr(self, "_closing", False):
+            return
+        inv_res = payload.get("inversion")
+        diag = payload.get("diagnostic")
+        if not inv_res:
+            return
+
+        self.last_brune_result = inv_res
+        self.last_brune_diagnostic = diag
+
+        fc = float(inv_res["fc"])
+        omega0 = float(inv_res["omega0"])
+        t_star = float(inv_res["t_star"])
+        m0 = float(inv_res["m0"])
+        mw = float(inv_res["mw"])
+        dsigma_bar = float(inv_res["stress_drop_bar"])
+        m_type = str(inv_res.get("model_type", "brune")).capitalize()
+
+        self.brune_label.setText(
+            f"{m_type} w^-2 Fit:   fc = {fc:.3f} Hz   |   Omega0 = {omega0:.3e} nm*s   |   "
+            f"t* = {t_star:.3f} s   |   M0 = {m0:.3e} N*m   |   Mw = {mw:.2f}   |   "
+            f"Delta_sigma = {dsigma_bar:.2f} bar"
+        )
+        self.brune_label.setStyleSheet("color: #3fb950; font-weight: bold;")
+
+        if self.method_combo.currentIndex() == 4:
+            self.method_combo.blockSignals(True)
+            self.method_combo.setCurrentIndex(0)
+            self.method_combo.blockSignals(False)
+
+        self.replot()
+        if diag is not None:
+            self.fitDiagnosticReady.emit(diag)
+
+    def _on_brune_error(self, err: str) -> None:
+        self.btn_fit_brune.setEnabled(True)
+        self.brune_label.setText(f"Brune/Boatwright Fit Error: {err}")
+        self.brune_label.setStyleSheet("color: #f85149; font-weight: bold;")
 
     def _on_canvas_leave(self, _event=None) -> None:
         if hasattr(self, "cursor_label"):
@@ -1048,6 +1659,9 @@ class SpectrumDialog(QDialog):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._closing = True
+        if self.brune_worker is not None and self.brune_worker.isRunning():
+            self.brune_worker.cancel()
+            self.brune_worker.wait(1000)
         self._ax = None
         self._spec_grid = None
         for cid in getattr(self, "_mpl_cids", ()):
@@ -1064,6 +1678,12 @@ class SpectrumDialog(QDialog):
             except Exception:
                 pass
         super().closeEvent(event)
+
+    def reject(self) -> None:
+        if self.brune_worker is not None and self.brune_worker.isRunning():
+            self.brune_worker.cancel()
+            self.brune_worker.wait(1000)
+        super().reject()
 
     def _spectrum_of(self, c: dict, m_idx: int):
         tr, lo, hi = c["trace"], c["t_lo"], c["t_hi"]
@@ -1112,6 +1732,37 @@ class SpectrumDialog(QDialog):
                     a_line = (10.0 ** fit["intercept"]) * (f_line ** fit["slope"])
                     ax.loglog(f_line, a_line, color=c["color"], lw=1.6, ls="--", alpha=0.85)
                 fit_texts.append(f"{c['label']}: slope b = {fit['slope']:.2f}, plateau = {fit['plateau']:.2e}")
+
+            if self.last_brune_result is not None:
+                inv = self.last_brune_result
+                bf = np.asarray(inv["freqs"], dtype=np.float64)
+                b_obs = np.asarray(inv["obs_spec"], dtype=np.float64)
+                b_mod = np.asarray(inv["model_spec"], dtype=np.float64)
+                b_noise = np.asarray(inv["noise_spec"], dtype=np.float64)
+                pos = bf > 0.0
+                if np.any(pos):
+                    if m_idx != 0:
+                        ax.loglog(bf[pos], np.maximum(1e-15, b_obs[pos]), color="#79c0ff", lw=1.1, alpha=0.75, label="Observed U(f)")
+                    m_lbl = str(inv.get("model_type", "brune")).capitalize()
+                    fc_val = float(inv["fc"])
+                    ax.loglog(
+                        bf[pos],
+                        np.maximum(1e-15, b_mod[pos]),
+                        color="#3fb950",
+                        lw=2.1,
+                        label=f"{m_lbl} Fit (fc={fc_val:.2f} Hz)",
+                    )
+                    if b_noise.size == bf.size and np.any(b_noise[pos] > 0.0):
+                        ax.loglog(
+                            bf[pos],
+                            np.maximum(1e-15, b_noise[pos]),
+                            color="#f85149",
+                            lw=1.3,
+                            ls=":",
+                            label="Noise Floor",
+                        )
+                    ax.axvline(fc_val, color="#d2a8ff", lw=1.1, ls="--", label=f"fc = {fc_val:.2f} Hz")
+
             ax.legend(facecolor="#161b22", labelcolor="#e6edf3", fontsize=8)
             ax.set_xlabel("Frequency (Hz)", color="#e6edf3")
             ax.set_ylabel("Spectral Amplitude", color="#e6edf3")
@@ -1128,10 +1779,17 @@ class SpectrumDialog(QDialog):
         self.canvas.draw_idle()
 
 
+_HODOGRAM_CMAP = LinearSegmentedColormap.from_list(
+    "gyr_hodogram",
+    [(0.0, "#2ea043"), (0.5, "#f2cc60"), (1.0, "#f85149")],
+)
+
+
 class ParticleMotionDialog(QDialog):
     """3-Component Particle Motion Hodograms (E-N, N-Z, E-Z & Rotated L-Q-T) with live Azimuth/Incidence sliders."""
 
     adoptAngles = pyqtSignal(float, float)  # (azimuth_deg, incidence_deg)
+    fitDiagnosticReady = pyqtSignal(object)  # FitDiagnosticResult
 
     def __init__(
         self,
@@ -1144,7 +1802,7 @@ class ParticleMotionDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"3-Component Particle Motion & MDIR: {tr_z.station}")
-        self.resize(840, 560)
+        self.resize(860, 580)
         self.tr_z = tr_z
         self.tr_n = tr_n
         self.tr_e = tr_e
@@ -1152,16 +1810,15 @@ class ParticleMotionDialog(QDialog):
         self.t_hi = t_hi
 
         mdir = compute_mdir(tr_z, tr_n, tr_e, t_lo, t_hi)
+        self.last_mdir: Dict[str, float] = mdir
+        self.last_diagnostic: Optional[FitDiagnosticResult] = None
 
         layout = QVBoxLayout(self)
 
-        info_lbl = QLabel(
-            f"MDIR Eigensolver:   Backazimuth = {mdir['azimuth']:.1f} deg   |   "
-            f"Incidence = {mdir['incidence']:.1f} deg   |   Rectilinearity = {mdir['rectilinearity']:.3f}   |   "
-            f"Planarity = {mdir['planarity']:.3f}"
-        )
-        info_lbl.setStyleSheet("color: #3fb950; font-weight: bold;")
-        layout.addWidget(info_lbl)
+        self.info_lbl = QLabel(self._format_metrics_text(mdir))
+        self.info_lbl.setStyleSheet("color: #3fb950; font-weight: bold;")
+        self.info_lbl.setWordWrap(True)
+        layout.addWidget(self.info_lbl)
 
         # Sliders for interactive 3D rotation
         sl_h = QHBoxLayout()
@@ -1191,10 +1848,13 @@ class ParticleMotionDialog(QDialog):
         layout.addWidget(self.canvas)
 
         bot_h = QHBoxLayout()
+        legend_lbl = QLabel("Trajectory Time Gradient: Green (Start) -> Yellow -> Red (End)")
+        legend_lbl.setStyleSheet("color: #8b949e; font-size: 11px;")
         btn_adopt = QPushButton("Adopt Azimuth && Incidence")
         btn_adopt.clicked.connect(lambda: (self.adoptAngles.emit(self.az_spin.value(), self.inc_spin.value()), self.accept()))
         btn_close = QPushButton("Close")
         btn_close.clicked.connect(self.accept)
+        bot_h.addWidget(legend_lbl)
         bot_h.addStretch(1)
         bot_h.addWidget(btn_adopt)
         bot_h.addWidget(btn_close)
@@ -1209,6 +1869,30 @@ class ParticleMotionDialog(QDialog):
 
         self.replot()
 
+    @staticmethod
+    def _format_metrics_text(mdir: Dict[str, float]) -> str:
+        return (
+            f"MDIR Eigensolver:   Backazimuth = {mdir['azimuth']:.1f} deg   |   "
+            f"Incidence = {mdir['incidence']:.1f} deg   |   Rectilinearity = {mdir['rectilinearity']:.3f}   |   "
+            f"Planarity = {mdir['planarity']:.3f}\n"
+            f"Trajectory Misfit RMS_pol = {mdir.get('rms_pol', 0.0):.3g}   |   "
+            f"Confidence Cones (sigma_theta, sigma_phi) = "
+            f"({mdir.get('sigma_theta_deg', 0.0):.2f} deg, {mdir.get('sigma_phi_deg', 0.0):.2f} deg)"
+        )
+
+    def emit_diagnostic(self) -> FitDiagnosticResult:
+        """Compute polarization FitDiagnosticResult and emit fitDiagnosticReady."""
+        diag = analyze_polarization_diagnostic(
+            self.tr_z,
+            self.tr_n,
+            self.tr_e,
+            t_lo=self.t_lo,
+            t_hi=self.t_hi,
+        )
+        self.last_diagnostic = diag
+        self.fitDiagnosticReady.emit(diag)
+        return diag
+
     def replot(self) -> None:
         dt = self.tr_z.delta if self.tr_z.delta > 0 else 0.05
         lth = min(self.tr_z.length, self.tr_n.length, self.tr_e.length)
@@ -1219,6 +1903,10 @@ class ParticleMotionDialog(QDialog):
             i0, i1 = 0, min(lth, 400)
         if i1 <= i0 + 2:
             i0, i1 = 0, min(lth, 400)
+
+        mdir = compute_mdir(self.tr_z, self.tr_n, self.tr_e, self.t_lo, self.t_hi)
+        self.last_mdir = mdir
+        self.info_lbl.setText(self._format_metrics_text(mdir))
 
         if self.chk_rotated.isChecked():
             tl, tq, tt = rotate_3d_lqt(self.tr_z, self.tr_n, self.tr_e, self.az_spin.value(), self.inc_spin.value())
@@ -1238,14 +1926,23 @@ class ParticleMotionDialog(QDialog):
         ]
         for idx, (x_arr, y_arr, title) in enumerate(pairs, start=1):
             ax = self.fig.add_subplot(1, 3, idx, facecolor="#0d1117")
-            ax.plot(x_arr, y_arr, color="#58a6ff", lw=1.2)
-            if x_arr.size > 0:
-                ax.plot(x_arr[0], y_arr[0], marker="o", markersize=7, color="#ffd700", label="Start")
+            if x_arr.size >= 2:
+                pts = np.column_stack([x_arr, y_arr]).reshape(-1, 1, 2)
+                segs = np.concatenate([pts[:-1], pts[1:]], axis=1)
+                lc = LineCollection(segs, cmap=_HODOGRAM_CMAP, norm=Normalize(0.0, 1.0), linewidths=1.6)
+                lc.set_array(np.linspace(0.0, 1.0, len(segs)))
+                ax.add_collection(lc)
+                ax.update_datalim(np.column_stack([x_arr, y_arr]))
+                ax.autoscale_view()
+                ax.plot(x_arr[0], y_arr[0], marker="o", markersize=6, color="#2ea043", label="Start")
+                ax.plot(x_arr[-1], y_arr[-1], marker="s", markersize=5, color="#f85149", label="End")
+            elif x_arr.size == 1:
+                ax.plot(x_arr[0], y_arr[0], marker="o", markersize=7, color="#2ea043", label="Start")
             if idx == 1 and not self.chk_rotated.isChecked():
                 # Draw azimuth arrow
-                rmax = max(1e-6, float(np.max(np.hypot(x_arr, y_arr))))
+                rmax = max(1e-6, float(np.max(np.hypot(x_arr, y_arr)))) if x_arr.size > 0 else 1.0
                 az_r = math.radians(self.az_spin.value())
-                ax.plot([0, rmax * math.sin(az_r)], [0, rmax * math.cos(az_r)], color="#ff7b72", lw=1.8, ls="--")
+                ax.plot([0, rmax * math.sin(az_r)], [0, rmax * math.cos(az_r)], color="#58a6ff", lw=1.8, ls="--")
             ax.set_title(title, color="#e6edf3", fontsize=9)
             ax.tick_params(colors="#8b949e", labelsize=7)
             ax.grid(True, color="#21262d", ls="--", lw=0.6)
@@ -1253,3 +1950,5 @@ class ParticleMotionDialog(QDialog):
 
         self.fig.tight_layout()
         self.canvas.draw_idle()
+        self.emit_diagnostic()
+

@@ -12,14 +12,23 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from shm_app.core.config_station import SHMConfig, get_config
+from shm_app.core.fit_models import (
+    FitDiagnosticResult,
+    FitType,
+    ParameterUncertainty,
+    ResidualEntry,
+)
 from shm_app.core.models import AnalysisParamSet, PhasePick, Trace
-from shm_app.core.time_utils import parse_sh_time
+from shm_app.core.time_utils import format_sh_time, parse_sh_time
 from shm_app.io.evt import format_ev2view_summary, read_evt_file, write_evt_file
+from shm_app.io.geojson import write_geojson
 from shm_app.io.gse import read_gse_file, write_gse2_file
 from shm_app.io.mseed import generate_sfd_file, read_from_sfd, read_mseed_file, write_mseed_file
 from shm_app.io.qfile import read_ascii_file, read_qfile, write_ascii_file, write_qfile
-from shm_app.processing.filters import filter_trace
+from shm_app.io.quakeml import parse_quakeml, write_quakeml
+from shm_app.processing.filters import autocut_trace, filter_trace
 from shm_app.processing.polarization import (
+    analyze_polarization_diagnostic,
     apply_polarization_filter,
     compute_mdir,
     rotate_2d,
@@ -27,9 +36,13 @@ from shm_app.processing.polarization import (
     rotate_STS2_zne_to_uvw,
 )
 from shm_app.processing.spectrum import (
+    build_brune_fit_diagnostic,
     compute_fft_spectrum,
     compute_mem_spectrum,
     compute_welch_power_spectrum,
+    find_surface_wave_amplitude,
+    invert_brune_spectrum,
+    scan_surface_waves,
 )
 from shm_app.processing.trace_ops import (
     attenuate_trace,
@@ -52,6 +65,7 @@ from shm_app.processing.trace_ops import (
     sum_traces,
 )
 from shm_app.seismology.array_loc import (
+    SlownessCalibrationTable,
     align_traces_on_phase,
     compute_beam,
     compute_fk_analysis,
@@ -60,11 +74,18 @@ from shm_app.seismology.array_loc import (
     correlate_traces,
     corrpick_array,
     fit_depth_phase,
+    identify_phase,
+    identify_trace_picks,
+    load_calibration_for_array,
     locate_by_slowness_azimuth,
     locate_by_sp_diff,
     locate_network_geiger,
     pick_onset_baer_kradolfer,
     plane_wave_locate,
+)
+from shm_app.seismology.focal_mechanism import (
+    extract_polarities_from_traces,
+    solve_focal_mechanism,
 )
 from shm_app.seismology.traveltime import get_ttt_manager, sphere_diff
 
@@ -156,10 +177,31 @@ class SHCommandEngine:
         self.quit_requested: bool = False
         self.last_fk_result: Optional[Dict[str, Any]] = None
         self.last_mdir_result: Optional[Dict[str, float]] = None
+        self.last_fit_diagnostic: Optional[FitDiagnosticResult] = None
+        self.fit_diagnostic_callback: Optional[Callable[[FitDiagnosticResult], None]] = None
+        self.calib_table: Optional[SlownessCalibrationTable] = None
+        self.last_focal_mechanism: Optional[Dict[str, Any]] = None
+        self.last_brune_result: Optional[Dict[str, Any]] = None
+        self.last_surfmag_result: Optional[Dict[str, Any]] = None
+        self.last_identify_results: List[Dict[str, Any]] = []
+        self.last_stationxml_inventory: Any = None
 
     @property
     def current_params(self) -> AnalysisParamSet:
         return self.param_sets[self.active_set_index]
+
+    @property
+    def params(self) -> AnalysisParamSet:
+        return self.param_sets[self.active_set_index]
+
+    @params.setter
+    def params(self, value: AnalysisParamSet) -> None:
+        self.param_sets[self.active_set_index] = value
+
+    def _emit_fit_diagnostic(self, diag: Optional[FitDiagnosticResult]) -> None:
+        self.last_fit_diagnostic = diag
+        if diag is not None and self.fit_diagnostic_callback is not None:
+            self.fit_diagnostic_callback(diag)
 
     def visible_traces(self) -> List[Trace]:
         return [t for t in self.traces if not t.hidden]
@@ -345,6 +387,16 @@ class SHCommandEngine:
             return self._cmd_readevt(args)
         if verb == "WRITEEVT":
             return self._cmd_writeevt(args)
+        if verb == "READSXML":
+            return self._cmd_readsxml(args, quals)
+        if verb == "WRITEQML":
+            return self._cmd_writeqml(args, quals)
+        if verb == "READQML":
+            return self._cmd_readqml(args)
+        if verb == "WRITEGEOJSON":
+            return self._cmd_writegeojson(args, quals)
+        if verb == "REPORT":
+            return self._cmd_report(args, quals)
         if verb == "SFD":
             return self._cmd_sfd(args)
         if verb in ("FETCH", "BGRFETCH"):
@@ -402,6 +454,10 @@ class SHCommandEngine:
             return self._cmd_filter(args, quals)
         if verb == "BUTTER":
             return self._cmd_butter(args, quals)
+        if verb in ("ADDFIL", "COLOUR_ADDFIL", "COLOR_ADDFIL"):
+            return self._cmd_addfil(args, quals)
+        if verb == "AUTOCUT":
+            return self._cmd_autocut(args, quals)
         if verb == "DEMEAN":
             return self._cmd_demean(args, quals)
         if verb == "TREND":
@@ -465,9 +521,13 @@ class SHCommandEngine:
         if verb == "VESPA":
             return self._cmd_vespa(args)
         if verb == "FK":
-            return self._cmd_fk(args)
+            return self._cmd_fk(args, quals)
+        if verb == "CALIB":
+            return self._cmd_calib(args, quals)
         if verb == "LOCATE":
             return self._cmd_locate(args, quals)
+        if verb == "IDENTIFY":
+            return self._cmd_identify(args, quals)
         if verb in ("PICK", "AUTOPICK"):
             return self._cmd_pick(args)
         if verb == "CORRPICK":
@@ -476,12 +536,16 @@ class SHCommandEngine:
             return self._cmd_corr(args)
         if verb in ("AMPL", "MAG", "MAGNITUDE"):
             return self._cmd_mag(args)
+        if verb == "SURFMAG":
+            return self._cmd_surfmag(args, quals)
         if verb == "THEO":
             return self._cmd_theo(args)
 
-        # --- Spectrum ---
+        # --- Spectrum & Diagnostics Fit ---
         if verb == "SPECTRUM":
             return self._cmd_spectrum(args, quals)
+        if verb == "FIT":
+            return self._cmd_fit(args, quals)
 
         # Check if verb is a .SHC script in globals or current directory
         for cand in (verb + ".SHC", verb.lower() + ".shc", os.path.join(self.config.globals_dir, verb + ".SHC")):
@@ -501,20 +565,23 @@ class SHCommandEngine:
             "SH Command Interpreter (Modernized SHC / SHM):\n"
             "  I/O        : READ <qfile> [list], WRITE <qfile> [list], READS <sfd/mseed> [t_start] [dur] [streams],\n"
             "               WRITESEED <file> [list], READGSE <file>, WRITEGSE <file>, READA <file>, WRITEA <file>,\n"
-            "               READEVT <file>, WRITEEVT <file>, SFD <dir> [outfile],\n"
+            "               READEVT <file>, WRITEEVT <file>, READSXML <xml>, WRITEQML <qml>, READQML <qml>,\n"
+            "               WRITEGEOJSON <geojson>, REPORT <file.pdf|file.svg>, SFD <dir> [outfile],\n"
             "               FETCH /BGR <net> <stations> <channels> <start_time> <duration>\n"
             "  Traces     : LIST, DEL <list>, HIDE <list>, DISPLAY <list>, SEL <list>, TRESET, NORM <C|A|AW|SW>,\n"
             "               ZOOM [list] <factor>, STW <lo> <hi>, DTW, TITLE <text>\n"
-            "  Filtering  : FILI <filter>, FILTER <filter> [lo] [hi], BUTTER <LP|HP|BP|BS> <f1> [f2] [order]\n"
+            "  Filtering  : FILI <filter>, FILTER <filter> [/AUTOCUT], BUTTER <LP|HP|BP|BS> <f1> [f2] [order] [/AUTOCUT],\n"
+            "               ADDFIL / COLOUR_ADDFIL <filter> [color] [/LIST=...], AUTOCUT [list] [settle_sec]\n"
             "  Processing : DEMEAN [list], TREND [list], DESPIKE [list] [crit], RESAMPLE <dt>, DECIMATE <factor>,\n"
             "               CUT [list] <lo> <hi>, SHIFT [list] <sec>, INT [list], DERIVE [list], HILBERT [list],\n"
             "               ENVELOPE [list], SPHASE [list], FLIP [list], MULT [list] <fac>, SUM [list], PWS [list],\n"
             "               MEND <idx_lo> <idx_hi>, ATTENUATE <t_star>, SPIKING <len> <prew>, DECONV, CREATE <kind>\n"
             "  3-Comp     : ROT2 <az>, ROT3 <az> <inci>, UVW [/INV], MDIR [lo] [hi], POLFIL [win] [pow] [mode]\n"
             "  Array/Loc  : BEAM <az> <slo> [ref], ALIGN [phase], VESPA <az> <s_lo> <s_hi> <s_step> [pow],\n"
-            "               FK [f_lo] [f_hi] [max_slo], LOCATE [/PLANE|/SLOWNESS|/GEIGER], PICK [list],\n"
-            "               CORRPICK [phase], CORR <t1> <t2> [lo] [hi], MAG [phase], THEO [dist] [depth]\n"
-            "  Spectrum   : SPECTRUM [/FFT|/PSD|/MEM] [list]\n"
+            "               FK [f_lo] [f_hi] [max_slo], CALIB [/ARRAY|<file>], LOCATE [/PLANE|/SLOWNESS|/GEIGER],\n"
+            "               IDENTIFY [list], PICK [list], CORRPICK [phase], CORR <t1> <t2> [lo] [hi],\n"
+            "               MAG [phase], SURFMAG [list], THEO [dist] [depth]\n"
+            "  Spectrum   : SPECTRUM [/FFT|/PSD|/MEM] [list], FIT </BRUNE|/BOATWRIGHT|/POL|/FOCAL|/LOCATE>\n"
             "  Scripting  : SDEF <var> <val>, CALC <var> = <expr>, IF <cond> <cmd>, GOTO <label>, ECHO, QUIT"
         )
         self.emit(msg)
@@ -718,6 +785,140 @@ class SHCommandEngine:
         self.emit(msg)
         return msg
 
+    def _cmd_readsxml(self, args: List[str], quals: Dict[str, str]) -> str:
+        if not args:
+            raise ValueError("READSXML requires a StationXML file path")
+        fpath = args[0]
+        inv = self.config.load_stationxml(fpath)
+        self.last_stationxml_inventory = inv
+        n_sta = len(inv.stations)
+        n_cha = sum(len(s.channels) for s in inv.stations)
+        # Optionally enrich existing workspace traces that lack coordinates
+        for tr in self.traces:
+            st = self.config.get_station(tr.station)
+            if st is not None and (st.lat != 0.0 or st.lon != 0.0) and tr.lat == 0.0 and tr.lon == 0.0:
+                tr.lat = st.lat
+                tr.lon = st.lon
+        msg = f"Loaded StationXML from {fpath}: {n_sta} station(s), {n_cha} channel(s)."
+        self.emit(msg)
+        return msg
+
+    def _cmd_writeqml(self, args: List[str], quals: Dict[str, str]) -> str:
+        if not args:
+            raise ValueError("WRITEQML requires an output filepath")
+        fpath = args[0]
+        list_spec = args[1] if len(args) > 1 else quals.get("LIST", "ALL")
+        idxs = self.parse_trace_list(list_spec)
+        trs = [self.traces[i] for i in idxs]
+        prefix = quals.get("PREFIX", "smi:shm-modern")
+        write_quakeml(
+            fpath,
+            trs,
+            self.current_params,
+            public_id_prefix=prefix,
+            focal_mechanism=self.last_focal_mechanism,
+        )
+        msg = f"Wrote QuakeML 1.2 ({len(trs)} trace(s)) to {fpath}"
+        self.emit(msg)
+        return msg
+
+    def _cmd_readqml(self, args: List[str]) -> str:
+        if not args:
+            raise ValueError("READQML requires a QuakeML file path")
+        fpath = args[0]
+        qml = parse_quakeml(fpath)
+        param = qml["params"]
+        picks = qml.get("phase_picks", [])
+        fms = qml.get("focal_mechanisms", [])
+        if fms:
+            fm0 = fms[0]
+            np1 = fm0.get("nodalPlane1")
+            if isinstance(np1, dict):
+                fm_dict: Dict[str, Any] = {
+                    "strike": float(np1.get("strike", 0.0)),
+                    "dip": float(np1.get("dip", 0.0)),
+                    "rake": float(np1.get("rake", 0.0)),
+                }
+                np2 = fm0.get("nodalPlane2")
+                if isinstance(np2, dict):
+                    fm_dict["strike2"] = float(np2.get("strike", 0.0))
+                    fm_dict["dip2"] = float(np2.get("dip", 0.0))
+                    fm_dict["rake2"] = float(np2.get("rake", 0.0))
+                self.last_focal_mechanism = fm_dict
+                setattr(param, "focal_mechanism", fm_dict)
+
+        self.param_sets[self.active_set_index] = param
+        for p in picks:
+            for tr in self.traces:
+                if tr.station.upper() == p.station.upper() and (not p.comp or tr.comp.upper() == p.comp.upper()):
+                    tr.add_or_replace_pick(p)
+                    break
+            else:
+                for tr in self.traces:
+                    if tr.station.upper() == p.station.upper():
+                        tr.add_or_replace_pick(p)
+                        break
+
+        msg = (
+            f"Read QuakeML {qml.get('schema_version', '1.2')} from {fpath}: "
+            f"Lat={param.lat:+.3f}, Lon={param.lon:+.3f}, Depth={param.depth:.1f} km, "
+            f"{len(picks)} pick(s)."
+        )
+        self.emit(msg)
+        return msg
+
+    def _cmd_writegeojson(self, args: List[str], quals: Dict[str, str]) -> str:
+        if not args:
+            raise ValueError("WRITEGEOJSON requires an output filepath")
+        fpath = args[0]
+        list_spec = args[1] if len(args) > 1 else quals.get("LIST", "ALL")
+        idxs = self.parse_trace_list(list_spec)
+        trs = [self.traces[i] for i in idxs]
+        write_geojson(
+            fpath,
+            trs,
+            self.current_params,
+            include_stations=("NOSTATIONS" not in quals),
+            include_ellipse=("NOELLIPSE" not in quals),
+            focal_mechanism=self.last_focal_mechanism,
+        )
+        msg = f"Wrote GeoJSON ({len(trs)} trace(s)) to {fpath}"
+        self.emit(msg)
+        return msg
+
+    def _cmd_report(self, args: List[str], quals: Dict[str, str]) -> str:
+        if not args:
+            raise ValueError("REPORT requires an output filepath (.pdf or .svg)")
+        fpath = args[0]
+        list_spec = args[1] if len(args) > 1 else quals.get("LIST", "ALL")
+        idxs = self.parse_trace_list(list_spec)
+        trs = [self.traces[i] for i in idxs]
+        fmt = quals.get("FORMAT", quals.get("FMT"))
+        if fmt is None:
+            if "SVG" in quals:
+                fmt = "svg"
+            elif "PDF" in quals:
+                fmt = "pdf"
+        title = quals.get("TITLE", self.title)
+        agency = quals.get("AGENCY", "SHM-Modern Observatory")
+
+        from shm_app.gui.reporting import generate_observatory_bulletin
+
+        out_path = generate_observatory_bulletin(
+            output_path=fpath,
+            traces=trs,
+            params=self.current_params,
+            fit_result=self.last_fit_diagnostic,
+            focal_mech=self.last_focal_mechanism,
+            title=title,
+            format=fmt,
+            agency=agency,
+            config=self.config,
+        )
+        msg = f"Generated observatory bulletin report: {out_path}"
+        self.emit(msg)
+        return msg
+
     def _cmd_sfd(self, args: List[str]) -> str:
         dpath = args[0] if args else "."
         out_sfd = args[1] if len(args) > 1 else os.path.join(dpath, "sfdlist.sfd")
@@ -868,6 +1069,8 @@ class SHCommandEngine:
         use_lpc: bool = False,
         demean_first: bool = False,
         visible_only: bool = False,
+        autocut: bool = False,
+        zero_phase: bool = False,
     ) -> int:
         target_indices = list(range(len(self.traces))) if indices is None else list(indices)
         count = 0
@@ -885,6 +1088,8 @@ class SHCommandEngine:
                 mode=mode,
                 use_lpc=use_lpc,
                 config=self.config,
+                autocut=autocut,
+                zero_phase=zero_phase,
             )
             count += 1
         return count
@@ -981,9 +1186,19 @@ class SHCommandEngine:
         idxs = self.parse_trace_list(list_spec)
         mode = "REC" if ("REC" in quals or f_expr.upper().startswith("R")) else ("FFT" if "FFT" in quals else "AUTO")
         use_lpc = "LPC" in quals
+        autocut = "AUTOCUT" in quals
+        zero_phase = ("ZEROPHASE" in quals or "ZERO" in quals)
 
-        count = self.apply_filter_to_traces(f_expr, indices=idxs, mode=mode, use_lpc=use_lpc)
-        msg = f"Applied filter '{f_expr}' to {count} trace(s)."
+        count = self.apply_filter_to_traces(
+            f_expr,
+            indices=idxs,
+            mode=mode,
+            use_lpc=use_lpc,
+            autocut=autocut,
+            zero_phase=zero_phase,
+        )
+        ac_note = " (with autocut)" if autocut else ""
+        msg = f"Applied filter '{f_expr}'{ac_note} to {count} trace(s)."
         self.emit(msg)
         return msg
 
@@ -1001,9 +1216,118 @@ class SHCommandEngine:
             expr = f"BUTTER {ftype} {f1} {f2} {order}"
 
         idxs = self.parse_trace_list(quals.get("LIST", "ALL"))
+        autocut = "AUTOCUT" in quals
+        zero_phase = ("ZEROPHASE" in quals or "ZERO" in quals)
         for i in idxs:
-            self.traces[i] = filter_trace(self.traces[i], expr, config=self.config)
-        msg = f"Applied Butterworth filter ({expr}) to {len(idxs)} trace(s)."
+            self.traces[i] = filter_trace(
+                self.traces[i],
+                expr,
+                config=self.config,
+                autocut=autocut,
+                zero_phase=zero_phase,
+            )
+        ac_note = " (with autocut)" if autocut else ""
+        msg = f"Applied Butterworth filter ({expr}){ac_note} to {len(idxs)} trace(s)."
+        self.emit(msg)
+        return msg
+
+    @staticmethod
+    def _looks_like_color(token: str) -> bool:
+        t = token.strip().lower()
+        if t.startswith("#") and len(t) in (4, 7, 9):
+            return True
+        return t in {
+            "red", "blue", "green", "orange", "purple", "cyan", "magenta",
+            "yellow", "teal", "navy", "crimson", "gold", "black", "gray",
+            "grey", "lime", "brown", "pink", "violet", "indigo",
+        }
+
+    def _cmd_addfil(self, args: List[str], quals: Dict[str, str]) -> str:
+        if "LIST" in quals:
+            idxs = self.parse_trace_list(quals["LIST"])
+        else:
+            idxs = [i for i, t in enumerate(self.traces) if t.selected and not t.hidden]
+        if not idxs:
+            raise ValueError("ADDFIL requires selected traces (SEL <list>) or /LIST=<list>")
+
+        rem = list(args)
+        color = quals.get("COLOR", quals.get("COLOUR", ""))
+        if not color and len(rem) >= 2 and self._looks_like_color(rem[-1]):
+            color = rem.pop()
+
+        f_expr = quals.get("FILTER", " ".join(rem).strip())
+        clear_mode = ("CLEAR" in quals) or ("OFF" in quals) or (f_expr.upper() in ("NONE", "CLEAR", "OFF"))
+        if not clear_mode and not f_expr:
+            f_expr = self.loaded_filters[0] if self.loaded_filters else "WWSSN_SP"
+
+        if clear_mode:
+            for i in idxs:
+                self.traces[i].overlay_filter_name = "NONE"
+                self.traces[i].overlay_filter_color = ""
+            msg = f"Cleared overlay filter on {len(idxs)} selected trace(s)."
+            self.emit(msg)
+            return msg
+
+        eff_color = color or "#e11d48"
+        mode = "REC" if ("REC" in quals or f_expr.upper().startswith("R")) else ("FFT" if "FFT" in quals else "AUTO")
+        for i in idxs:
+            tr = self.traces[i]
+            prev_global = tr.filter_name
+            filtered = filter_trace(tr, f_expr, mode=mode, config=self.config)
+            filtered.filter_name = prev_global
+            filtered.overlay_filter_name = f_expr
+            filtered.overlay_filter_color = eff_color
+            filtered.filter_history = list(tr.filter_history) + [f_expr]
+            self.traces[i] = filtered
+
+        msg = f"Assigned overlay filter '{f_expr}' (color={eff_color}) to {len(idxs)} trace(s)."
+        self.emit(msg)
+        return msg
+
+    def _cmd_autocut(self, args: List[str], quals: Dict[str, str]) -> str:
+        settle_sec: Optional[float] = float(quals["SETTLE"]) if "SETTLE" in quals else None
+        list_spec: Optional[str] = quals.get("LIST")
+
+        rem = list(args)
+        if rem:
+            if len(rem) == 1:
+                tok = rem[0]
+                if tok.upper() in ("ALL", "SEL", "SELECTED", "*") or "," in tok or "-" in tok:
+                    if list_spec is None:
+                        list_spec = tok
+                elif tok.isdigit() and 1 <= int(tok) <= len(self.traces):
+                    if list_spec is None:
+                        list_spec = tok
+                else:
+                    try:
+                        settle_sec = float(tok)
+                    except ValueError:
+                        if list_spec is None:
+                            list_spec = tok
+            else:
+                if list_spec is None:
+                    list_spec = rem[0]
+                if settle_sec is None:
+                    settle_sec = float(rem[1])
+
+        if list_spec is None:
+            list_spec = "SEL"
+        idxs = self.parse_trace_list(list_spec)
+        if not idxs:
+            return "No traces available for AUTOCUT."
+
+        zero_phase = ("ZEROPHASE" in quals or "ZERO" in quals)
+        trimmed_samples = 0
+        for i in idxs:
+            before_len = self.traces[i].length
+            self.traces[i] = autocut_trace(
+                self.traces[i],
+                settle_sec=settle_sec,
+                zero_phase=zero_phase,
+            )
+            trimmed_samples += max(0, before_len - self.traces[i].length)
+
+        msg = f"Autocut trimmed {trimmed_samples} sample(s) across {len(idxs)} trace(s)."
         self.emit(msg)
         return msg
 
@@ -1307,38 +1631,148 @@ class SHCommandEngine:
         self.traces.extend(v_trs)
         return f"Generated {len(v_trs)} Vespagram traces (az={az:.1f}, slo={s_lo}..{s_hi} s/deg, N={power})."
 
-    def _cmd_fk(self, args: List[str]) -> str:
+    def _cmd_fk(self, args: List[str], quals: Optional[Dict[str, str]] = None) -> str:
+        q = quals or {}
         f_lo = float(args[0]) if args else 0.5
         f_hi = float(args[1]) if len(args) > 1 else 3.0
         max_slo = float(args[2]) if len(args) > 2 else 12.0
         lo = self.time_window[0] if self.time_window else None
         hi = self.time_window[1] if self.time_window else None
         vis = self.visible_traces()
-        res = compute_fk_analysis(vis, t_lo=lo, t_hi=hi, f_lo=f_lo, f_hi=f_hi, max_slowness=max_slo, config=self.config)
+        use_calib = self.calib_table if ("NOCALIB" not in q) else None
+        res = compute_fk_analysis(
+            vis,
+            t_lo=lo,
+            t_hi=hi,
+            f_lo=f_lo,
+            f_hi=f_hi,
+            max_slowness=max_slo,
+            config=self.config,
+            calib_table=use_calib,
+            apply_calibration=True if use_calib is not None else None,
+        )
         self.last_fk_result = res
         self.current_params.azimuth = res["azimuth"]
         self.current_params.slowness = res["slowness"]
+        cal_tag = " [calibrated]" if res.get("calib_applied") else ""
         msg = (
-            f"FK Result: Azimuth = {res['azimuth']:.1f} deg, Slowness = {res['slowness']:.2f} s/deg "
+            f"FK Result{cal_tag}: Azimuth = {res['azimuth']:.1f} deg, Slowness = {res['slowness']:.2f} s/deg "
             f"(Vel = {res['apparent_velocity_kms']:.2f} km/s, Semblance = {res['semblance']:.3f})"
         )
+        self.emit(msg)
+        return msg
+
+    def _cmd_calib(self, args: List[str], quals: Dict[str, str]) -> str:
+        if "OFF" in quals or "CLEAR" in quals or (args and args[0].upper() in ("OFF", "NONE", "CLEAR")):
+            self.calib_table = None
+            msg = "Slowness calibration cleared."
+            self.emit(msg)
+            return msg
+
+        tbl: Optional[SlownessCalibrationTable] = None
+        src_desc = ""
+
+        if "FILE" in quals:
+            fpath = quals["FILE"]
+            tbl = SlownessCalibrationTable.from_file(fpath)
+            src_desc = fpath
+        elif args and (
+            os.path.isfile(args[0])
+            or args[0].lower().endswith((".dat", ".txt"))
+            or os.sep in args[0]
+        ):
+            fpath = args[0]
+            tbl = SlownessCalibrationTable.from_file(fpath)
+            src_desc = fpath
+        elif "ARRAY" in quals or args:
+            arr_val = quals.get("ARRAY", "")
+            if arr_val and arr_val != "TRUE":
+                target: Any = arr_val
+                src_desc = arr_val
+            elif args:
+                target = args[0]
+                src_desc = args[0]
+            else:
+                vis_stas = [t.station for t in self.visible_traces() if t.station]
+                target = vis_stas if vis_stas else "GRF"
+                src_desc = ",".join(vis_stas[:4]) if vis_stas else "GRF"
+            tbl = load_calibration_for_array(target, inputs_dir=self.config.inputs_dir, config=self.config)
+            if tbl is None or len(tbl) == 0:
+                raise ValueError(f"No slowness calibration table found for array/station {src_desc!r}")
+        else:
+            if self.calib_table is not None:
+                msg = f"Active slowness calibration table: {len(self.calib_table)} entries ({self.calib_table.source_path or 'in-memory'})."
+                self.emit(msg)
+                return msg
+            vis_stas = [t.station for t in self.visible_traces() if t.station]
+            target = vis_stas if vis_stas else "GRF"
+            tbl = load_calibration_for_array(target, inputs_dir=self.config.inputs_dir, config=self.config)
+            if tbl is None or len(tbl) == 0:
+                raise ValueError("No slowness calibration table found for current workspace")
+            src_desc = tbl.source_path or "array"
+
+        self.calib_table = tbl
+        msg = f"Loaded slowness calibration table ({len(tbl)} entries) from {tbl.source_path or src_desc}."
+
+        # If workspace already has a slowness solution, apply calibration immediately unless /NOAPPLY
+        p = self.current_params
+        if "NOAPPLY" not in quals and p.slowness > 0.0:
+            raw_slo = float(p.residuals.get("raw_slowness", p.slowness)) if p.residuals else float(p.slowness)
+            raw_az = float(p.residuals.get("raw_azimuth", p.azimuth)) if p.residuals else float(p.azimuth)
+            ph = p.phase or "P"
+            vis = self.visible_traces()
+            ref_tr = vis[0] if vis else None
+            pk = ref_tr.get_pick(ph) if ref_tr else None
+            onset_ep = pk.onset_epoch if (pk and pk.onset) else (
+                parse_sh_time(p.origin) if p.origin else (ref_tr.start_epoch if ref_tr else 0.0)
+            )
+            st_code = p.source if p.source in self.config.stations else (ref_tr.station if ref_tr else "GRA1")
+            cal_param = locate_by_slowness_azimuth(
+                st_code,
+                ph,
+                onset_ep,
+                raw_slo,
+                raw_az,
+                p.depth,
+                config=self.config,
+                ttt=self.ttt,
+                calib_table=self.calib_table,
+                apply_calibration=True,
+            )
+            self.param_sets[self.active_set_index] = cal_param
+            for tr in vis:
+                pk_tr = tr.get_pick(ph)
+                if pk_tr is not None:
+                    pk_tr.l_slowness = cal_param.slowness
+                    pk_tr.l_azim = cal_param.azimuth
+            msg += (
+                f" Applied calibration: slo {raw_slo:.2f}->{cal_param.slowness:.2f} s/deg, "
+                f"baz {raw_az:.1f}->{cal_param.azimuth:.1f} deg, Dist={cal_param.distance:.2f} deg."
+            )
+
         self.emit(msg)
         return msg
 
     def _cmd_locate(self, args: List[str], quals: Dict[str, str]) -> str:
         ph = args[0] if args else (self.current_params.phase or "P")
         vis = self.visible_traces()
+        use_calib = self.calib_table if ("NOCALIB" not in quals) else None
 
         if "GEIGER" in quals or "NET" in quals:
             all_picks = [p for t in vis for p in t.picks]
-            param = locate_network_geiger(
+            param, _resids, diag = locate_network_geiger(
                 all_picks,
                 depth_km=self.current_params.depth,
                 free_depth=("FREE" in quals),
                 config=self.config,
                 ttt=self.ttt,
+                return_diagnostics=True,
             )
+            if self.last_focal_mechanism is not None:
+                setattr(param, "focal_mechanism", self.last_focal_mechanism)
+                diag.context_data["focal_mechanism"] = self.last_focal_mechanism
             self.param_sets[self.active_set_index] = param
+            self._emit_fit_diagnostic(diag)
             msg = (
                 f"Network Location: Lat={param.lat:+.3f}, Lon={param.lon:+.3f}, Depth={param.depth:.1f} km, "
                 f"Origin={param.origin}, Region={param.region_name}"
@@ -1360,6 +1794,8 @@ class SHCommandEngine:
                 self.current_params.depth,
                 config=self.config,
                 ttt=self.ttt,
+                calib_table=use_calib,
+                apply_calibration=True if use_calib is not None else None,
             )
             self.param_sets[self.active_set_index] = param
             msg = (
@@ -1391,33 +1827,171 @@ class SHCommandEngine:
             elev_m=[c[2] for c in coords],
             vp_kms=[c[3] for c in coords],
             dt=picked_traces[0].delta,
+            calib_table=use_calib,
+            apply_calibration=True if use_calib is not None else None,
+            stations=[t.station for t in picked_traces],
+            config=self.config,
         )
         for tr, resid in zip(picked_traces, res["residuals"]):
             pk = tr.get_pick(ph)
             if pk:
                 pk.resid = resid
-                pk.slowness = res["slowness"]
-                pk.beam_azim = res["azimuth"]
+                pk.slowness = res.get("raw_slowness", res["slowness"]) if res.get("calib_applied") else res["slowness"]
+                pk.beam_azim = res.get("raw_azimuth", res["azimuth"]) if res.get("calib_applied") else res["azimuth"]
+                if res.get("calib_applied"):
+                    pk.l_slowness = res["slowness"]
+                    pk.l_azim = res["azimuth"]
 
-        # Also compute slowness-based epicenter automatically
+        # Pass raw slowness/azimuth when calib_table is passed so locate_by_slowness_azimuth calibrates once and populates metadata
+        raw_slo = res.get("raw_slowness", res["slowness"]) if res.get("calib_applied") else res["slowness"]
+        raw_az = res.get("raw_azimuth", res["azimuth"]) if res.get("calib_applied") else res["azimuth"]
         param = locate_by_slowness_azimuth(
             picked_traces[0].station,
             ph,
             arr_times[0],
-            res["slowness"],
-            res["azimuth"],
+            raw_slo,
+            raw_az,
             self.current_params.depth,
             config=self.config,
             ttt=self.ttt,
+            calib_table=use_calib,
+            apply_calibration=True if res.get("calib_applied") else False,
         )
         param.d_azimuth = res["d_azimuth"]
         param.d_slowness = res["d_slowness"]
         self.param_sets[self.active_set_index] = param
+        cal_note = " [calibrated]" if res.get("calib_applied") else ""
         msg = (
-            f"Plane Wave Fit ({len(picked_traces)} stations): BAZ = {res['azimuth']:.1f} +/- {res['d_azimuth']:.1f} deg, "
+            f"Plane Wave Fit{cal_note} ({len(picked_traces)} stations): BAZ = {res['azimuth']:.1f} +/- {res['d_azimuth']:.1f} deg, "
             f"Slowness = {res['slowness']:.2f} +/- {res['d_slowness']:.2f} s/deg -> "
             f"Dist = {param.distance:.1f} deg ({param.region_name})"
         )
+        self.emit(msg)
+        return msg
+
+    def _cmd_identify(self, args: List[str], quals: Dict[str, str]) -> str:
+        p = self.current_params
+        depth_km = float(quals["DEPTH"]) if "DEPTH" in quals else float(p.depth)
+        dist_override = float(quals["DIST"]) if "DIST" in quals else None
+        cand_phases: Optional[List[str]] = None
+        if "PHASES" in quals:
+            cand_phases = [x.strip() for x in quals["PHASES"].split(",") if x.strip()]
+
+        sigma_t = float(quals.get("SIGMA_T", 2.0))
+        sigma_s = float(quals.get("SIGMA_S", 1.0))
+
+        # Direct travel-time + slowness phase identification via /TIME=<sec>
+        if "TIME" in quals:
+            t_obs_rel = float(quals["TIME"])
+            slo_meas = float(quals.get("SLO", p.slowness))
+            dist_val = dist_override if dist_override is not None else float(p.distance)
+            if dist_val <= 0.0:
+                raise ValueError("IDENTIFY /TIME requires /DIST=<deg> or a valid distance in params")
+            baz_meas = float(quals["BAZ"]) if "BAZ" in quals else (float(p.azimuth) if p.azimuth > 0.0 else None)
+            baz_theo = float(quals["BAZ_THEO"]) if "BAZ_THEO" in quals else None
+            cands = identify_phase(
+                t_obs_rel_sec=t_obs_rel,
+                slowness_meas_s_deg=slo_meas,
+                dist_deg=dist_val,
+                depth_km=depth_km,
+                baz_meas_deg=baz_meas,
+                baz_theo_deg=baz_theo,
+                sigma_t=sigma_t,
+                sigma_s=sigma_s,
+                w_s=1.0 if slo_meas > 0.0 else 0.0,
+                candidate_phases=cand_phases,
+                ttt=self.ttt,
+            )
+            self.last_identify_results = cands
+            if not cands:
+                return "No matching seismic phases found."
+            lines = [f"Phase Identification (t={t_obs_rel:.2f}s, slo={slo_meas:.2f}s/deg, dist={dist_val:.1f}deg):"]
+            for rank, c in enumerate(cands[:5], start=1):
+                lines.append(
+                    f"  {rank}. {c['phase']:<7s} prob={c['probability']:.3f} chi2={c['chi2']:.2f} "
+                    f"dt={c['t_resid']:+.2f}s ds={c['s_resid']:+.2f}s/deg"
+                )
+            msg = "\n".join(lines)
+            self.emit(msg)
+            return msg
+
+        list_spec = quals.get("LIST", args[0] if args else "ALL")
+        idxs = self.parse_trace_list(list_spec)
+        target_traces = [self.traces[i] for i in idxs if self.traces[i].picks]
+        if not target_traces:
+            raise ValueError("IDENTIFY requires picked traces in workspace (or /TIME=... /DIST=...)")
+
+        if "ORIGIN" in quals:
+            try:
+                orig_ep = float(quals["ORIGIN"])
+            except ValueError:
+                orig_ep = parse_sh_time(quals["ORIGIN"])
+        elif p.origin:
+            orig_ep = parse_sh_time(p.origin)
+        elif target_traces[0].torig > 0.0:
+            orig_ep = float(target_traces[0].torig)
+        else:
+            orig_ep = float(target_traces[0].start_epoch)
+
+        update_names = ("NOUPDATE" not in quals) and ("DRY" not in quals)
+        max_chi2 = float(quals["MAX_CHI2"]) if "MAX_CHI2" in quals else None
+        def_slo = float(quals["SLO"]) if "SLO" in quals else (float(p.slowness) if p.slowness > 0.0 else None)
+        def_baz = float(quals["BAZ"]) if "BAZ" in quals else (float(p.azimuth) if p.azimuth > 0.0 else None)
+        baz_theo = float(quals["BAZ_THEO"]) if "BAZ_THEO" in quals else None
+
+        has_hypo = (p.lat != 0.0 or p.lon != 0.0)
+        all_results: List[Dict[str, Any]] = []
+        for tr in target_traces:
+            if dist_override is not None:
+                dist_i = dist_override
+            elif has_hypo:
+                st = self.config.get_station(tr.station)
+                if st is not None and (st.lat != 0.0 or st.lon != 0.0):
+                    dist_i, _, _ = sphere_diff(st.lat, st.lon, p.lat, p.lon)
+                    tr.distance = dist_i
+                elif tr.lat != 0.0 or tr.lon != 0.0:
+                    dist_i, _, _ = sphere_diff(tr.lat, tr.lon, p.lat, p.lon)
+                    tr.distance = dist_i
+                else:
+                    dist_i = float(tr.distance) if tr.distance > 0.0 else float(p.distance)
+            elif tr.distance > 0.0:
+                dist_i = float(tr.distance)
+            else:
+                dist_i = float(p.distance)
+
+            if dist_i <= 0.0:
+                raise ValueError(f"IDENTIFY requires epicentral distance for trace {tr.station} (set params.distance, hypocenter, or /DIST=<deg>)")
+
+            res_tr = identify_trace_picks(
+                [tr],
+                origin_epoch=orig_ep,
+                dist_deg=dist_i,
+                depth_km=depth_km,
+                baz_theo_deg=baz_theo,
+                default_slowness=def_slo,
+                default_baz=def_baz,
+                update_pick_names=update_names,
+                max_chi2=max_chi2,
+                sigma_t=sigma_t,
+                sigma_s=sigma_s,
+                candidate_phases=cand_phases,
+                ttt=self.ttt,
+                config=self.config,
+            )
+            all_results.extend(res_tr)
+
+        self.last_identify_results = all_results
+        if not all_results:
+            return "No phase candidates matched."
+
+        lines = [f"Identified {len(all_results)} pick(s):"]
+        for r in all_results:
+            top3 = ", ".join(f"{c['phase']}({c['probability']:.2f})" for c in r["candidates"][:3])
+            lines.append(
+                f"  {r['station']} {r['old_phase']} -> {r['identified_phase']} "
+                f"(prob={r['probability']:.3f}, chi2={r['chi2']:.2f}, dt={r['t_resid']:+.2f}s) | top: {top3}"
+            )
+        msg = "\n".join(lines)
         self.emit(msg)
         return msg
 
@@ -1528,6 +2102,108 @@ class SHCommandEngine:
         self.emit(msg)
         return msg
 
+    def _cmd_surfmag(self, args: List[str], quals: Dict[str, str]) -> str:
+        p = self.current_params
+        list_spec = quals.get("LIST")
+        if list_spec is None and args:
+            tok = args[0]
+            if tok.upper() in ("ALL", "SEL", "SELECTED", "*") or "," in tok or "-" in tok or tok.isdigit():
+                list_spec = tok
+        if list_spec is None:
+            list_spec = "ALL"
+
+        idxs = self.parse_trace_list(list_spec)
+        selected_traces = [self.traces[i] for i in idxs]
+        if not selected_traces:
+            raise ValueError("SURFMAG requires at least one trace in workspace")
+
+        vertical_only = ("ALLCOMP" not in quals)
+        if vertical_only:
+            z_traces = [tr for tr in selected_traces if (tr.comp or "").upper() == "Z"]
+            eff_traces = z_traces if z_traces else selected_traces
+        else:
+            eff_traces = selected_traces
+
+        p_lo = float(quals.get("PERIOD_LO", quals.get("TMIN", 18.0)))
+        p_hi = float(quals.get("PERIOD_HI", quals.get("TMAX", 22.0)))
+        lo = float(quals["T_LO"]) if "T_LO" in quals else (self.time_window[0] if self.time_window else None)
+        hi = float(quals["T_HI"]) if "T_HI" in quals else (self.time_window[1] if self.time_window else None)
+        input_type = (
+            "velocity"
+            if ("VELOCITY" in quals or quals.get("INPUT", "").lower().startswith("v"))
+            else "displacement"
+        )
+        dist_override = float(quals["DIST"]) if "DIST" in quals else None
+        has_hypo = (p.lat != 0.0 or p.lon != 0.0)
+        global_dist = p.distance if p.distance > 0.0 else 50.0
+
+        dists: List[float] = []
+        for tr in eff_traces:
+            if dist_override is not None:
+                dist_i = dist_override
+            elif has_hypo:
+                st = self.config.get_station(tr.station)
+                if st is not None and (st.lat != 0.0 or st.lon != 0.0):
+                    dist_i, _, _ = sphere_diff(st.lat, st.lon, p.lat, p.lon)
+                    tr.distance = dist_i
+                elif tr.lat != 0.0 or tr.lon != 0.0:
+                    dist_i, _, _ = sphere_diff(tr.lat, tr.lon, p.lat, p.lon)
+                    tr.distance = dist_i
+                else:
+                    dist_i = float(tr.distance) if tr.distance > 0.0 else global_dist
+            elif tr.distance > 0.0:
+                dist_i = float(tr.distance)
+            else:
+                dist_i = global_dist
+            dists.append(dist_i)
+
+        scan_res = scan_surface_waves(
+            eff_traces,
+            distances_deg=dists,
+            period_lo=p_lo,
+            period_hi=p_hi,
+            t_lo=lo,
+            t_hi=hi,
+            vertical_only=False,
+            input_type=input_type,
+        )
+        self.last_surfmag_result = scan_res
+
+        valid_ms = [float(s["ms"]) for s in scan_res["stations"] if s.get("ms") is not None and s["ms"] > 0.0]
+        if scan_res["ms_mean"] is not None:
+            p.mag_ms = float(scan_res["ms_mean"])
+            p.d_ms = float(scan_res["ms_std"] or 0.0)
+            p.mags_count = max(p.mags_count, len(valid_ms))
+
+        for tr, st_res in zip(eff_traces, scan_res["stations"]):
+            pk = tr.get_pick("LR") or tr.get_pick("LQ") or tr.get_pick("R") or (tr.picks[0] if tr.picks else None)
+            if pk is None:
+                pk = PhasePick(
+                    name="LR",
+                    onset=format_sh_time(tr.start_epoch + float(st_res["time_sec"])),
+                    source="a",
+                    filter_name=tr.filter_name,
+                    station=tr.station,
+                    comp=tr.comp,
+                    chan1=tr.chan1,
+                    chan2=tr.chan2,
+                )
+                tr.add_or_replace_pick(pk)
+            pk.ampl = float(st_res["ampl_nm"])
+            pk.ampl_time = float(st_res["time_sec"])
+            pk.period = float(st_res["period"])
+            if st_res["ms"] is not None:
+                pk.mag_ms = float(st_res["ms"])
+
+        ms_str = f"{p.mag_ms:.2f} +/- {p.d_ms:.2f}" if valid_ms else "N/A"
+        max_ampl = max((float(s["ampl_nm"]) for s in scan_res["stations"]), default=0.0)
+        msg = (
+            f"Surface Wave Magnitude ({len(eff_traces)} Z-trace(s), {p_lo:.0f}-{p_hi:.0f}s): "
+            f"MS={ms_str}, max A={max_ampl:.1f} nm"
+        )
+        self.emit(msg)
+        return msg
+
     def _cmd_theo(self, args: List[str]) -> str:
         dist = float(args[0]) if args else self.current_params.distance
         depth = float(args[1]) if len(args) > 1 else self.current_params.depth
@@ -1562,6 +2238,300 @@ class SHCommandEngine:
         f_peak = float(freqs[peak_i]) if freqs.size > 0 else 0.0
         a_peak = float(amps[peak_i]) if amps.size > 0 else 0.0
         msg = f"{kind} Spectrum ({tr.station} {tr.channel3}): Peak amplitude = {a_peak:.3e} at {f_peak:.3f} Hz"
+        self.emit(msg)
+        return msg
+
+    def _cmd_fit(self, args: List[str], quals: Dict[str, str]) -> str:
+        rem = list(args)
+        mode: Optional[str] = None
+        if "BOATWRIGHT" in quals:
+            mode = "BOATWRIGHT"
+        elif "BRUNE" in quals:
+            mode = "BRUNE"
+        elif any(k in quals for k in ("POL", "POLARIZATION", "MDIR")):
+            mode = "POL"
+        elif any(k in quals for k in ("FOCAL", "FM", "BEACHBALL")):
+            mode = "FOCAL"
+        elif any(k in quals for k in ("LOCATE", "GEIGER", "NET")):
+            mode = "LOCATE"
+        elif rem and rem[0].upper() in ("BRUNE", "BOATWRIGHT", "POL", "POLARIZATION", "MDIR", "FOCAL", "FM", "BEACHBALL", "LOCATE", "GEIGER", "NET"):
+            tok = rem.pop(0).upper()
+            if tok in ("POLARIZATION", "MDIR"):
+                mode = "POL"
+            elif tok in ("FM", "BEACHBALL"):
+                mode = "FOCAL"
+            elif tok in ("GEIGER", "NET"):
+                mode = "LOCATE"
+            else:
+                mode = tok
+
+        if mode is None:
+            raise ValueError("FIT requires a mode qualifier: /BRUNE, /BOATWRIGHT, /POL, /FOCAL, or /LOCATE")
+
+        if mode in ("BRUNE", "BOATWRIGHT"):
+            model_name = "boatwright" if mode == "BOATWRIGHT" else "brune"
+            list_spec = quals.get("LIST")
+            t_lo = float(quals["T_LO"]) if "T_LO" in quals else (self.time_window[0] if self.time_window else None)
+            t_hi = float(quals["T_HI"]) if "T_HI" in quals else (self.time_window[1] if self.time_window else None)
+
+            if list_spec is None and rem:
+                if len(rem) >= 3:
+                    list_spec = rem[0]
+                    t_lo = float(rem[1])
+                    t_hi = float(rem[2])
+                elif len(rem) == 2:
+                    if "." in rem[0] or not rem[0].isdigit() or int(rem[0]) > len(self.traces):
+                        t_lo = float(rem[0])
+                        t_hi = float(rem[1])
+                    else:
+                        list_spec = rem[0]
+                else:
+                    list_spec = rem[0]
+
+            if list_spec is None:
+                list_spec = "SEL"
+            idxs = self.parse_trace_list(list_spec)
+            if not idxs:
+                raise ValueError("FIT /BRUNE requires at least one trace in workspace")
+            tr = self.traces[idxs[0]]
+
+            noise_lo = float(quals["NOISE_LO"]) if "NOISE_LO" in quals else None
+            noise_hi = float(quals["NOISE_HI"]) if "NOISE_HI" in quals else None
+            f_lo = float(quals.get("F_LO", 0.1))
+            f_hi = float(quals["F_HI"]) if "F_HI" in quals else None
+            input_type = (
+                "velocity"
+                if ("VELOCITY" in quals or quals.get("INPUT", "").lower().startswith("v"))
+                else "displacement"
+            )
+            phase = quals.get("PHASE", self.current_params.phase or "P")
+
+            phys_kwargs: Dict[str, Any] = {}
+            if "DIST_M" in quals:
+                phys_kwargs["distance_m"] = float(quals["DIST_M"])
+            elif "DIST" in quals:
+                phys_kwargs["distance_m"] = float(quals["DIST"]) * 111194.9266
+            elif tr.distance > 0.0:
+                phys_kwargs["distance_m"] = float(tr.distance) * 111194.9266
+            elif self.current_params.distance > 0.0:
+                phys_kwargs["distance_m"] = float(self.current_params.distance) * 111194.9266
+
+            if "VEL" in quals or "VEL_M_S" in quals:
+                phys_kwargs["vel_m_s"] = float(quals.get("VEL", quals.get("VEL_M_S")))
+            if "RHO" in quals or "RHO_KG_M3" in quals:
+                phys_kwargs["rho_kg_m3"] = float(quals.get("RHO", quals.get("RHO_KG_M3")))
+            if "WAVE" in quals:
+                phys_kwargs["wave_type"] = quals["WAVE"]
+            if "NOTSTAR" in quals:
+                phys_kwargs["fit_t_star"] = False
+
+            inv_res = invert_brune_spectrum(
+                tr,
+                t_lo=t_lo,
+                t_hi=t_hi,
+                noise_lo=noise_lo,
+                noise_hi=noise_hi,
+                model=model_name,
+                f_lo=f_lo,
+                f_hi=f_hi,
+                input_type=input_type,
+                **phys_kwargs,
+            )
+            diag = build_brune_fit_diagnostic(inv_res, station=tr.station, phase=phase)
+
+            p = self.current_params
+            p.corner_freq = float(inv_res["fc"])
+            p.moment_m0 = float(inv_res["m0"])
+            p.mag_mw = float(inv_res["mw"])
+            p.rmse = float(inv_res["rms_log10"])
+            p.wrmse = float(inv_res.get("wrmse_log10", inv_res["rms_log10"]))
+            p.chi2_reduced = float(inv_res.get("chi2_reduced", 0.0))
+            p.condition_number = float(inv_res.get("condition_number", 1.0))
+
+            self.last_brune_result = inv_res
+            self._emit_fit_diagnostic(diag)
+            msg = (
+                f"{model_name.title()} Fit ({tr.station} {tr.channel3}): "
+                f"Omega0={inv_res['omega0']:.3e} nm*s, fc={inv_res['fc']:.3f} Hz, "
+                f"t*={inv_res['t_star']:.3f} s, M0={inv_res['m0']:.3e} N*m, "
+                f"Mw={inv_res['mw']:.2f}, dSigma={inv_res['stress_drop_bar']:.2f} bar, "
+                f"RMS={inv_res['rms_log10']:.4f}"
+            )
+            self.emit(msg)
+            return msg
+
+        if mode == "POL":
+            prefer_station = quals.get("STATION")
+            if prefer_station is None and rem and not rem[0].replace(".", "").replace("-", "").isdigit():
+                prefer_station = rem.pop(0)
+            tr_z, tr_n, tr_e = self._find_zne_triplet(prefer_station=prefer_station)
+            lo = float(quals["T_LO"]) if "T_LO" in quals else (
+                float(rem[0]) if len(rem) >= 2 else (self.time_window[0] if self.time_window else None)
+            )
+            hi = float(quals["T_HI"]) if "T_HI" in quals else (
+                float(rem[1]) if len(rem) >= 2 else (self.time_window[1] if self.time_window else None)
+            )
+            diag = analyze_polarization_diagnostic(tr_z, tr_n, tr_e, t_lo=lo, t_hi=hi)
+            ctx = diag.context_data
+            p = self.current_params
+            p.azimuth = float(ctx.get("baz", 0.0))
+            p.d_azimuth = float(ctx.get("sigma_theta_deg", 0.0))
+            p.incidence = float(ctx.get("incidence", 0.0))
+            p.rmse = float(diag.rmse)
+            p.wrmse = float(diag.wrmse)
+            p.chi2_reduced = float(diag.chi2_reduced)
+            p.condition_number = float(diag.condition_number)
+            for t in (tr_z, tr_n, tr_e):
+                t.inci = p.incidence
+            self.last_mdir_result = {
+                "azimuth": p.azimuth,
+                "incidence": p.incidence,
+                "rectilinearity": float(ctx.get("rectilinearity", 0.0)),
+                "planarity": float(ctx.get("planarity", 0.0)),
+                "lambda1": float(ctx.get("lambda1", 0.0)),
+                "lambda2": float(ctx.get("lambda2", 0.0)),
+                "lambda3": float(ctx.get("lambda3", 0.0)),
+                "rms_pol": float(ctx.get("rms_pol", 0.0)),
+                "sigma_theta_deg": float(ctx.get("sigma_theta_deg", 0.0)),
+                "sigma_phi_deg": float(ctx.get("sigma_phi_deg", 0.0)),
+            }
+            self._emit_fit_diagnostic(diag)
+            msg = (
+                f"Polarization Fit ({tr_z.station}): BAZ={p.azimuth:.1f} +/- {ctx.get('sigma_theta_deg', 0.0):.1f} deg, "
+                f"Inc={p.incidence:.1f} +/- {ctx.get('sigma_phi_deg', 0.0):.1f} deg, "
+                f"Rect={ctx.get('rectilinearity', 0.0):.3f}, RMS_pol={diag.rmse:.4f}"
+            )
+            self.emit(msg)
+            return msg
+
+        if mode == "FOCAL":
+            vis = self.visible_traces()
+            p = self.current_params
+            ev_lat = float(quals["LAT"]) if "LAT" in quals else float(p.lat)
+            ev_lon = float(quals["LON"]) if "LON" in quals else float(p.lon)
+            depth_km = float(quals["DEPTH"]) if "DEPTH" in quals else float(p.depth)
+            grid_step = float(quals.get("STEP", 10.0))
+            pols = extract_polarities_from_traces(
+                vis,
+                ev_lat,
+                ev_lon,
+                depth_km=depth_km,
+                config=self.config,
+                ttt=self.ttt,
+            )
+            if not pols:
+                raise ValueError(
+                    "FIT /FOCAL requires at least one trace pick with non-zero polarity (sign +1/-1 or 'c'/'d')"
+                )
+            fm_res = solve_focal_mechanism(pols, grid_step_deg=grid_step, refine=("NOREFINE" not in quals))
+            pol_tuples = [
+                (float(m["azimuth"]), float(m["takeoff"]), int(m["observed"]))
+                for m in fm_res["station_matches"]
+            ]
+            fm_payload: Dict[str, Any] = {
+                **fm_res,
+                "misfit": float(fm_res["misfit_ratio"]),
+                "polarities": pol_tuples,
+            }
+            self.last_focal_mechanism = fm_payload
+            setattr(p, "focal_mechanism", fm_payload)
+
+            residuals: List[ResidualEntry] = []
+            for m in fm_res["station_matches"]:
+                obs_v = float(m["observed"])
+                pred_v = float(m["predicted_sign"])
+                res_v = obs_v - pred_v
+                residuals.append(
+                    ResidualEntry(
+                        identifier=f"{m['station']}.P.FM",
+                        observed=obs_v,
+                        calculated=pred_v,
+                        residual=res_v,
+                        normalized_residual=abs(res_v),
+                        weight=float(m["weight"]),
+                        uncertainty=1.0,
+                        azimuth_deg=float(m["azimuth"]),
+                        station=str(m["station"]),
+                        phase="P",
+                        channel="Z",
+                        is_outlier=not bool(m["matched"]),
+                    )
+                )
+
+            fm_params = {
+                "strike": ParameterUncertainty(
+                    name="strike",
+                    value=float(fm_res["strike"]),
+                    standard_error=grid_step,
+                    confidence_interval_95=(float(fm_res["strike"]) - grid_step, float(fm_res["strike"]) + grid_step),
+                    unit="deg",
+                ),
+                "dip": ParameterUncertainty(
+                    name="dip",
+                    value=float(fm_res["dip"]),
+                    standard_error=grid_step,
+                    confidence_interval_95=(max(0.0, float(fm_res["dip"]) - grid_step), min(90.0, float(fm_res["dip"]) + grid_step)),
+                    unit="deg",
+                ),
+                "rake": ParameterUncertainty(
+                    name="rake",
+                    value=float(fm_res["rake"]),
+                    standard_error=grid_step,
+                    confidence_interval_95=(float(fm_res["rake"]) - grid_step, float(fm_res["rake"]) + grid_step),
+                    unit="deg",
+                ),
+            }
+            diag = FitDiagnosticResult(
+                fit_type=FitType.HYPOCENTER_GEIGER,
+                title=f"Double-Couple Focal Mechanism Fit ({fm_res['n_obs']} polarities)",
+                converged=bool(fm_res["converged"]),
+                iterations=1,
+                dof=max(1, int(fm_res["n_obs"]) - 3),
+                rmse=float(fm_res["misfit_ratio"]),
+                wrmse=float(fm_res["misfit_ratio"]),
+                parameters=fm_params,
+                residuals=residuals,
+                outlier_count=int(fm_res["n_misfit"]),
+                context_data={"focal_mechanism": fm_payload},
+            )
+            self._emit_fit_diagnostic(diag)
+            msg = (
+                f"Focal Mechanism Fit ({fm_res['n_obs']} polarities): "
+                f"Strike={fm_res['strike']:.1f} deg, Dip={fm_res['dip']:.1f} deg, Rake={fm_res['rake']:.1f} deg "
+                f"(Aux: {fm_res['strike2']:.1f}/{fm_res['dip2']:.1f}/{fm_res['rake2']:.1f}, "
+                f"Misfit={fm_res['n_misfit']}/{fm_res['n_obs']} [{fm_res['misfit_ratio']:.2f}])"
+            )
+            self.emit(msg)
+            return msg
+
+        # mode == "LOCATE"
+        vis = self.visible_traces()
+        all_picks = [pk for t in vis for pk in t.picks]
+        depth_km = float(quals["DEPTH"]) if "DEPTH" in quals else float(self.current_params.depth)
+        free_depth = ("FREE" in quals)
+        init_lat = float(quals["LAT"]) if "LAT" in quals else None
+        init_lon = float(quals["LON"]) if "LON" in quals else None
+        excl = [s.strip() for s in quals["EXCLUDE"].split(",") if s.strip()] if "EXCLUDE" in quals else None
+        param, _resids, diag = locate_network_geiger(
+            all_picks,
+            depth_km=depth_km,
+            free_depth=free_depth,
+            initial_lat=init_lat,
+            initial_lon=init_lon,
+            config=self.config,
+            ttt=self.ttt,
+            excluded_stations=excl,
+            return_diagnostics=True,
+        )
+        if self.last_focal_mechanism is not None:
+            setattr(param, "focal_mechanism", self.last_focal_mechanism)
+            diag.context_data["focal_mechanism"] = self.last_focal_mechanism
+        self.param_sets[self.active_set_index] = param
+        self._emit_fit_diagnostic(diag)
+        msg = (
+            f"Geiger Location Fit: Lat={param.lat:+.3f}, Lon={param.lon:+.3f}, Depth={param.depth:.1f} km, "
+            f"RMSE={param.rmse:.3f} s, Origin={param.origin}, Region={param.region_name}"
+        )
         self.emit(msg)
         return msg
 

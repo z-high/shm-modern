@@ -5,14 +5,15 @@ from __future__ import annotations
 import copy
 import math
 import os
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import uuid
 import weakref
 
 import functools
+import numpy as np
 
 from PyQt6 import sip
-from PyQt6.QtCore import QPoint, QTimer, Qt
+from PyQt6.QtCore import QPoint, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QColor, QPalette
 from PyQt6.QtWidgets import (
     QApplication,
@@ -45,6 +46,7 @@ from shm_app.core.config_station import get_config
 from shm_app.core.fit_bridge import FitDiagnosticBridge
 from shm_app.core.fit_models import FitModificationRequest, FitType
 from shm_app.core.models import AnalysisParamSet, Trace
+from shm_app.core.session import SessionManager, resolve_session_path
 from shm_app.core.time_utils import format_sh_time, parse_sh_time
 from shm_app.gui.fit_dialog import FitDiagnosticWindow
 from shm_app.seismology.traveltime import sphere_diff
@@ -55,21 +57,26 @@ from shm_app.gui.dialogs_analysis import (
     SpectrumDialog,
     VespagramDialog,
 )
-from shm_app.gui.dialogs_io import ReadDataDialog
+from shm_app.gui.dialogs_io import ReadDataDialog, SeedLinkStreamDialog
 from shm_app.gui.dialogs_location import EventSummaryDialog, NetworkLocationDialog
 from shm_app.gui.help_texts import apply_tutorial_tooltips, register_tutorial_help, render_tooltip
 from shm_app.gui.main_window_menus import build_menus_and_toolbar
 from shm_app.gui.panels import ParameterBoxPanel, PhaseDialogPanel
+from shm_app.gui.reporting import BulletinWorker
 from shm_app.gui.ui_helpers import apply_c_locale, get_dark_stylesheet
 from shm_app.gui.waveform_canvases import MagnifierCanvas, MainTraceCanvas
 from shm_app.gui.world_map import WorldMapDialog
 from shm_app.interpreter.sh_engine import SHCommandEngine
+from shm_app.io.geojson import write_geojson
 from shm_app.io.gse import read_gse_file
 from shm_app.io.mseed import read_mseed_file
+from shm_app.io.quakeml import parse_quakeml, write_quakeml
 from shm_app.plugins.bgr_dialog import BGRFetchDialog
 from shm_app.plugins.live_dialog import LiveEventDialog
 from shm_app.plugins.live_service import LiveEventCoordinator, build_analysis_param_set
+from shm_app.processing.filters import filter_trace
 from shm_app.processing.trace_ops import cut_trace
+from shm_app.seismology.focal_mechanism import extract_polarities_from_traces, solve_focal_mechanism
 from shm_app.seismology.traveltime import get_ttt_manager
 
 
@@ -111,6 +118,135 @@ def apply_dark_theme(app: Optional[QApplication]) -> None:
     app.setProperty("_shm_dark_theme_applied", True)
 
 
+class _RecomputeFitWorker(QThread):
+    """Background worker for >50 ms FitDiagnosticWindow re-fits (FK/plane-wave and Brune spectrum)."""
+
+    finishedDiagnostic = pyqtSignal(int, object, str)  # (seq_id, FitDiagnosticResult, log_msg)
+    failed = pyqtSignal(int, str)  # (seq_id, error_msg)
+
+    def __init__(
+        self,
+        seq_id: int,
+        fit_type: FitType,
+        *,
+        traces: Optional[List[Trace]] = None,
+        trace: Optional[Trace] = None,
+        t_lo: float = 0.0,
+        t_hi: float = 0.0,
+        dist_deg: float = 1.0,
+        config: Any = None,
+        calib_table: Any = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.seq_id = int(seq_id)
+        self.fit_type = fit_type
+        self.traces = traces or []
+        self.trace = trace
+        self.t_lo = float(t_lo)
+        self.t_hi = float(t_hi)
+        self.dist_deg = float(dist_deg)
+        self.config = config
+        self.calib_table = calib_table
+        self._is_cancelled = False
+
+    def cancel(self) -> None:
+        self._is_cancelled = True
+
+    def run(self) -> None:
+        try:
+            if self._is_cancelled:
+                return
+            if self.fit_type in (FitType.FK_SEMBLANCE, FitType.PLANE_WAVE):
+                from shm_app.seismology.array_loc import (
+                    build_fk_fit_diagnostic,
+                    compute_array_response_function,
+                    compute_beam_diagnostics,
+                    compute_fk_analysis,
+                )
+
+                cfg = self.config or get_config()
+                fk_res = compute_fk_analysis(
+                    self.traces,
+                    t_lo=self.t_lo,
+                    t_hi=self.t_hi,
+                    f_lo=0.5,
+                    f_hi=3.0,
+                    max_slowness=15.0,
+                    grid_points=51,
+                    config=cfg,
+                    progress_callback=lambda _cur, _tot: not self._is_cancelled,
+                    calib_table=self.calib_table,
+                    apply_calibration=self.calib_table is not None,
+                )
+                if self._is_cancelled or not fk_res:
+                    return
+                beam_diag = compute_beam_diagnostics(
+                    self.traces,
+                    azimuth_deg=float(fk_res["azimuth"]),
+                    slowness_s_deg=float(fk_res["slowness"]),
+                    t_lo=self.t_lo,
+                    t_hi=self.t_hi,
+                    config=cfg,
+                )
+                if self._is_cancelled:
+                    return
+                rel_coords = cfg.relative_xy_km(
+                    [t.station for t in self.traces],
+                    ref_station="CENTRE",
+                )
+                x_km = [c[0] for c in rel_coords]
+                y_km = [c[1] for c in rel_coords]
+                arf = compute_array_response_function(
+                    x_km,
+                    y_km,
+                    slowness_max=15.0,
+                    n_grid=51,
+                    freq_hz=1.5,
+                )
+                if self._is_cancelled:
+                    return
+                diag = build_fk_fit_diagnostic(
+                    fk_res,
+                    beam_diag,
+                    arf_result=arf,
+                    calib_info=fk_res,
+                )
+                msg = (
+                    f"Recomputed {self.fit_type.value}: BAZ={fk_res['azimuth']:.1f} deg, "
+                    f"Slow={fk_res['slowness']:.2f} s/deg"
+                )
+                if not self._is_cancelled:
+                    self.finishedDiagnostic.emit(self.seq_id, diag, msg)
+                return
+
+            if self.fit_type == FitType.BRUNE_SPECTRUM:
+                if self.trace is None:
+                    raise ValueError("No trace provided for Brune spectrum recomputation.")
+                from shm_app.processing.spectrum import build_brune_fit_diagnostic, invert_brune_spectrum
+
+                inv_res = invert_brune_spectrum(
+                    self.trace,
+                    t_lo=self.t_lo,
+                    t_hi=self.t_hi,
+                    distance_m=float(self.dist_deg) * 111194.9266,
+                )
+                if self._is_cancelled:
+                    return
+                diag = build_brune_fit_diagnostic(inv_res, station=self.trace.station)
+                if not self._is_cancelled:
+                    self.finishedDiagnostic.emit(self.seq_id, diag, "")
+                return
+        except Exception as exc:
+            if not self._is_cancelled:
+                prefix = (
+                    "Brune re-fit error"
+                    if self.fit_type == FitType.BRUNE_SPECTRUM
+                    else f"Re-fit error ({self.fit_type.value})"
+                )
+                self.failed.emit(self.seq_id, f"{prefix}: {exc}")
+
+
 class SHMMainWindow(QMainWindow):
     """Complete modernized SeismicHandler Motif (SHM) desktop application window."""
 
@@ -119,6 +255,8 @@ class SHMMainWindow(QMainWindow):
         shm_root: str = SHM_DEFAULT_ROOT,
         autoload_example: bool = False,
         parent: Optional[QWidget] = None,
+        session_path: Optional[Union[str, os.PathLike]] = None,
+        prompt_session_recovery: Optional[bool] = None,
     ) -> None:
         super().__init__(parent)
         apply_dark_theme(QApplication.instance())
@@ -130,13 +268,25 @@ class SHMMainWindow(QMainWindow):
         self._unfiltered_by_uid: Dict[str, Trace] = {}
         self._unfiltered_backup: List[Trace] = []
 
-        # Undo / redo, non-modal dialogs and ALIGN toggle state
+        # Undo / redo, non-modal dialogs, workers, session and ALIGN toggle state
         self._undo_stack: list = []
         self._redo_stack: list = []
         self._open_dialogs: List[QDialog] = []
+        self._bulletin_workers: List[Any] = []
+        self._recompute_workers: List[_RecomputeFitWorker] = []
+        self._recompute_seq: int = 0
         self._align_saved_offsets: Dict[Tuple[str, str, float], float] = {}
         self._pending_ready_event_id: Optional[str] = None
         self._last_pmotion_station: Optional[str] = None
+        self._last_fit_diagnostic: Any = None
+        self._last_focal_mechanism: Optional[Dict[str, Any]] = None
+
+        self._explicit_session_path: bool = session_path is not None
+        resolved_sess = resolve_session_path(
+            session_path if session_path is not None else (os.environ.get("SHM_SESSION_PATH") or None)
+        )
+        self.session_manager = SessionManager(resolved_sess)
+        self._has_autosaved: bool = False
 
         self.live_coordinator = LiveEventCoordinator(
             shm_config=self.config,
@@ -292,6 +442,8 @@ class SHMMainWindow(QMainWindow):
         self.fit_dock = FitDiagnosticWindow(self, bridge=self.fit_bridge)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.fit_dock)
         self.fit_dock.hide()
+        self.engine.fit_diagnostic_callback = self.fit_bridge.fitDiagnosticAvailable.emit
+        self.fit_bridge.fitDiagnosticAvailable.connect(self._on_fit_diagnostic_received)
         self.fit_bridge.recomputeFitRequested.connect(self._on_recompute_fit_requested)
         self.fit_bridge.adoptParametersRequested.connect(self._on_adopt_network_loc)
         self.fit_bridge.highlightTraceRequested.connect(self._on_highlight_fit_trace)
@@ -326,12 +478,21 @@ class SHMMainWindow(QMainWindow):
         self.live_coordinator.eventReadyToNotify.connect(self._on_live_event_ready)
         self.live_coordinator.loadEventRequested.connect(self._on_live_load_requested)
         self.live_coordinator.logMessage.connect(self._append_console_log)
+        self.live_coordinator.seedlinkTracesUpdated.connect(self._on_seedlink_traces_updated)
+        self.live_coordinator.seedlinkStatusChanged.connect(self._on_seedlink_status_changed)
+        self.live_coordinator.seedlinkErrorOccurred.connect(self._on_seedlink_error)
 
         # Keep status-bar state summary current (cheap, text only updated on change)
         self._state_timer = QTimer(self)
         self._state_timer.setInterval(250)
         self._state_timer.timeout.connect(self._update_state_label)
         self._state_timer.start()
+
+        # Periodic 60s atomic workspace autosave (M-23)
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(60000)
+        self._autosave_timer.timeout.connect(self._on_autosave_timer)
+        self._autosave_timer.start()
 
         # Vertical & horizontal scrollbars <-> canvas
         self.main_canvas.verticalRangeChanged.connect(self._on_vertical_range_changed)
@@ -346,10 +507,13 @@ class SHMMainWindow(QMainWindow):
         self.h_scroll.valueChanged.connect(self.main_canvas.set_time_offset_from_scroll)
         self.h_zoom_slider.valueChanged.connect(self._on_h_zoom_slider)
 
-        # Pick editing & context menu
+        # Pick editing, overlay filters & context menu
         self.main_canvas.pickDeleteRequested.connect(self._on_pick_delete_requested)
         self.main_canvas.pickMoved.connect(self._on_pick_moved)
+        self.main_canvas.pickChanged.connect(self._on_pick_changed)
         self.main_canvas.traceInvertRequested.connect(self._on_trace_invert_requested)
+        self.main_canvas.overlayFilterRequested.connect(self._on_overlay_filter_requested)
+        self.main_canvas.clearOverlayFilterRequested.connect(self._on_clear_overlay_filter_requested)
         self.main_canvas.contextMenuRequested.connect(self._on_trace_context_menu)
 
         # Connect canvas & dock signals
@@ -359,8 +523,10 @@ class SHMMainWindow(QMainWindow):
         self.main_canvas.cursorModeCycled.connect(self._on_cursor_mode_cycled)
 
         self.mag_canvas.pickPlaced.connect(self._on_magnifier_pick_placed)
+        self.mag_canvas.pickChanged.connect(self._on_pick_changed)
         self.mag_canvas.amplitudeMeasured.connect(self._on_magnifier_amplitude_measured)
         self.mag_canvas.cursorModeCycled.connect(self._on_cursor_mode_cycled)
+        self.mag_canvas.cursorOverlayModeChanged.connect(self._on_mag_cursor_overlay_mode_changed)
 
         self.phase_panel.deleteActivePickRequested.connect(self.action_delete_active_pick)
         self.phase_panel.depthPhaseCheckToggled.connect(self._on_depth_phase_check_toggled)
@@ -379,6 +545,17 @@ class SHMMainWindow(QMainWindow):
             self.load_example_dataset("GRF_031102_0225.GSE")
             self._undo_stack.clear()
             self._update_undo_actions()
+
+        no_prompt = os.environ.get("SHM_NO_SESSION_PROMPT", "").strip().lower() in ("1", "true", "yes")
+        if (prompt_session_recovery is not False) and (not no_prompt) and self.session_manager.has_unclean_session():
+            ans = QMessageBox.question(
+                self,
+                "Restore Previous Session",
+                "Previous session terminated unexpectedly. Restore workspace state?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ans == QMessageBox.StandardButton.Yes:
+                self.restore_session()
 
     @staticmethod
     def _wrap_dock_scroll(widget: QWidget) -> QScrollArea:
@@ -541,6 +718,12 @@ class SHMMainWindow(QMainWindow):
             "Deselect trace" if tr.selected else "Select trace",
             lambda: self._toggle_trace_selection(trace_idx),
         )
+        menu.addAction("Trace Overlay Filter...", lambda: self._on_overlay_filter_requested(trace_idx))
+        if getattr(tr, "overlay_filter_name", "NONE") not in ("", "NONE"):
+            menu.addAction(
+                f"Clear Overlay Filter ({tr.overlay_filter_name})",
+                lambda: self._on_clear_overlay_filter_requested(trace_idx),
+            )
         menu.addAction("Invert sign", lambda: self._invert_trace_sign(trace_idx))
         menu.addAction("Hide trace", lambda: self._hide_trace(trace_idx))
         menu.addAction("Delete trace", lambda: self._delete_trace(trace_idx))
@@ -629,6 +812,61 @@ class SHMMainWindow(QMainWindow):
             "Components grouped by station (Z, N, E)." if on else "Original trace order restored.", 4000
         )
 
+    def action_toggle_pick_error_bars(self, checked: Optional[bool] = None) -> None:
+        if checked is not None:
+            on = bool(checked)
+        else:
+            on = self.act_pick_error_bars.isChecked() if hasattr(self, "act_pick_error_bars") else True
+        self.main_canvas.set_show_pick_error_bars(on)
+        self.mag_canvas.set_show_pick_error_bars(on)
+        self.status_bar.showMessage(
+            f"Pick uncertainty error bars {'shown' if on else 'hidden'}.", 3000
+        )
+
+    def action_set_mag_cursor_mode(self, mode: str) -> None:
+        self.mag_canvas.set_cursor_overlay_mode(mode)
+        self._on_mag_cursor_overlay_mode_changed(self.mag_canvas.cursor_overlay_mode)
+        self.status_bar.showMessage(
+            f"Magnifier cursor mode: {self.mag_canvas.cursor_overlay_mode}", 3000
+        )
+
+    def _on_mag_cursor_overlay_mode_changed(self, mode: str) -> None:
+        m = (mode or "STANDARD").upper()
+        mapping = {
+            "STANDARD": getattr(self, "act_mag_cursor_standard", None),
+            "HILBERT": getattr(self, "act_mag_cursor_hilbert", None),
+            "REFERENCE": getattr(self, "act_mag_cursor_reference", None),
+        }
+        act = mapping.get(m)
+        if act is not None and not act.isChecked():
+            act.blockSignals(True)
+            act.setChecked(True)
+            act.blockSignals(False)
+
+    def action_capture_reference_window(self) -> None:
+        if self.mag_canvas.capture_reference_window():
+            if self.mag_canvas.cursor_overlay_mode == "STANDARD":
+                self.mag_canvas.set_cursor_overlay_mode("REFERENCE")
+            self.status_bar.showMessage(
+                "Captured Magnifier window as Reference / Hilbert cursor template.", 4000
+            )
+            self._append_console_log("Captured reference waveform window from Magnifier.")
+        else:
+            self.status_bar.showMessage("No active Magnifier waveform window to capture.", 4000)
+
+    def _on_pick_changed(self, trace_idx: int, pk: Any) -> None:
+        if 0 <= trace_idx < len(self.engine.traces):
+            self.main_canvas.invalidate_slot(trace_idx)
+        else:
+            self.main_canvas.invalidate_cache()
+        self.mag_canvas.invalidate_cache()
+        if pk is not None and 0 <= trace_idx < len(self.engine.traces):
+            tr = self.engine.traces[trace_idx]
+            self.status_bar.showMessage(
+                f"Updated {pk.name} pick on {tr.station}: Q={pk.quality} (±{pk.sigma_t(tr.delta):.2f} s)",
+                4000,
+            )
+
     # ------------------------------------------------------------------
     # Spectrum: curves from the yellow Magnifier window, accumulated in one graph
     # ------------------------------------------------------------------
@@ -661,6 +899,7 @@ class SHMMainWindow(QMainWindow):
         is_new = dlg is None
         if is_new:
             dlg = SpectrumDialog(None, parent=self)
+            dlg.fitDiagnosticReady.connect(self.fit_bridge.fitDiagnosticAvailable.emit)
         added = sum(1 for tr, lo, hi, label in items if dlg.add_curve(tr, lo, hi, label))
         if is_new:
             self._show_nonmodal(dlg)
@@ -1348,19 +1587,175 @@ class SHMMainWindow(QMainWindow):
         dt = self.engine.traces[0].delta if self.engine.traces else 0.05
         dlg = FilterDialog(dt=dt, config=self.config, parent=self)
         if dlg.exec():
-            if dlg.selected_filter_expr == "NONE":
+            opts = dlg.get_filter_options()
+            if opts["filter_expr"] == "NONE":
                 self.action_unfilter()
                 return
             self._push_undo("Filter")
             self.engine.apply_filter_to_traces(
-                dlg.selected_filter_expr,
-                mode=dlg.selected_mode,
-                use_lpc=dlg.use_lpc,
-                demean_first=dlg.demean_first,
+                opts["filter_expr"],
+                mode=opts["mode"],
+                use_lpc=opts["use_lpc"],
+                demean_first=opts["demean_first"],
                 visible_only=True,
+                autocut=opts["autocut"],
+                zero_phase=opts["zero_phase"],
             )
             self.refresh_views()
-            self._append_console_log(f"Applied filter '{dlg.selected_filter_expr}' ({dlg.selected_mode}).")
+            ac_note = " + autocut" if opts["autocut"] else ""
+            zp_note = " + zero-phase" if opts["zero_phase"] else ""
+            self._append_console_log(
+                f"Applied filter '{opts['filter_expr']}' ({opts['mode']}{ac_note}{zp_note})."
+            )
+
+    def _restore_pre_overlay_waveform(self, tr: Trace) -> None:
+        """Restore raw or pre-overlay globally filtered waveform when clearing an overlay filter."""
+        uid = tr.extra_headers.get("_raw_uid")
+        raw_tr = self._unfiltered_by_uid.get(uid) if uid else None
+        if (
+            raw_tr is None
+            or raw_tr.length != tr.length
+            or abs(raw_tr.delta - tr.delta) > 1e-6
+            or raw_tr.station != tr.station
+            or raw_tr.channel3 != tr.channel3
+        ):
+            return
+        if tr.filter_name == "NONE":
+            tr.data = raw_tr.data.copy()
+        else:
+            try:
+                rebuilt = filter_trace(
+                    raw_tr.copy(),
+                    tr.filter_name,
+                    config=self.config,
+                )
+                if rebuilt.length == tr.length:
+                    tr.data = rebuilt.data.copy()
+            except Exception:
+                pass
+
+    def apply_overlay_filter(
+        self,
+        filter_expr: str,
+        color: str = "red",
+        trace_indices: Optional[Sequence[int]] = None,
+        mode: str = "AUTO",
+        autocut: bool = False,
+        zero_phase: bool = False,
+        clear: bool = False,
+    ) -> int:
+        """Apply or clear a trace-specific secondary overlay filter (M-24) without modifying global filter_name."""
+        if trace_indices is None:
+            idxs = [i for i, t in enumerate(self.engine.traces) if t.selected and not t.hidden]
+        else:
+            idxs = [i for i in trace_indices if 0 <= i < len(self.engine.traces) and not self.engine.traces[i].hidden]
+        if not idxs:
+            return 0
+
+        self._push_undo("Clear overlay filter" if clear else "Overlay filter")
+        if clear or filter_expr.strip().upper() in ("NONE", "CLEAR", "OFF", ""):
+            for i in idxs:
+                tr = self.engine.traces[i]
+                tr.overlay_filter_name = "NONE"
+                tr.overlay_filter_color = ""
+                self._restore_pre_overlay_waveform(tr)
+            self.refresh_views()
+            self._append_console_log(f"Cleared overlay filter on {len(idxs)} trace(s).")
+            return len(idxs)
+
+        eff_color = (color or "red").strip() or "red"
+        for i in idxs:
+            tr = self.engine.traces[i]
+            prev_global = tr.filter_name
+            filtered = filter_trace(
+                tr,
+                filter_expr,
+                mode=mode,
+                config=self.config,
+                autocut=autocut,
+                zero_phase=zero_phase,
+            )
+            filtered.filter_name = prev_global
+            filtered.overlay_filter_name = filter_expr
+            filtered.overlay_filter_color = eff_color
+            filtered.filter_history = list(tr.filter_history) + [filter_expr]
+            self.engine.traces[i] = filtered
+
+        self.refresh_views()
+        self._append_console_log(
+            f"Applied overlay filter '{filter_expr}' ({eff_color}) to {len(idxs)} trace(s)."
+        )
+        return len(idxs)
+
+    def action_overlay_filter_dialog(self, target_indices: Optional[Sequence[int]] = None) -> None:
+        if target_indices is None:
+            idxs = [i for i, t in enumerate(self.engine.traces) if t.selected and not t.hidden]
+        else:
+            idxs = [i for i in target_indices if 0 <= i < len(self.engine.traces)]
+        if not idxs:
+            self.status_bar.showMessage("Select at least one trace first (click left margin).", 5000)
+            return
+
+        dt = self.engine.traces[idxs[0]].delta if self.engine.traces[idxs[0]].delta > 0 else 0.05
+        dlg = FilterDialog(dt=dt, config=self.config, parent=self)
+        dlg.setWindowTitle("Trace Overlay Filter (colour_addfil)")
+        if not dlg.exec():
+            return
+        opts = dlg.get_filter_options()
+        if opts["filter_expr"] == "NONE":
+            self.apply_overlay_filter("NONE", trace_indices=idxs, clear=True)
+            return
+
+        color, ok = QInputDialog.getItem(
+            self,
+            "Overlay Filter Color",
+            "Badge && Overlay Color:",
+            ["red", "green", "blue"],
+            0,
+            False,
+        )
+        if not ok:
+            return
+        self.apply_overlay_filter(
+            opts["filter_expr"],
+            color=color,
+            trace_indices=idxs,
+            mode=opts["mode"],
+            autocut=opts["autocut"],
+            zero_phase=opts["zero_phase"],
+        )
+
+    def action_clear_overlay_filters(self) -> None:
+        idxs = [i for i, t in enumerate(self.engine.traces) if t.selected and not t.hidden]
+        if not idxs:
+            idxs = [
+                i
+                for i, t in enumerate(self.engine.traces)
+                if not t.hidden and getattr(t, "overlay_filter_name", "NONE") not in ("", "NONE")
+            ]
+        if not idxs:
+            self.status_bar.showMessage("No trace overlay filters to clear.", 3000)
+            return
+        for i in idxs:
+            tr = self.engine.traces[i]
+            tr.overlay_filter_name = "NONE"
+            tr.overlay_filter_color = ""
+            self._restore_pre_overlay_waveform(tr)
+        self.refresh_views()
+        self._append_console_log(f"Cleared overlay filter on {len(idxs)} trace(s).")
+
+    def _on_overlay_filter_requested(self, trace_idx: int) -> None:
+        if 0 <= trace_idx < len(self.engine.traces):
+            self.action_overlay_filter_dialog(target_indices=[trace_idx])
+
+    def _on_clear_overlay_filter_requested(self, trace_idx: int) -> None:
+        if 0 <= trace_idx < len(self.engine.traces):
+            tr = self.engine.traces[trace_idx]
+            tr.overlay_filter_name = "NONE"
+            tr.overlay_filter_color = ""
+            self._restore_pre_overlay_waveform(tr)
+            self.refresh_views()
+            self._append_console_log(f"Cleared overlay filter on {tr.station} {tr.channel3}.")
 
     def action_unfilter(self) -> None:
         restored = 0
@@ -1551,6 +1946,7 @@ class SHMMainWindow(QMainWindow):
         )
         dlg.adoptParameters.connect(self._on_adopt_az_slo)
         dlg.adoptAndLocate.connect(self._on_adopt_az_slo_and_locate)
+        dlg.fitDiagnosticReady.connect(self.fit_bridge.fitDiagnosticAvailable.emit)
         self._show_nonmodal(dlg)
 
     def _on_adopt_az_slo(self, az: float, slo: float) -> None:
@@ -1667,46 +2063,174 @@ class SHMMainWindow(QMainWindow):
             req = FitModificationRequest(fit_type=FitType.HYPOCENTER_GEIGER)
             self._on_recompute_fit_requested(req)
 
-    def _on_recompute_fit_requested(self, req: Any) -> None:
-        """Re-invert earthquake location with modified station exclusions / weights and update UI."""
-        from shm_app.seismology.array_loc import locate_network_geiger
+    def _on_fit_diagnostic_received(self, diag: Any) -> None:
+        self._last_fit_diagnostic = diag
+        self.engine.last_fit_diagnostic = diag
 
-        all_picks = [pk for tr in self.engine.visible_traces() for pk in tr.picks if pk.onset and pk.station]
-        if not all_picks:
-            all_picks = [pk for tr in self.engine.traces for pk in tr.picks if pk.onset and pk.station]
-        if len(all_picks) < 3:
-            self._append_console_log("Cannot re-invert: need at least 3 phase picks across network.")
+    def _cancel_active_recompute_workers(self) -> int:
+        alive: List[_RecomputeFitWorker] = []
+        for w in getattr(self, "_recompute_workers", []):
+            if w is not None and not sip.isdeleted(w) and w.isRunning():
+                w.cancel()
+                alive.append(w)
+        self._recompute_workers = alive
+        self._recompute_seq = getattr(self, "_recompute_seq", 0) + 1
+        return self._recompute_seq
+
+    def _launch_recompute_worker(self, worker: _RecomputeFitWorker) -> _RecomputeFitWorker:
+        worker.finishedDiagnostic.connect(self._on_recompute_worker_finished)
+        worker.failed.connect(self._on_recompute_worker_failed)
+        self._recompute_workers.append(worker)
+        worker.start()
+        return worker
+
+    def _on_recompute_worker_finished(self, seq_id: int, diag: Any, log_msg: str) -> None:
+        if seq_id != self._recompute_seq:
+            return
+        self.fit_bridge.fitDiagnosticAvailable.emit(diag)
+        if log_msg:
+            self._append_console_log(log_msg)
+
+    def _on_recompute_worker_failed(self, seq_id: int, err_msg: str) -> None:
+        if seq_id != self._recompute_seq:
+            return
+        if err_msg:
+            self._append_console_log(err_msg)
+
+    def _on_recompute_fit_requested(self, req: Any) -> None:
+        """Re-compute diagnostics / re-invert according to req.fit_type with exclusions and weights."""
+        fit_type = getattr(req, "fit_type", FitType.HYPOCENTER_GEIGER)
+        excluded = list(getattr(req, "excluded_identifiers", None) or [])
+        excluded_upper = {str(x).split(".")[0].strip().upper() for x in excluded if str(x).strip()}
+        weight_overrides = getattr(req, "weight_overrides", None)
+        seq_id = self._cancel_active_recompute_workers()
+
+        if fit_type in (
+            FitType.HYPOCENTER_GEIGER,
+            FitType.ORIGIN_TIME,
+            FitType.TTFIT_SIMPLEX,
+            FitType.SP_DIFF_DEPTH,
+        ):
+            from shm_app.seismology.array_loc import locate_network_geiger
+
+            all_picks = [pk for tr in self.engine.visible_traces() for pk in tr.picks if pk.onset and pk.station]
+            if not all_picks:
+                all_picks = [pk for tr in self.engine.traces for pk in tr.picks if pk.onset and pk.station]
+            if len(all_picks) < 3:
+                self._append_console_log("Cannot re-invert: need at least 3 phase picks across network.")
+                return
+
+            try:
+                param, _station_residuals, diag = locate_network_geiger(
+                    all_picks,
+                    depth_km=self.engine.current_params.depth,
+                    free_depth=(self.engine.current_params.depth_type == 3),
+                    config=self.config,
+                    ttt=self.engine.ttt,
+                    excluded_stations=excluded or None,
+                    weight_overrides=weight_overrides,
+                    return_diagnostics=True,
+                )
+                self._on_adopt_network_loc(param)
+                self.fit_bridge.fitDiagnosticAvailable.emit(diag)
+                self._append_console_log(
+                    f"Re-inverted Geiger hypocenter: Lat={param.lat:+.3f}, Lon={param.lon:+.3f}, "
+                    f"Depth={param.depth:.1f} km, RMSE={diag.rmse:.3f} s"
+                )
+            except Exception as exc:
+                self._append_console_log(f"Re-fit error: {exc}")
             return
 
-        try:
-            param, station_residuals, diag = locate_network_geiger(
-                all_picks,
-                depth_km=self.engine.current_params.depth,
-                free_depth=(self.engine.current_params.depth_type == 3),
+        if fit_type in (FitType.FK_SEMBLANCE, FitType.PLANE_WAVE):
+            vis = [
+                tr.copy()
+                for tr in self.engine.visible_traces()
+                if tr.station.strip().upper() not in excluded_upper
+            ]
+            if len(vis) < 2:
+                self._append_console_log("Cannot recompute FK/Array fit: need at least 2 active traces.")
+                return
+            worker = _RecomputeFitWorker(
+                seq_id,
+                fit_type,
+                traces=vis,
+                t_lo=self.main_canvas.mag_t_lo,
+                t_hi=self.main_canvas.mag_t_hi,
                 config=self.config,
-                ttt=self.engine.ttt,
-                excluded_stations=getattr(req, "excluded_identifiers", None),
-                weight_overrides=getattr(req, "weight_overrides", None),
-                return_diagnostics=True,
+                calib_table=getattr(self.engine, "calib_table", None),
+                parent=self,
             )
-            self._on_adopt_network_loc(param)
-            self.fit_bridge.fitDiagnosticAvailable.emit(diag)
-            self._append_console_log(
-                f"Re-inverted Geiger hypocenter: Lat={param.lat:+.3f}, Lon={param.lon:+.3f}, "
-                f"Depth={param.depth:.1f} km, RMSE={diag.rmse:.3f} s"
+            self._launch_recompute_worker(worker)
+            return
+
+        if fit_type == FitType.BRUNE_SPECTRUM:
+            vis = self.engine.visible_traces()
+            if not vis:
+                self._append_console_log("Cannot recompute Brune spectrum: no traces loaded.")
+                return
+            idx = max(0, min(self.main_canvas.mag_trace_idx, len(self.engine.traces) - 1))
+            tr = self.engine.traces[idx].copy()
+            lo, hi = self._spectrum_window_for(tr)
+            if hi - lo < 8 * tr.delta:
+                lo, hi = 0.0, tr.duration
+            dist_deg = tr.distance if tr.distance > 0 else (self.engine.current_params.distance or 1.0)
+            worker = _RecomputeFitWorker(
+                seq_id,
+                fit_type,
+                trace=tr,
+                t_lo=lo,
+                t_hi=hi,
+                dist_deg=float(dist_deg),
+                parent=self,
             )
-        except Exception as exc:
-            self._append_console_log(f"Re-fit error: {exc}")
+            self._launch_recompute_worker(worker)
+            return
+
+        if fit_type == FitType.POLARIZATION_3C:
+            try:
+                from shm_app.processing.polarization import analyze_polarization_diagnostic
+
+                prefer_sta = None
+                if 0 <= self.main_canvas.mag_trace_idx < len(self.engine.traces):
+                    prefer_sta = self.engine.traces[self.main_canvas.mag_trace_idx].station
+                tz, tn, te = self.engine._find_zne_triplet(prefer_station=prefer_sta)
+                lo, hi = self._spectrum_window_for(tz)
+                if hi - lo <= 2.0 * max(1e-6, tz.delta):
+                    lo, hi = 0.0, tz.duration
+                diag = analyze_polarization_diagnostic(tz, tn, te, t_lo=lo, t_hi=hi)
+                self.fit_bridge.fitDiagnosticAvailable.emit(diag)
+            except Exception as exc:
+                self._append_console_log(f"Polarization re-fit error: {exc}")
+            return
+
+        # Other domains (RESTITUTION_FIT, RECEIVER_FUNC, SURFACE_DISPERSION): re-emit cached result if matching
+        last_diag = self._last_fit_diagnostic
+        if last_diag is not None and getattr(last_diag, "fit_type", None) == fit_type:
+            self.fit_bridge.fitDiagnosticAvailable.emit(last_diag)
+        self._append_console_log(f"Re-fit handled for domain {getattr(fit_type, 'value', fit_type)}.")
 
     def _on_highlight_fit_trace(self, station: str) -> None:
-        """Highlight matching station trace in main canvas when clicked in diagnostic table."""
-        st_upper = station.upper()
-        visible = self.engine.visible_traces()
-        for idx, tr in enumerate(visible):
-            if tr.station.upper() == st_upper:
-                self.engine.selected_trace_indices = {idx}
-                self.refresh_views()
-                break
+        """Highlight and select matching station trace(s) in main canvas when clicked in diagnostic table."""
+        st_upper = (station or "").strip().upper()
+        if not st_upper:
+            return
+        selected_indices = set()
+        first_idx: Optional[int] = None
+        for idx, tr in enumerate(self.engine.traces):
+            if tr.hidden:
+                continue
+            matched = tr.station.strip().upper() == st_upper
+            tr.selected = matched
+            if matched:
+                selected_indices.add(idx)
+                if first_idx is None:
+                    first_idx = idx
+        self.engine.selected_trace_indices = selected_indices
+        if first_idx is not None:
+            self.main_canvas.mag_trace_idx = first_idx
+        self.main_canvas.invalidate_cache()
+        self.main_canvas.update()
+        self.refresh_views()
 
     def _on_exclude_fit_station(self, station: str, exclude: bool) -> None:
         """Handle explicit station exclusion toggle from external plugins."""
@@ -1852,6 +2376,8 @@ class SHMMainWindow(QMainWindow):
             lo, hi = 0.0, tz.duration
         dlg = ParticleMotionDialog(tz, tn, te, t_lo=lo, t_hi=hi, parent=self)
         dlg.adoptAngles.connect(self._on_adopt_pmotion_angles)
+        dlg.fitDiagnosticReady.connect(self.fit_bridge.fitDiagnosticAvailable.emit)
+        dlg.emit_diagnostic()
         self._show_nonmodal(dlg)
 
     def _on_adopt_pmotion_angles(self, az: float, inc: float) -> None:
@@ -1875,6 +2401,540 @@ class SHMMainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Polarization Filter", str(exc))
 
+    # ------------------------------------------------------------------
+    # Phase 4: StationXML, QuakeML, GeoJSON, Vector Bulletin, Phase ID,
+    # Surface Wave Scan, Focal Mechanism, SeedLink, and Session Recovery
+    # ------------------------------------------------------------------
+
+    def action_import_stationxml(self, fpath: Optional[str] = None) -> None:
+        if fpath is None:
+            fpath, _ = QFileDialog.getOpenFileName(
+                self,
+                "Import FDSN StationXML",
+                self.config.shm_root,
+                "StationXML Files (*.xml *.stationxml);;All Files (*)",
+            )
+        if not fpath:
+            return
+        try:
+            inv = self.config.load_stationxml(fpath)
+            self.engine.last_stationxml_inventory = inv
+            for tr in self.engine.traces:
+                ch_meta = self.config.get_channel_metadata(
+                    tr.network, tr.station, tr.locid, tr.channel3, tr.start_epoch
+                )
+                if ch_meta is not None:
+                    if ch_meta.latitude != 0.0 or ch_meta.longitude != 0.0:
+                        tr.lat = float(ch_meta.latitude)
+                        tr.lon = float(ch_meta.longitude)
+                    if ch_meta.sensor_description:
+                        tr.instype = ch_meta.sensor_description
+                    tr.extra_headers["azimuth"] = float(ch_meta.azimuth)
+                    tr.extra_headers["dip"] = float(ch_meta.dip)
+                    tr.extra_headers["station_lat"] = float(tr.lat)
+                    tr.extra_headers["station_lon"] = float(tr.lon)
+                    tr.extra_headers["station_elev"] = float(ch_meta.elevation)
+                    sxml_calib = self.config._stationxml_calib_nm_per_count(ch_meta)
+                    if sxml_calib is not None and sxml_calib > 0:
+                        tr.calib = float(sxml_calib)
+                else:
+                    st = self.config.get_station(tr.station)
+                    if st is not None and (st.lat != 0.0 or st.lon != 0.0) and tr.lat == 0.0 and tr.lon == 0.0:
+                        tr.lat = st.lat
+                        tr.lon = st.lon
+            self.refresh_views()
+            n_sta = len(inv.stations)
+            n_cha = sum(len(s.channels) for s in inv.stations)
+            msg = f"Imported StationXML ({n_sta} station(s), {n_cha} channel(s)) from {fpath}."
+            self._append_console_log(msg)
+            self.status_bar.showMessage(msg, 5000)
+        except Exception as exc:
+            self._append_console_log(f"StationXML import error: {exc}")
+            QMessageBox.warning(self, "StationXML Import Error", str(exc))
+
+    def action_import_quakeml(self, fpath: Optional[str] = None) -> None:
+        if fpath is None:
+            fpath, _ = QFileDialog.getOpenFileName(
+                self,
+                "Import QuakeML Event",
+                self.config.shm_root,
+                "QuakeML Files (*.xml *.qml);;All Files (*)",
+            )
+        if not fpath:
+            return
+        try:
+            self._push_undo("Import QuakeML")
+            qml = parse_quakeml(fpath)
+            param = qml["params"]
+            picks = qml.get("phase_picks", [])
+            fms = qml.get("focal_mechanisms", [])
+            if fms:
+                fm0 = fms[0]
+                np1 = fm0.get("nodalPlane1")
+                if isinstance(np1, dict):
+                    fm_dict: Dict[str, Any] = {
+                        "strike": float(np1.get("strike", 0.0)),
+                        "dip": float(np1.get("dip", 0.0)),
+                        "rake": float(np1.get("rake", 0.0)),
+                    }
+                    np2 = fm0.get("nodalPlane2")
+                    if isinstance(np2, dict):
+                        fm_dict["strike2"] = float(np2.get("strike", 0.0))
+                        fm_dict["dip2"] = float(np2.get("dip", 0.0))
+                        fm_dict["rake2"] = float(np2.get("rake", 0.0))
+                    self.engine.last_focal_mechanism = fm_dict
+                    self._last_focal_mechanism = fm_dict
+                    setattr(param, "focal_mechanism", fm_dict)
+                    self.fit_dock.display_focal_mechanism(fm_dict)
+
+            self.engine.param_sets[self.engine.active_set_index] = param
+            for p in picks:
+                for tr in self.engine.traces:
+                    if tr.station.upper() == p.station.upper() and (not p.comp or tr.comp.upper() == p.comp.upper()):
+                        tr.add_or_replace_pick(p)
+                        break
+                else:
+                    for tr in self.engine.traces:
+                        if tr.station.upper() == p.station.upper():
+                            tr.add_or_replace_pick(p)
+                            break
+            self.refresh_views()
+            msg = (
+                f"Imported QuakeML {qml.get('schema_version', '1.2')} from {fpath}: "
+                f"Lat={param.lat:+.3f}, Lon={param.lon:+.3f}, Depth={param.depth:.1f} km, {len(picks)} pick(s)."
+            )
+            self._append_console_log(msg)
+            self.status_bar.showMessage(msg, 5000)
+        except Exception as exc:
+            self._append_console_log(f"QuakeML import error: {exc}")
+            QMessageBox.warning(self, "QuakeML Import Error", str(exc))
+
+    def action_export_quakeml(self, fpath: Optional[str] = None) -> None:
+        if fpath is None:
+            fpath, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export QuakeML 1.2",
+                "event.quakeml.xml",
+                "QuakeML XML (*.xml *.qml)",
+            )
+        if not fpath:
+            return
+        try:
+            fm = self._last_focal_mechanism or getattr(self.engine, "last_focal_mechanism", None)
+            write_quakeml(
+                fpath,
+                self.engine.traces,
+                self.engine.current_params,
+                focal_mechanism=fm,
+            )
+            msg = f"Exported QuakeML 1.2 to {fpath}"
+            self._append_console_log(msg)
+            self.status_bar.showMessage(msg, 5000)
+        except Exception as exc:
+            self._append_console_log(f"QuakeML export error: {exc}")
+            QMessageBox.warning(self, "QuakeML Export Error", str(exc))
+
+    def action_export_geojson(self, fpath: Optional[str] = None) -> None:
+        if fpath is None:
+            fpath, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export GeoJSON (RFC 7946)",
+                "event.geojson",
+                "GeoJSON Files (*.geojson *.json)",
+            )
+        if not fpath:
+            return
+        try:
+            fm = self._last_focal_mechanism or getattr(self.engine, "last_focal_mechanism", None)
+            write_geojson(
+                fpath,
+                self.engine.traces,
+                self.engine.current_params,
+                focal_mechanism=fm,
+            )
+            msg = f"Exported RFC 7946 GeoJSON to {fpath}"
+            self._append_console_log(msg)
+            self.status_bar.showMessage(msg, 5000)
+        except Exception as exc:
+            self._append_console_log(f"GeoJSON export error: {exc}")
+            QMessageBox.warning(self, "GeoJSON Export Error", str(exc))
+
+    def action_export_bulletin(
+        self,
+        fpath: Optional[str] = None,
+        fmt: Optional[str] = None,
+    ) -> Optional[BulletinWorker]:
+        if fpath is None:
+            fpath, selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Export Observatory Bulletin (PDF / SVG)",
+                "observatory_bulletin.pdf",
+                "Vector PDF (*.pdf);;Vector SVG (*.svg)",
+            )
+            if fpath and fmt is None and "SVG" in selected_filter and not fpath.lower().endswith(".svg"):
+                fpath = fpath + ".svg"
+        if not fpath:
+            return None
+
+        self._bulletin_workers = [
+            w for w in self._bulletin_workers if w is not None and not sip.isdeleted(w) and w.isRunning()
+        ]
+        fm = self._last_focal_mechanism or getattr(self.engine, "last_focal_mechanism", None)
+        fit_res = self._last_fit_diagnostic or getattr(self.engine, "last_fit_diagnostic", None)
+        worker = BulletinWorker(
+            output_path=fpath,
+            traces=[t.copy() for t in self.engine.traces],
+            params=copy.deepcopy(self.engine.current_params),
+            fit_result=fit_res,
+            focal_mech=fm,
+            format=fmt,
+            config=self.config,
+            parent=self,
+        )
+        worker.finishedReport.connect(self._on_bulletin_finished)
+        worker.failed.connect(self._on_bulletin_failed)
+        self._bulletin_workers.append(worker)
+        worker.start()
+        self.status_bar.showMessage(f"Generating observatory bulletin: {fpath}...", 4000)
+        return worker
+
+    def _on_bulletin_finished(self, out_path: str) -> None:
+        msg = f"Generated vector observatory bulletin: {out_path}"
+        self._append_console_log(msg)
+        self.status_bar.showMessage(msg, 5000)
+
+    def _on_bulletin_failed(self, err: str) -> None:
+        msg = f"Observatory bulletin export failed: {err}"
+        self._append_console_log(msg)
+        self.status_bar.showMessage(msg, 5000)
+
+    def action_identify_phases(self, dist_deg: Optional[float] = None) -> None:
+        picked_traces = [tr for tr in self.engine.traces if tr.picks]
+        if not picked_traces:
+            self.status_bar.showMessage("Pick at least one phase before identifying phases.", 4000)
+            self._append_console_log("IDENTIFY: no picked traces in workspace.")
+            return
+
+        p = self.engine.current_params
+        has_hypo = (p.lat != 0.0 or p.lon != 0.0)
+        if dist_deg is None and not has_hypo and p.distance <= 0.0 and not any(tr.distance > 0.0 for tr in picked_traces):
+            val, ok = QInputDialog.getDouble(
+                self,
+                "Identify Phases (IASP91)",
+                "Epicentral Distance (degrees):",
+                65.0,
+                0.1,
+                180.0,
+                2,
+            )
+            if not ok:
+                return
+            dist_deg = float(val)
+
+        try:
+            self._push_undo("Identify phases")
+            cmd = f"IDENTIFY /DIST={float(dist_deg):.4f}" if dist_deg is not None else "IDENTIFY"
+            msg = self.engine.execute_line(cmd)
+            self.refresh_views()
+            if msg:
+                self.status_bar.showMessage(msg.splitlines()[0], 5000)
+        except Exception as exc:
+            self._append_console_log(f"Phase identification error: {exc}")
+            self.status_bar.showMessage(f"Identify error: {exc}", 5000)
+
+    def action_scan_surface_waves(self) -> None:
+        if not self.engine.traces:
+            self.status_bar.showMessage("Load traces before scanning surface waves.", 4000)
+            return
+        try:
+            self._push_undo("Scan surface waves (18-22s Ms)")
+            msg = self.engine.execute_line("SURFMAG")
+            self.refresh_views()
+            if msg:
+                self.status_bar.showMessage(msg, 6000)
+        except Exception as exc:
+            self._append_console_log(f"Surface wave scan error: {exc}")
+            self.status_bar.showMessage(f"Surface wave scan error: {exc}", 5000)
+
+    def action_solve_focal_mechanism(self) -> Optional[Dict[str, Any]]:
+        p = self.engine.current_params
+        vis = self.engine.visible_traces()
+        try:
+            pols = extract_polarities_from_traces(
+                vis,
+                p.lat,
+                p.lon,
+                depth_km=p.depth,
+                config=self.config,
+                ttt=self.ttt,
+            )
+            if not pols:
+                msg = "Need at least one pick with +/- polarity ('c'/'d') to solve focal mechanism."
+                self._append_console_log(msg)
+                self.status_bar.showMessage(msg, 5000)
+                return None
+            fm_res = solve_focal_mechanism(pols)
+            pol_tuples = [
+                (float(m["azimuth"]), float(m["takeoff"]), int(m["observed"]))
+                for m in fm_res["station_matches"]
+            ]
+            fm_payload: Dict[str, Any] = {
+                **fm_res,
+                "misfit": float(fm_res["misfit_ratio"]),
+                "polarities": pol_tuples,
+            }
+            self._last_focal_mechanism = fm_payload
+            self.engine.last_focal_mechanism = fm_payload
+            setattr(p, "focal_mechanism", fm_payload)
+            self.fit_dock.show()
+            self.fit_dock.raise_()
+            self.fit_dock.display_focal_mechanism(fm_payload)
+            msg = (
+                f"Focal Mechanism ({fm_res['n_obs']} polarities): "
+                f"Strike={fm_res['strike']:.1f}°, Dip={fm_res['dip']:.1f}°, Rake={fm_res['rake']:.1f}° "
+                f"(misfit={fm_res['misfit_ratio']:.2f})"
+            )
+            self._append_console_log(msg)
+            self.status_bar.showMessage(msg, 6000)
+            return fm_payload
+        except Exception as exc:
+            self._append_console_log(f"Focal mechanism solver error: {exc}")
+            self.status_bar.showMessage(f"Focal mechanism error: {exc}", 5000)
+            return None
+
+    def action_open_seedlink_dialog(self) -> None:
+        existing = self._find_open_dialog(SeedLinkStreamDialog)
+        if existing is not None:
+            self._raise_nonmodal(existing)
+            return
+        dlg = SeedLinkStreamDialog(self.live_coordinator, parent=self)
+        self._show_nonmodal(dlg)
+
+    def start_seedlink_stream(
+        self,
+        host: str,
+        port: int = 18000,
+        streams: Optional[Sequence[Any]] = None,
+        **kwargs: Any,
+    ):
+        norm_streams: Optional[List[Any]] = None
+        if streams is not None:
+            norm_streams = []
+            for item in streams:
+                if isinstance(item, str):
+                    tok = item.strip()
+                    if ":" in tok:
+                        left, sel = tok.split(":", 1)
+                        parts = [p for p in left.replace(".", "_").split("_") if p]
+                        if len(parts) >= 2:
+                            sel_norm = sel.strip().upper()
+                            if "." not in sel_norm:
+                                sel_norm = f"{sel_norm}.D"
+                            norm_streams.append((parts[0].upper(), parts[1].upper(), sel_norm))
+                            continue
+                    if "." in tok:
+                        parts = tok.split(".")
+                        if len(parts) >= 4:
+                            loc = parts[2].strip().upper()
+                            cha = parts[3].strip().upper() or "BHZ"
+                            sel = f"{loc}{cha}.D" if loc else f"{cha}.D"
+                            norm_streams.append((parts[0].strip().upper(), parts[1].strip().upper(), sel))
+                            continue
+                        if len(parts) >= 2:
+                            sel = f"{parts[2].strip().upper()}.D" if len(parts) == 3 and parts[2].strip() else "BHZ.D"
+                            norm_streams.append((parts[0].strip().upper(), parts[1].strip().upper(), sel))
+                            continue
+                    if "_" in tok:
+                        parts = [p for p in tok.split("_") if p]
+                        if len(parts) >= 2:
+                            sel = f"{parts[2].upper()}.D" if len(parts) >= 3 else "BHZ.D"
+                            norm_streams.append((parts[0].upper(), parts[1].upper(), sel))
+                            continue
+                norm_streams.append(item)
+
+        worker = self.live_coordinator.start_seedlink(
+            host=host,
+            port=port,
+            streams=norm_streams,
+            **kwargs,
+        )
+        if hasattr(self, "act_seedlink_stop"):
+            self.act_seedlink_stop.setEnabled(True)
+        return worker
+
+    def action_stop_seedlink(self) -> None:
+        self.live_coordinator.stop_seedlink()
+        if hasattr(self, "act_seedlink_stop"):
+            self.act_seedlink_stop.setEnabled(False)
+        self.status_bar.showMessage("SeedLink stream stopped.", 4000)
+
+    def _on_seedlink_traces_updated(self, stream_traces: list) -> None:
+        if not stream_traces:
+            return
+        was_empty = len(self.engine.traces) == 0
+        existing_picks: Dict[Tuple[str, str, str, str], List[Any]] = {}
+        kept_traces: List[Trace] = []
+        for tr in self.engine.traces:
+            key = (tr.network.upper(), tr.station.upper(), tr.locid.upper(), tr.channel3.upper())
+            if tr.picks:
+                existing_picks[key] = list(tr.picks)
+            if not tr.extra_headers.get("seedlink_stream"):
+                kept_traces.append(tr)
+
+        sl_traces: List[Trace] = []
+        for tr in stream_traces:
+            tr_copy = tr.copy()
+            tr_copy.extra_headers["seedlink_stream"] = True
+            key = (tr_copy.network.upper(), tr_copy.station.upper(), tr_copy.locid.upper(), tr_copy.channel3.upper())
+            if not tr_copy.picks and key in existing_picks:
+                tr_copy.picks = copy.deepcopy(existing_picks[key])
+            sl_traces.append(tr_copy)
+
+        self.engine.traces = kept_traces + sl_traces
+        self._register_unfiltered_traces(sl_traces, replace=False, overwrite_existing=False)
+        self.refresh_views(reset_time=was_empty)
+
+    def _on_seedlink_status_changed(self, status: str) -> None:
+        running = bool(self.live_coordinator.is_seedlink_running)
+        if hasattr(self, "act_seedlink_stop"):
+            self.act_seedlink_stop.setEnabled(running)
+        self.status_bar.showMessage(f"SeedLink: {status}", 3000)
+
+    def _on_seedlink_error(self, err: str) -> None:
+        self.status_bar.showMessage(f"SeedLink warning: {err}", 4000)
+
+    def autosave_session(self, clean_exit: bool = False) -> Optional[str]:
+        disp = {
+            "norm_mode": self.main_canvas.norm_mode,
+            "global_zoom": self.main_canvas.global_zoom,
+            "view_t_lo": self.main_canvas.view_t_lo,
+            "view_t_hi": self.main_canvas.view_t_hi,
+            "mag_t_lo": self.main_canvas.mag_t_lo,
+            "mag_t_hi": self.main_canvas.mag_t_hi,
+            "min_slot_h": self.main_canvas.min_slot_h,
+            "group_by_station": self.main_canvas.group_by_station,
+            "show_pick_error_bars": self.main_canvas.show_pick_error_bars,
+            "cursor_overlay_mode": self.mag_canvas.cursor_overlay_mode,
+        }
+        sel_idxs = [i for i, t in enumerate(self.engine.traces) if t.selected]
+        saved = self.session_manager.save(
+            traces=self.engine.traces,
+            param_sets=self.engine.param_sets,
+            active_set_index=self.engine.active_set_index,
+            selected_trace_indices=sel_idxs,
+            active_trace_index=self.main_canvas.mag_trace_idx,
+            display_settings=disp,
+            clean_exit=clean_exit,
+        )
+        self._has_autosaved = True
+        return saved
+
+    def _on_autosave_timer(self) -> None:
+        if self.engine.traces or self._explicit_session_path or self._has_autosaved:
+            try:
+                self.autosave_session(clean_exit=False)
+            except Exception:
+                pass
+
+    def _load_trace_data_for_session(self, raw_tr: Dict[str, Any]) -> Optional[np.ndarray]:
+        src = str(raw_tr.get("source_path") or "")
+        if not src or not os.path.isfile(src):
+            return None
+        sta = str(raw_tr.get("station") or "").upper()
+        ch1 = str(raw_tr.get("chan1") or "B").upper()
+        ch2 = str(raw_tr.get("chan2") or "H").upper()
+        cp = str(raw_tr.get("comp") or "Z").upper()
+        ch3 = f"{ch1}{ch2}{cp}"
+        low = src.lower()
+        try:
+            if low.endswith(".gse"):
+                trs = read_gse_file(src, config=self.config)
+            elif low.endswith((".qhd", ".qbn")):
+                from shm_app.io.qfile import read_qfile
+
+                trs = read_qfile(src, config=self.config)
+            elif low.endswith((".asc", ".txt")):
+                from shm_app.io.qfile import read_ascii_file
+
+                trs = read_ascii_file(src, config=self.config)
+            else:
+                trs = read_mseed_file(src, config=self.config)
+        except Exception:
+            return None
+        for cand in trs:
+            if cand.station.upper() == sta and cand.channel3.upper() == ch3:
+                return cand.data
+        for cand in trs:
+            if cand.station.upper() == sta:
+                return cand.data
+        return trs[0].data if trs else None
+
+    def restore_session(self, session_path: Optional[Union[str, os.PathLike]] = None) -> bool:
+        mgr = SessionManager(session_path) if session_path is not None else self.session_manager
+        res = mgr.load(trace_loader=self._load_trace_data_for_session, raise_on_error=False)
+        if not res.get("ok", False):
+            err = res.get("error") or "Unable to restore session."
+            self._append_console_log(f"Session restore skipped: {err}")
+            return False
+
+        self.engine.traces = list(res.get("traces") or [])
+        ps_list = list(res.get("param_sets") or [])
+        for idx, ps in enumerate(ps_list):
+            if idx < len(self.engine.param_sets):
+                self.engine.param_sets[idx] = ps
+            else:
+                self.engine.param_sets.append(ps)
+        if self.engine.param_sets:
+            self.engine.active_set_index = max(
+                0, min(len(self.engine.param_sets) - 1, int(res.get("active_set_index", 0)))
+            )
+
+        disp = res.get("display_settings") or {}
+        if disp.get("norm_mode") in ("A", "C", "AW", "SW"):
+            self.engine.norm_mode = disp["norm_mode"]
+            self.main_canvas.norm_mode = disp["norm_mode"]
+        if disp.get("global_zoom") is not None:
+            gz = max(0.05, min(200.0, float(disp["global_zoom"])))
+            self.engine.global_zoom = gz
+            self.main_canvas.global_zoom = gz
+        v_lo = disp.get("view_t_lo")
+        v_hi = disp.get("view_t_hi")
+        if v_lo is not None and v_hi is not None:
+            self.engine.view_window = (float(v_lo), float(v_hi))
+            self.main_canvas.view_t_lo = float(v_lo)
+            self.main_canvas.view_t_hi = float(v_hi)
+            self._synced_view_window_version = self.engine._view_window_version
+        if disp.get("mag_t_lo") is not None and disp.get("mag_t_hi") is not None:
+            self.main_canvas.mag_t_lo = float(disp["mag_t_lo"])
+            self.main_canvas.mag_t_hi = float(disp["mag_t_hi"])
+        if disp.get("min_slot_h") is not None:
+            self._set_row_height(int(disp["min_slot_h"]))
+        if "group_by_station" in disp:
+            grp_on = bool(disp["group_by_station"])
+            if hasattr(self, "act_group"):
+                self.act_group.setChecked(grp_on)
+            self.main_canvas.set_group_by_station(grp_on)
+        if "show_pick_error_bars" in disp:
+            eb_on = bool(disp["show_pick_error_bars"])
+            if hasattr(self, "act_pick_error_bars"):
+                self.act_pick_error_bars.setChecked(eb_on)
+            self.main_canvas.set_show_pick_error_bars(eb_on)
+            self.mag_canvas.set_show_pick_error_bars(eb_on)
+        if disp.get("cursor_overlay_mode"):
+            self.mag_canvas.set_cursor_overlay_mode(str(disp["cursor_overlay_mode"]))
+        self.main_canvas.mag_trace_idx = int(res.get("active_trace_index", 0))
+
+        self._register_unfiltered_traces(self.engine.traces, replace=True, overwrite_existing=False)
+        self.refresh_views(reset_time=False)
+        msg = f"Restored workspace session ({len(self.engine.traces)} trace(s)) from {mgr.session_path}"
+        self._append_console_log(msg)
+        self.status_bar.showMessage(msg, 5000)
+        return True
+
+    def action_restore_session(self) -> None:
+        if not self.restore_session():
+            self.status_bar.showMessage("No valid saved session found to restore.", 4000)
+
     def action_create_synthetics(self) -> None:
         for kind, pos in [("KUEPPER", 12.0), ("GAUSS", 25.0), ("SHARP", 38.0)]:
             self.engine.execute_line(f"CREATE {kind} 60.0 0.05 {pos} 150.0 2.0")
@@ -1892,7 +2952,8 @@ class SHMMainWindow(QMainWindow):
             "SHM Keyboard & Mouse Shortcuts Reference",
             "Mouse Controls (Main Trace Canvas):\n"
             "  • Left-Click on Waveform: Pick active phase onset & focus Magnifier\n"
-            "  • Drag a pick marker: move it  |  Double-click or Del on a marker: delete it\n"
+            "  • Drag a pick marker: move it  |  Drag error-bar edge: adjust pick quality Q\n"
+            "  • Double-click or Del on a marker: delete it\n"
             "  • Shift + Left-Drag: pan time window  |  Alt+Left / Alt+Right: previous / next view\n"
             "  • Right-Click (no drag): trace context menu\n"
             "  • Shift + Mouse Wheel: scroll rows vertically (View > Trace Row Height)\n"
@@ -1902,7 +2963,8 @@ class SHMMainWindow(QMainWindow):
             "  • Mouse Wheel: Zoom Time Axis (Ctrl+Wheel: Zoom Amplitude)\n\n"
             "Mouse Controls (Magnifier Window):\n"
             "  • Left-Click: High-precision phase onset pick\n"
-            "  • Right-Click & Drag: Measure peak-to-peak Amplitude & Period -> Magnitudes\n\n"
+            "  • Right-Click & Drag: Measure peak-to-peak Amplitude & Period -> Magnitudes\n"
+            "  • View > Magnifier Cursor Mode: Standard, Hilbert 90°, Reference Waveform\n\n"
             "Single-Key Accelerators:\n"
             "  • + / - / 0 : Set first-motion polarity (+ compression 'c', - dilatation 'd', 0 none)\n"
             "  • i / e     : Set onset type (i impulsive, e emergent)\n"
@@ -1913,6 +2975,7 @@ class SHMMainWindow(QMainWindow):
             "  • Ctrl+P: AutoPick       • Ctrl+T: Theo Phases      • Ctrl+Shift+Del: Delete Phase Picks   • Ctrl+Z / Ctrl+Shift+Z: Undo / Redo\n"
             "  • Ctrl+B: Beam           • Ctrl+N: Align            • Ctrl+K: FK Analysis\n"
             "  • Ctrl+V: Vespagram      • Ctrl+L: Plane Wave Loc   • Ctrl+O: 2D Rotation\n"
+            "  • Ctrl+Shift+D: Fit Diagnostics Window\n"
             "  • Ctrl+A: Select All     • Ctrl+Y: Deselect All     • Ctrl+D: Delete Selected",
         )
 
@@ -1923,15 +2986,42 @@ class SHMMainWindow(QMainWindow):
             "SeismicHandler Motif (SHM) & Command Interpreter (SHC) v3.0\n\n"
             "Reverse-engineered and modernized from Klaus Stammler's BGR SeismicHandler\n"
             "using Python 3, PyQt6, NumPy, and Matplotlib.\n\n"
-            "Supports Mini-SEED (Steim-1/2, SFD), GSE1/GSE2 (CM6/INT/FLT), SH Q-Files,\n"
-            "ASCII traces, .evt files, pole-zero & recursive IIR filters, Butterworth design,\n"
-            "seismometer simulations (WWSSN, Wood-Anderson, Kirnos, SRO, LRSM),\n"
-            "array beamforming, N-th root Vespagrams, wideband FK analysis,\n"
-            "plane-wave & Geiger/LocSAT location, Flinn-Engdahl regions, and ML/mb/MS/mB magnitudes.",
+            "Supports Mini-SEED (Steim-1/2, SFD), SeedLink v3.1 streaming, StationXML, QuakeML 1.2, GeoJSON,\n"
+            "GSE1/GSE2, SH Q-Files, ASCII traces, .evt files, SOS Butterworth & recursive IIR filters,\n"
+            "trace-specific overlay filters, Brune/Boatwright source spectra, 3C polarization & beachball solver,\n"
+            "array beamforming with slowness calibration, IASP91 phase ID, vector PDF/SVG bulletins, and session recovery.",
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if hasattr(self, "_state_timer") and self._state_timer is not None:
+            self._state_timer.stop()
+        if hasattr(self, "_autosave_timer") and self._autosave_timer is not None:
+            self._autosave_timer.stop()
         self.live_coordinator.shutdown()
+        for w in list(getattr(self, "_recompute_workers", [])):
+            if w is not None and not sip.isdeleted(w):
+                w.cancel()
+                if w.isRunning():
+                    w.wait(3000)
+        if hasattr(self, "_recompute_workers"):
+            self._recompute_workers.clear()
+        for w in list(getattr(self, "_bulletin_workers", [])):
+            if w is not None and not sip.isdeleted(w) and w.isRunning():
+                w.wait(3000)
+        self._bulletin_workers.clear()
+        if hasattr(self, "session_manager") and self.session_manager is not None:
+            is_offscreen = os.environ.get("QT_QPA_PLATFORM") == "offscreen"
+            should_save = (
+                self._explicit_session_path
+                or self._has_autosaved
+                or self.session_manager.session_path.is_file()
+                or (not is_offscreen and bool(self.engine.traces))
+            )
+            if should_save:
+                try:
+                    self.autosave_session(clean_exit=True)
+                except Exception:
+                    pass
         for dlg in list(self._open_dialogs):
             if dlg is not None and not sip.isdeleted(dlg):
                 dlg.close()
@@ -1956,6 +3046,8 @@ _UNDOABLE_ACTIONS = {
     "load_example_dataset": "Load sample data",
     "action_read_evt": "Read event file",
     "action_unfilter": "Unfilter",
+    "action_clear_overlay_filters": "Clear overlay filters",
+    "_on_clear_overlay_filter_requested": "Clear overlay filter",
     "action_auto_pick": "Auto pick",
     "action_corr_pick": "Correlation pick",
     "action_theoretical_phases": "Theoretical phases",

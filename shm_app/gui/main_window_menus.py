@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QAction, QKeySequence
+from PyQt6.QtGui import QAction, QActionGroup, QKeySequence
 from PyQt6.QtWidgets import QMenu, QToolBar
 
 from shm_app.gui.help_texts import status_summary
@@ -68,6 +68,9 @@ def build_menus_and_toolbar(win: Any) -> None:
     add(m_file, "&Open Waveforms...", win.action_open_read_dialog, "Ctrl+R", "open")
     add(m_file, "Download from &BGR (FDSN)...", win.action_open_bgr_fetch_dialog, None, "bgr_fetch")
     add(m_file, "Open &Event Parameters (.evt)...", win.action_read_evt, None, "open_evt")
+    add(m_file, "Import &StationXML...", win.action_import_stationxml, None, "import_stationxml")
+    add(m_file, "Import Quake&ML 1.2 (.xml)...", win.action_import_quakeml, None, "import_quakeml")
+    add(m_file, "Restore Last Session", win.action_restore_session, None, "restore_session")
     m_file.addSeparator()
     add(m_file, "&Save Event Parameters (.evt)...", win.action_save_evt, "Ctrl+I", "save_evt")
     add(m_file, "Save Event and &Clear...", win.action_save_evt_and_clear, "Ctrl+J", "save_evt_clear")
@@ -76,6 +79,10 @@ def build_menus_and_toolbar(win: Any) -> None:
     add(m_exp, "Mini-SEED (.mseed)...", win.action_export_mseed, None, "export_mseed")
     add(m_exp, "SH Q-File (.QHD/.QBN)...", win.action_export_qfile, None, "export_q")
     add(m_exp, "ASCII (.asc)...", win.action_export_ascii, None, "export_ascii")
+    m_cat = new_menu(m_file, "Export &Catalog && Bulletins")
+    add(m_cat, "QuakeML 1.2 (.xml)...", win.action_export_quakeml, None, "export_quakeml")
+    add(m_cat, "GeoJSON RFC 7946 (.geojson)...", win.action_export_geojson, None, "export_geojson")
+    add(m_cat, "Observatory Bulletin (PDF/SVG)...", win.action_export_bulletin, None, "export_bulletin")
     add(m_file, "Export Plot &Image...", win.action_export_plot, "Ctrl+H", "export_image")
     m_file.addSeparator()
     add(m_file, "&Quit", win.close, "Ctrl+Q", "quit")
@@ -114,6 +121,48 @@ def build_menus_and_toolbar(win: Any) -> None:
         m_view, "&Group Components by Station (Z, N, E)", win.action_toggle_grouping, None, "group_components"
     )
     win.act_group.setCheckable(True)
+    win.act_pick_error_bars = add(
+        m_view, "Show Pick &Uncertainty Error Bars", lambda: None, None, "pick_error_bars"
+    )
+    win.act_pick_error_bars.setCheckable(True)
+    win.act_pick_error_bars.setChecked(True)
+    win.act_pick_error_bars.toggled.connect(win.action_toggle_pick_error_bars)
+
+    m_mag_cur = new_menu(m_view, "&Magnifier Cursor Mode")
+    win._mag_cursor_group = QActionGroup(win)
+    win._mag_cursor_group.setExclusive(True)
+    win.act_mag_cursor_standard = add(
+        m_mag_cur,
+        "Standard Crosshair",
+        lambda: win.action_set_mag_cursor_mode("STANDARD"),
+        None,
+        "mag_cursor_standard",
+    )
+    win.act_mag_cursor_hilbert = add(
+        m_mag_cur,
+        "Hilbert 90° Phase Shift Cursor",
+        lambda: win.action_set_mag_cursor_mode("HILBERT"),
+        None,
+        "mag_cursor_hilbert",
+    )
+    win.act_mag_cursor_reference = add(
+        m_mag_cur,
+        "Reference Waveform Cursor",
+        lambda: win.action_set_mag_cursor_mode("REFERENCE"),
+        None,
+        "mag_cursor_reference",
+    )
+    for act_cur in (
+        win.act_mag_cursor_standard,
+        win.act_mag_cursor_hilbert,
+        win.act_mag_cursor_reference,
+    ):
+        act_cur.setCheckable(True)
+        win._mag_cursor_group.addAction(act_cur)
+    win.act_mag_cursor_standard.setChecked(True)
+    m_mag_cur.addSeparator()
+    add(m_mag_cur, "Capture Reference Window", win.action_capture_reference_window, None, "mag_capture_ref")
+
     m_rows = new_menu(m_view, "Trace &Row Height")
     win._row_actions = {}
     for label, px, key in (
@@ -153,6 +202,8 @@ def build_menus_and_toolbar(win: Any) -> None:
     m_proc = new_menu(mb, "&Process")
     m_flt = new_menu(m_proc, "&Filter")
     add(m_flt, "Filter Dialog...", win.action_open_filter_dialog, "Ctrl+F", "filter")
+    add(m_flt, "Trace Overlay Filter (colour_addfil)...", win.action_overlay_filter_dialog, None, "overlay_filter")
+    add(m_flt, "Clear Overlay Filters on Selected", win.action_clear_overlay_filters, None, "clear_overlay_filter")
     add(m_flt, "Restore Unfiltered (Raw) Waveforms", win.action_unfilter, "Ctrl+U", "unfilter")
     add(m_flt, "3-Component Polarization Filter...", win.action_apply_polfil_interactive, None, "polfil")
     m_ops = new_menu(m_proc, "&Basic Operations")
@@ -176,6 +227,7 @@ def build_menus_and_toolbar(win: Any) -> None:
     add(m_pick, "Auto Pick All Traces", win.action_auto_pick, "Ctrl+P", "autopick")
     add(m_pick, "Correlation Pick Across Array", win.action_corr_pick, None, "corrpick")
     add(m_pick, "Show Theoretical Phases", win.action_theoretical_phases, "Ctrl+T", "theo")
+    add(m_pick, "Identify Phases (IASP91)...", win.action_identify_phases, None, "identify_phases")
     m_arr = new_menu(m_ana, "&Array")
     add(m_arr, "Beam (toggle)", win.action_form_beam, "Ctrl+B", "beam")
     add(m_arr, "Align on Phase (toggle)", win.action_align_phase, "Ctrl+N", "align")
@@ -196,9 +248,11 @@ def build_menus_and_toolbar(win: Any) -> None:
     add(m_loc, "From S-P Time", win.action_locate_by_sp_diff, None, "loc_sp")
     add(m_loc, "Depth from Depth Phases (pP-P / sP-P)", win.action_fit_depth_phase, None, "loc_depth")
     add(m_loc, "Multi-Station Network Location...", win.action_open_network_loc_dialog, None, "loc_network")
+    add(m_loc, "Solve Focal Mechanism (Beachball)", win.action_solve_focal_mechanism, None, "focal_mechanism")
     add(m_loc, "Fit Diagnostics & Inversion Residuals...", win.action_open_fit_diagnostic_window, "Ctrl+Shift+D", "fit_diagnostics")
     m_loc.addSeparator()
     add(m_loc, "Compute Magnitudes (ML, mb, MS, mB)", win.action_compute_magnitudes, None, "magnitudes")
+    add(m_loc, "Scan Surface Waves (18-22s Ms)", win.action_scan_surface_waves, None, "surfmag")
     add(m_loc, "Event Summary...", win.action_open_event_summary, None, "event_summary")
     m_set = new_menu(m_loc, "Parameter &Sets")
     add(m_set, "Copy Set 1 to Set 2", lambda: win._copy_param_set(0, 1), None, "copy_set12")
@@ -208,6 +262,9 @@ def build_menus_and_toolbar(win: Any) -> None:
     m_tool = new_menu(mb, "T&ools")
     add(m_tool, "BGR EIDA Waveform &Downloader...", win.action_open_bgr_fetch_dialog, "Ctrl+G", "bgr_fetch")
     add(m_tool, "&Live Event Monitor...", win.action_open_live_event_dialog, "Ctrl+M", "live_events")
+    win.act_seedlink_stream = add(m_tool, "Seed&Link Stream...", win.action_open_seedlink_dialog, None, "seedlink_stream")
+    win.act_seedlink_stop = add(m_tool, "Stop SeedLink Stream", win.action_stop_seedlink, None, "seedlink_stop")
+    win.act_seedlink_stop.setEnabled(False)
     add(m_tool, "&World Map (Stations && Events)...", win.action_open_world_map, "Ctrl+Shift+W", "world_map")
     m_tool.addSeparator()
     add(m_tool, "Create Synthetic Test Waveforms...", win.action_create_synthetics, None, "synthetics")

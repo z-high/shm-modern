@@ -20,6 +20,16 @@ HELP_TEXTS: Dict[str, Tuple[str, str, str]] = {
         "Traces of the same stations should already be loaded.",
         "READEVT <file>",
     ),
+    "import_stationxml": (
+        "Imports FDSN StationXML metadata (coordinates, orientations, multi-stage pole-zero responses and sensitivities) into SHMConfig.",
+        "A StationXML (.xml) file.",
+        "READSXML <file>",
+    ),
+    "import_quakeml": (
+        "Imports event origin, uncertainties, magnitudes, picks, and focal mechanisms from a QuakeML 1.2 or 1.0 XML file.",
+        "A QuakeML (.xml / .qml) file.",
+        "READQML <file>",
+    ),
     "save_evt": (
         "Saves phase picks, location and magnitudes of the current event to an .evt file.",
         "At least one pick or filled parameter set.",
@@ -34,6 +44,26 @@ HELP_TEXTS: Dict[str, Tuple[str, str, str]] = {
     "export_mseed": ("Exports the traces as Mini-SEED (Steim-1).", "Loaded traces.", "WRITESEED <file>"),
     "export_q": ("Exports the traces as SeismicHandler Q-file pair (.QHD/.QBN).", "Loaded traces.", "WRITE <file>"),
     "export_ascii": ("Exports the traces as plain-text amplitude lists.", "Loaded traces.", "WRITEA <file>"),
+    "export_quakeml": (
+        "Exports event parameters, confidence ellipse, magnitudes, picks, and focal mechanisms to QuakeML 1.2 XML.",
+        "Event parameters or picks.",
+        "WRITEQML <file>",
+    ),
+    "export_geojson": (
+        "Exports epicenter, 95% confidence ellipse polygon, and stations as RFC 7946 GeoJSON.",
+        "Event parameters or traces.",
+        "WRITEGEOJSON <file>",
+    ),
+    "export_bulletin": (
+        "Generates a publication-quality vector PDF or SVG observatory bulletin asynchronously via BulletinWorker.",
+        "Loaded traces or event parameters.",
+        "REPORT <file>",
+    ),
+    "restore_session": (
+        "Restores workspace traces, picks, parameters, and display settings from the saved session file.",
+        "An existing .shm_session.json file.",
+        "",
+    ),
     "export_image": ("Saves the main waveform display as a PNG image.", "", ""),
     "quit": ("Closes the application.", "", "QUIT"),
     # ---- Edit ----
@@ -246,6 +276,66 @@ HELP_TEXTS: Dict[str, Tuple[str, str, str]] = {
         "Shows or hides the Fit Diagnostics & Inversion Residuals dock window.",
         "",
         "View -> Fit Diagnostics Window",
+    ),
+    "pick_error_bars": (
+        "Shows or hides [±sigma_t] pick uncertainty intervals mapped from pick quality Q (drag edges to adjust quality).",
+        "Loaded traces with picks.",
+        "",
+    ),
+    "mag_cursor_standard": (
+        "Uses the standard vertical crosshair cursor in the Magnifier window.",
+        "",
+        "",
+    ),
+    "mag_cursor_hilbert": (
+        "Overlays a 90-degree Hilbert-transformed cursor waveform in the Magnifier window for depth phases and core reflections.",
+        "Reference window captured or Magnifier trace loaded.",
+        "",
+    ),
+    "mag_cursor_reference": (
+        "Overlays the captured reference waveform cursor in the Magnifier window for visual alignment.",
+        "Reference window captured.",
+        "",
+    ),
+    "mag_capture_ref": (
+        "Captures the current Magnifier waveform window as the Reference / Hilbert cursor template.",
+        "Magnifier trace loaded.",
+        "",
+    ),
+    "overlay_filter": (
+        "Applies a trace-specific secondary overlay filter (colour_addfil) with color badge to selected traces without changing global filter_name.",
+        "Selected traces.",
+        "ADDFIL <filter> <color>",
+    ),
+    "clear_overlay_filter": (
+        "Clears secondary trace-specific overlay filters from selected traces.",
+        "Selected traces with overlay filters.",
+        "ADDFIL /CLEAR",
+    ),
+    "identify_phases": (
+        "Matches observed pick travel times and slownesses against IASP91/AK135 tables to rank and label phases.",
+        "Picked traces and epicentral distance or hypocenter.",
+        "IDENTIFY",
+    ),
+    "surfmag": (
+        "Scans vertical traces in the 18-22 s period window to measure surface-wave amplitudes and compute Prague Ms.",
+        "Vertical (Z) traces and distance.",
+        "SURFMAG",
+    ),
+    "focal_mechanism": (
+        "Inverts P-wave first-motion polarities (+ / - / c / d) for a double-couple focal mechanism and renders the beachball in Fit Diagnostics Tab 5.",
+        "Hypocenter/station coordinates and polarity picks.",
+        "FIT /FOCAL",
+    ),
+    "seedlink_stream": (
+        "Opens the SeedLink v3.1 TCP streaming dialog to receive live 512-byte Mini-SEED packets into the workspace.",
+        "Reachable SeedLink server (host, port, streams).",
+        "",
+    ),
+    "seedlink_stop": (
+        "Stops the active SeedLink v3.1 real-time streaming worker.",
+        "Active SeedLink stream.",
+        "",
     ),
     "row_slider": (
         "Continuously scales vertical trace row height. Far left fits all traces into the window; dragging right gives fixed row heights with a vertical scrollbar.",
