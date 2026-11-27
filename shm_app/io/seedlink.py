@@ -226,8 +226,17 @@ class WaveformRingBuffer:
         gap = incoming.start_epoch - tail_end
 
         if abs(gap) <= 1.5 * dt:
-            # Contiguous packet -> merge directly into tail Trace
-            tail.data = np.concatenate((tail.data, incoming.data))
+            # Contiguous packet (or minor overlap within 1.5*dt) -> merge directly into tail Trace
+            if gap < 0.0:
+                skip = int(round(-gap / dt))
+                if skip <= 0:
+                    tail.data = np.concatenate((tail.data, incoming.data))
+                elif skip < incoming.length:
+                    tail.data = np.concatenate(
+                        (tail.data, np.array(incoming.data[skip:], dtype=np.float64, copy=True))
+                    )
+            else:
+                tail.data = np.concatenate((tail.data, incoming.data))
             if incoming.picks:
                 for p in incoming.picks:
                     tail.add_or_replace_pick(p)
@@ -236,6 +245,9 @@ class WaveformRingBuffer:
             skip = int(round(-gap / dt))
             if skip < incoming.length:
                 tail.data = np.concatenate((tail.data, np.array(incoming.data[skip:], dtype=np.float64, copy=True)))
+            if incoming.picks:
+                for p in incoming.picks:
+                    tail.add_or_replace_pick(p)
         else:
             # Non-contiguous gap or out-of-order jump -> keep as separate segment
             segments.append(incoming)
@@ -344,6 +356,7 @@ class SeedLinkClient:
         self._sock_lock = threading.Lock()
         self.server_info: Tuple[str, str] = ("", "")
         self.last_seq: Optional[int] = None
+        self.last_seq_by_station: Dict[Tuple[str, str], int] = {}
         self.packets_received: int = 0
         self.malformed_packets: int = 0
         self.sequence_gaps: int = 0
@@ -548,11 +561,25 @@ class SeedLinkClient:
             self.send_hello()
 
         is_reconnect = self._connect_count > 1 and self.last_seq is not None and self.resume_from_last_seq
-        resume_seq = ((self.last_seq + 1) & 0xFFFFFF) if is_reconnect else None
+        global_resume_seq = ((self.last_seq + 1) & 0xFFFFFF) if is_reconnect else None
 
         if specs:
-            for idx, spec in enumerate(specs):
-                seq = resume_seq if (is_reconnect and idx == 0) else spec.seq
+            for spec in specs:
+                if is_reconnect:
+                    net_u = spec.network.strip().upper()
+                    sta_u = spec.station.strip().upper()
+                    sta_last = self.last_seq_by_station.get((net_u, sta_u))
+                    if sta_last is None and net_u in ("*", ""):
+                        for (k_net, k_sta), k_seq in self.last_seq_by_station.items():
+                            if k_sta == sta_u:
+                                sta_last = k_seq
+                                break
+                    if sta_last is not None:
+                        seq: Optional[int] = (sta_last + 1) & 0xFFFFFF
+                    else:
+                        seq = global_resume_seq if global_resume_seq is not None else spec.seq
+                else:
+                    seq = spec.seq
                 self.select_station(
                     station=spec.station,
                     network=spec.network,
@@ -561,7 +588,7 @@ class SeedLinkClient:
                     start_time=spec.start_time,
                 )
         else:
-            self.send_data_command(seq=resume_seq)
+            self.send_data_command(seq=global_resume_seq)
 
         self.end_handshake()
         return self.server_info
@@ -615,9 +642,15 @@ class SeedLinkClient:
             expected = (self.last_seq + 1) & 0xFFFFFF
             if seq_num != expected:
                 gap = (seq_num - expected) & 0xFFFFFF
-                self.sequence_gaps += 1
-                self.packets_lost += gap
-        self.last_seq = seq_num
+                if gap < 0x800000:
+                    self.sequence_gaps += 1
+                    self.packets_lost += gap
+                    self.last_seq = seq_num
+                # Else: out-of-order or duplicate packet behind last_seq -> do not wrap into ~16M packets_lost
+            else:
+                self.last_seq = seq_num
+        else:
+            self.last_seq = seq_num
         self.packets_received += 1
 
         try:
@@ -637,6 +670,11 @@ class SeedLinkClient:
                 is_valid=False,
                 error=str(exc),
             )
+
+        sta_key = (hdr.network.strip().upper(), hdr.station.strip().upper())
+        prev_sta_seq = self.last_seq_by_station.get(sta_key)
+        if prev_sta_seq is None or ((seq_num - prev_sta_seq) & 0xFFFFFF) < 0x800000:
+            self.last_seq_by_station[sta_key] = seq_num
 
         skey = stream_key_for_trace(traces[0]) if traces else ""
         if self.ring_buffer is not None:

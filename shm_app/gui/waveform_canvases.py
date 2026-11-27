@@ -1,8 +1,4 @@
-"""Interactive Main Multi-Trace Canvas and Magnifier Single-Trace Canvas for SHM.
-
-Uses a two-layer offscreen QPixmap backing store + vectorized pixel-column min/max envelope
-decimation + single-slot partial redraws for sub-millisecond interactive frame times.
-"""
+"""Interactive Main Multi-Trace Canvas for SHM (re-exporting MagnifierCanvas & helpers)."""
 
 from __future__ import annotations
 
@@ -19,216 +15,25 @@ from PyQt6.QtGui import (
     QPainter,
     QPen,
     QPixmap,
-    QPolygonF,
     QWheelEvent,
 )
 from PyQt6.QtWidgets import QSizePolicy, QWidget
 
 from shm_app.core.models import PhasePick, Trace
 from shm_app.core.time_utils import format_sh_time
-from shm_app.processing.trace_ops import hilbert_transform
-
-CURSOR_LOCK_MODES: Tuple[str, ...] = ("CROSSHAIR", "PEAK_LOCK", "ZERO_LOCK")
-MAGNIFIER_CURSOR_MODES: Tuple[str, ...] = ("STANDARD", "HILBERT", "REFERENCE")
-
-_NAMED_OVERLAY_COLORS = {
-    "red": "#f85149",
-    "green": "#3fb950",
-    "blue": "#58a6ff",
-    "yellow": "#d29922",
-    "amber": "#d29922",
-    "orange": "#ffa657",
-    "purple": "#bc8cff",
-    "magenta": "#bc8cff",
-    "cyan": "#39c5cf",
-}
-_FALLBACK_OVERLAY_PALETTE = ("#f85149", "#3fb950", "#58a6ff", "#ffa657", "#bc8cff", "#39c5cf")
-
-
-def _resolve_overlay_filter_color(color_spec: str, filter_name: str = "") -> QColor:
-    """Resolve overlay filter color name/hex or deterministic fallback palette color."""
-    spec = (color_spec or "").strip()
-    if spec:
-        low = spec.lower()
-        if low in _NAMED_OVERLAY_COLORS:
-            return QColor(_NAMED_OVERLAY_COLORS[low])
-        qc = QColor(spec)
-        if qc.isValid():
-            return qc
-    h = sum(ord(ch) for ch in (filter_name or "FLT"))
-    return QColor(_FALLBACK_OVERLAY_PALETTE[h % len(_FALLBACK_OVERLAY_PALETTE)])
-
-
-def _draw_pick_uncertainty_interval(
-    painter: QPainter,
-    x_lo_raw: float,
-    x_hi_raw: float,
-    y_top: float,
-    height: float,
-    plot_left: float,
-    plot_right: float,
-    base_color: QColor,
-) -> None:
-    """Render shaded [tau - sigma_t, tau + sigma_t] interval and bounded vertical tick marks."""
-    if x_hi_raw < plot_left or x_lo_raw > plot_right:
-        return
-    bx0 = max(plot_left, x_lo_raw)
-    bx1 = min(plot_right, x_hi_raw)
-    band_h = max(2.0, height - 4.0)
-    fill_col = QColor(base_color.red(), base_color.green(), base_color.blue(), 36)
-    painter.fillRect(QRectF(bx0, y_top + 2.0, max(1.0, bx1 - bx0), band_h), fill_col)
-
-    y_mid = y_top + 0.5 * height
-    tick_half = max(3.0, min(14.0, 0.28 * height))
-    tick_top = max(y_top + 2.0, y_mid - tick_half)
-    tick_bot = min(y_top + height - 2.0, y_mid + tick_half)
-
-    bar_col = QColor(base_color.red(), base_color.green(), base_color.blue(), 190)
-    painter.setPen(QPen(bar_col, 1.1))
-    if bx1 > bx0 + 0.5:
-        painter.drawLine(QPointF(bx0, y_mid), QPointF(bx1, y_mid))
-
-    tick_pen = QPen(bar_col.lighter(115), 1.3)
-    painter.setPen(tick_pen)
-    cap = min(3.0, max(1.0, 0.25 * (bx1 - bx0)))
-    if plot_left <= x_lo_raw <= plot_right:
-        painter.drawLine(QPointF(x_lo_raw, tick_top), QPointF(x_lo_raw, tick_bot))
-        if cap >= 1.5:
-            painter.drawLine(QPointF(x_lo_raw, tick_top), QPointF(x_lo_raw + cap, tick_top))
-            painter.drawLine(QPointF(x_lo_raw, tick_bot), QPointF(x_lo_raw + cap, tick_bot))
-    if plot_left <= x_hi_raw <= plot_right:
-        painter.drawLine(QPointF(x_hi_raw, tick_top), QPointF(x_hi_raw, tick_bot))
-        if cap >= 1.5:
-            painter.drawLine(QPointF(x_hi_raw, tick_top), QPointF(x_hi_raw - cap, tick_top))
-            painter.drawLine(QPointF(x_hi_raw, tick_bot), QPointF(x_hi_raw - cap, tick_bot))
-
-
-def _alloc_pixmap_for_widget(widget: QWidget) -> QPixmap:
-    dpr = max(1.0, float(widget.devicePixelRatioF()))
-    pw = max(1, int(round(widget.width() * dpr)))
-    ph = max(1, int(round(widget.height() * dpr)))
-    pm = QPixmap(pw, ph)
-    pm.setDevicePixelRatio(dpr)
-    return pm
-
-
-def _pixmap_matches_widget(pm: Optional[QPixmap], widget: QWidget) -> bool:
-    if pm is None:
-        return False
-    dpr = max(1.0, float(widget.devicePixelRatioF()))
-    return (
-        pm.deviceIndependentSize().toSize() == widget.size()
-        and abs(pm.devicePixelRatio() - dpr) < 1e-3
-    )
-
-
-def snap_time_to_feature(tr: Trace, epoch_click: float, mode: str) -> float:
-    """Apply cursor lock mode ('CROSSHAIR', 'PEAK_LOCK', 'ZERO_LOCK') around epoch_click."""
-    if mode == "CROSSHAIR" or tr.delta <= 0 or tr.length < 3:
-        return epoch_click
-    rel_s = epoch_click - tr.start_epoch
-    idx_c = int(round(rel_s / tr.delta))
-    half_w = 8
-    i0 = max(0, idx_c - half_w)
-    i1 = min(tr.length, idx_c + half_w + 1)
-    if i1 - i0 < 2:
-        return epoch_click
-    raw_seg = tr.data[i0:i1]
-    seg = raw_seg - np.mean(raw_seg)
-    if seg.size < 2:
-        return epoch_click
-    if mode == "PEAK_LOCK":
-        best = i0 + int(np.argmax(np.abs(seg)))
-        return tr.start_epoch + best * tr.delta
-    if mode == "ZERO_LOCK":
-        best = i0 + int(np.argmin(np.abs(seg)))
-        return tr.start_epoch + best * tr.delta
-    return epoch_click
-
-
-def _build_trace_polygon(
-    data: np.ndarray,
-    i0: int,
-    i1: int,
-    tr_rel_start: float,
-    dt: float,
-    t_lo: float,
-    t_hi: float,
-    x_left: float,
-    width_px: float,
-    y_mid: float,
-    scale_y: float,
-    y_min: float,
-    y_max: float,
-    mean_v: float,
-) -> QPolygonF:
-    """Build a QPolygonF for data[i0:i1] at full sample resolution up to max_direct,
-    and true-timestamp sub-pixel min/max extrema bins when sample counts are huge.
-    """
-    n_pts = i1 - i0
-    if n_pts <= 0:
-        return QPolygonF()
-
-    inv_span = width_px / max(1e-9, t_hi - t_lo)
-    max_direct = max(4000, min(10000, int(width_px * 6)))
-
-    if n_pts <= max_direct:
-        idxs = np.arange(i0, i1, dtype=np.float64)
-        ts = tr_rel_start + idxs * dt
-        xs = x_left + (ts - t_lo) * inv_span
-        ys = np.clip(y_mid - (data[i0:i1] - mean_v) * scale_y, y_min, y_max)
-        return QPolygonF(map(QPointF, xs.tolist(), ys.tolist()))
-
-    # High-resolution vectorized min/max envelope using exact argmin/argmax timestamps
-    n_bins = max(900, min(4000, int(width_px * 1.5)))
-    bin_size = max(2, n_pts // n_bins)
-    n_used = (n_pts // bin_size) * bin_size
-    seg_2d = data[i0 : i0 + n_used].reshape(-1, bin_size)
-    nb = seg_2d.shape[0]
-
-    arg_min = np.argmin(seg_2d, axis=1)
-    arg_max = np.argmax(seg_2d, axis=1)
-    rows = np.arange(nb)
-    mins = seg_2d[rows, arg_min]
-    maxs = seg_2d[rows, arg_max]
-
-    min_first = arg_min <= arg_max
-    idx_first = np.where(min_first, arg_min, arg_max)
-    idx_second = np.where(min_first, arg_max, arg_min)
-    v_first = np.where(min_first, mins, maxs)
-    v_second = np.where(min_first, maxs, mins)
-
-    bin_starts = i0 + np.arange(nb, dtype=np.float64) * bin_size
-    sample_idxs = np.empty(2 * nb, dtype=np.float64)
-    sample_idxs[0::2] = bin_starts + idx_first
-    sample_idxs[1::2] = bin_starts + idx_second
-
-    vals = np.empty(2 * nb, dtype=np.float64)
-    vals[0::2] = v_first
-    vals[1::2] = v_second
-
-    rem = n_pts - n_used
-    if rem > 0:
-        tail = data[i0 + n_used : i1]
-        t_start = i0 + n_used
-        a_min = int(np.argmin(tail))
-        a_max = int(np.argmax(tail))
-        if a_min == a_max:
-            extra_i = [float(t_start + a_min)]
-            extra_v = [float(tail[a_min])]
-        elif a_min < a_max:
-            extra_i = [float(t_start + a_min), float(t_start + a_max)]
-            extra_v = [float(tail[a_min]), float(tail[a_max])]
-        else:
-            extra_i = [float(t_start + a_max), float(t_start + a_min)]
-            extra_v = [float(tail[a_max]), float(tail[a_min])]
-        sample_idxs = np.concatenate((sample_idxs, np.array(extra_i, dtype=np.float64)))
-        vals = np.concatenate((vals, np.array(extra_v, dtype=np.float64)))
-
-    ts = tr_rel_start + sample_idxs * dt
-    xs = x_left + (ts - t_lo) * inv_span
-    ys = np.clip(y_mid - (vals - mean_v) * scale_y, y_min, y_max)
-    return QPolygonF(map(QPointF, xs.tolist(), ys.tolist()))
+from shm_app.gui.canvas_helpers import (
+    CURSOR_LOCK_MODES,
+    MAGNIFIER_CURSOR_MODES,
+    _FALLBACK_OVERLAY_PALETTE,
+    _NAMED_OVERLAY_COLORS,
+    _alloc_pixmap_for_widget,
+    _build_trace_polygon,
+    _draw_pick_uncertainty_interval,
+    _pixmap_matches_widget,
+    _resolve_overlay_filter_color,
+    snap_time_to_feature,
+)
+from shm_app.gui.magnifier_canvas import MagnifierCanvas
 
 
 class MainTraceCanvas(QWidget):
@@ -237,7 +42,7 @@ class MainTraceCanvas(QWidget):
     Supports:
     - Left margin station/channel/filter labels & click-to-select trace
     - Normalization modes ('C' Constant, 'A' Auto, 'AW' Auto Window, 'SW' Single Window)
-    - Left-click phase onset picking / amplitude window selection / magnifier trace focus
+    - Left-click another trace to switch the Magnifier focus without placing a pick; left-click the active trace to pick phase onset / drag to select magnifier window
     - Middle-click cursor lock mode toggle ('CROSSHAIR', 'PEAK_LOCK', 'ZERO_LOCK')
     - Right-click drag to position/resize the Magnifier time window
     - Mouse wheel zoom
@@ -253,6 +58,7 @@ class MainTraceCanvas(QWidget):
     pickDeleteRequested = pyqtSignal(int, str)  # (trace_idx, phase_name)
     pickMoved = pyqtSignal(int, str, float)  # (trace_idx, phase_name, new_epoch)
     pickChanged = pyqtSignal(int, object)  # (trace_idx, PhasePick)
+    pickEditStarted = pyqtSignal(int, str)  # (trace_idx, label)
     overlayFilterRequested = pyqtSignal(int)  # trace_idx
     clearOverlayFilterRequested = pyqtSignal(int)  # trace_idx
     contextMenuRequested = pyqtSignal(int, float, int, int)  # (trace_idx, rel_t, global_x, global_y)
@@ -732,10 +538,13 @@ class MainTraceCanvas(QWidget):
                 (
                     orig_idx,
                     tr.selected,
+                    round(float(tr.display_offset), 5),
+                    round(float(tr.norm), 5),
                     tr.filter_name,
                     getattr(tr, "overlay_filter_name", "NONE"),
                     getattr(tr, "overlay_filter_color", ""),
                     tuple((p.name, p.onset, p.quality, p.sign, p.spec) for p in tr.picks),
+                    tuple(sorted((str(k), round(float(v), 4)) for k, v in tr.theo_picks.items())),
                 )
                 for orig_idx, tr in vis
             ),
@@ -804,7 +613,11 @@ class MainTraceCanvas(QWidget):
             for _, tr in vis:
                 seg = self._visible_samples(tr, ref_ep, t_lo, t_hi) if self.norm_mode == "AW" else tr.data
                 if seg.size > 0:
-                    m = float(np.max(np.abs(seg - np.mean(seg))))
+                    fm = np.isfinite(seg)
+                    if not np.any(fm):
+                        continue
+                    fseg = seg[fm]
+                    m = float(np.max(np.abs(fseg - np.mean(fseg))))
                     if m > global_max:
                         global_max = m
                     if m > 1000.0:
@@ -1027,18 +840,26 @@ class MainTraceCanvas(QWidget):
             return
 
         seg = tr.data[i0:i1]
-        mean_v = float(np.mean(seg))
-        local_max = float(np.max(np.abs(seg - mean_v))) if seg.size > 0 else 1e-9
+        finite_mask = np.isfinite(seg)
+        if np.any(finite_mask):
+            finite_seg = seg[finite_mask]
+            mean_v = float(np.mean(finite_seg))
+            local_max = max(1e-9, float(np.max(np.abs(finite_seg - mean_v))))
+        else:
+            mean_v = 0.0
+            local_max = 1e-9
         if self.norm_mode in ("C", "AW"):
             if getattr(self, "_has_mixed_tiers", False):
-                is_low_tier = local_max <= 1000.0 or float(np.max(np.abs(tr.data))) <= 1000.0
+                tr_fm = np.isfinite(tr.data)
+                tr_abs_max = float(np.max(np.abs(tr.data[tr_fm]))) if np.any(tr_fm) else 0.0
+                is_low_tier = local_max <= 1000.0 or tr_abs_max <= 1000.0
                 max_amp = self._cached_tier_low_max if is_low_tier else self._cached_tier_high_max
             else:
                 max_amp = global_max
         else:
             max_amp = max(1e-9, local_max)
 
-        scale_y = (0.44 * slot_h * self.global_zoom * tr.norm) / max_amp
+        scale_y = (0.44 * slot_h * self.global_zoom * tr.norm) / max(1e-9, max_amp)
         if local_max > 1e-6 and scale_y * local_max < 3.0:
             scale_y = 3.0 / local_max
 
@@ -1267,11 +1088,18 @@ class MainTraceCanvas(QWidget):
                 eb_hit = self.pick_error_bar_at(pos) if self.show_pick_error_bars else None
                 if eb_hit is not None:
                     self._error_bar_drag = (eb_hit[0], eb_hit[1])
+                    self.pickEditStarted.emit(eb_hit[0], f"Adjust {eb_hit[1].name} quality")
                     self._left_drag_start_t = None
                     self._left_drag_cur_t = None
                     self._left_press_pos = None
                     self._left_press_info = None
                     self.setCursor(Qt.CursorShape.SizeHorCursor)
+                elif prev_mag_idx != orig_idx:
+                    # Switching to a different trace only moves the Magnifier focus without placing a pick
+                    self._left_drag_start_t = rel_t
+                    self._left_drag_cur_t = None
+                    self._left_press_pos = pos
+                    self._left_press_info = None
                 else:
                     self._left_drag_start_t = rel_t
                     self._left_drag_cur_t = None
@@ -1291,7 +1119,6 @@ class MainTraceCanvas(QWidget):
 
         elif event.button() == Qt.MouseButton.RightButton:
             # Quick click -> context menu (on release); drag -> position/resize Magnifier window
-            self.mag_trace_idx = orig_idx
             self._right_drag_start_t = rel_t
             self._right_drag_trace_idx = orig_idx
             self._right_press_pos = pos
@@ -1400,6 +1227,7 @@ class MainTraceCanvas(QWidget):
 
             if (event.buttons() & Qt.MouseButton.RightButton) and self._right_drag_start_t is not None:
                 if self._right_moved and abs(rel_t - self._right_drag_start_t) > 0.2:
+                    self.mag_trace_idx = self._right_drag_trace_idx
                     self.mag_t_lo = min(self._right_drag_start_t, rel_t)
                     self.mag_t_hi = max(self._right_drag_start_t, rel_t)
                     self.magnifierWindowChanged.emit(self.mag_trace_idx, self.mag_t_lo, self.mag_t_hi)
@@ -1530,623 +1358,3 @@ class MainTraceCanvas(QWidget):
             self.view_t_hi = self.view_t_lo + new_span
         self.invalidate_cache()
 
-
-class MagnifierCanvas(QWidget):
-    """Single-trace high-resolution zoomed Magnifier panel matching SHM's Magnifier Window.
-
-    Uses an offscreen QPixmap backing store for the zoomed waveform + picks so cursor hover
-    and amplitude measurement drag run with sub-millisecond latency.
-    """
-
-    pickPlaced = pyqtSignal(int, float)  # (trace_idx, epoch_time)
-    pickChanged = pyqtSignal(int, object)  # (trace_idx, PhasePick)
-    amplitudeMeasured = pyqtSignal(int, float, float)  # (trace_idx, rel_t_lo, rel_t_hi)
-    cursorModeCycled = pyqtSignal(str)  # new cursor lock mode
-    cursorOverlayModeChanged = pyqtSignal(str)  # new overlay mode ('STANDARD', 'HILBERT', 'REFERENCE')
-
-    ERROR_BAR_HIT_TOLERANCE_PX = 7.0
-
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.setMinimumSize(400, 145)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self.setMouseTracking(True)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
-
-        self.trace: Optional[Trace] = None
-        self.trace_idx: int = 0
-        self.ref_epoch: float = 0.0
-        self.t_lo: float = 0.0
-        self.t_hi: float = 30.0
-        self.cursor_lock_mode: str = "CROSSHAIR"
-        self.cursor_overlay_mode: str = "STANDARD"
-        self.show_pick_error_bars: bool = True
-        self.depth_phase_cursors: List[Tuple[str, float]] = []  # [(phase, offset_sec), ...]
-
-        self._reference_waveform: Optional[np.ndarray] = None
-        self._reference_delta: float = 0.05
-        self._reference_center_rel_sec: float = 0.0
-        self._ref_version: int = 0
-        self._hilbert_cache_key: Optional[Tuple] = None
-        self._hilbert_cache_data: Optional[np.ndarray] = None
-        self._hilbert_cache_delta: float = 0.05
-        self._hilbert_cache_center_rel_sec: float = 0.0
-
-        self._drag_start_rel: Optional[float] = None
-        self._drag_cur_rel: Optional[float] = None
-        self._hover_x: Optional[float] = None
-        self._error_bar_drag: Optional[PhasePick] = None
-
-        self._static_pixmap: Optional[QPixmap] = None
-        self._cache_dirty: bool = True
-        self._cache_state_key: Optional[Tuple] = None
-        self._font = QFont("Monospace", 8)
-        self._font.setStyleHint(QFont.StyleHint.TypeWriter)
-
-    def invalidate_cache(self) -> None:
-        self._cache_dirty = True
-        self.update()
-
-    def set_show_pick_error_bars(self, show: bool) -> None:
-        val = bool(show)
-        if val != self.show_pick_error_bars:
-            self.show_pick_error_bars = val
-            self.invalidate_cache()
-
-    def set_cursor_lock_mode(self, mode: str) -> None:
-        if mode in CURSOR_LOCK_MODES and mode != self.cursor_lock_mode:
-            self.cursor_lock_mode = mode
-            self.invalidate_cache()
-
-    def set_cursor_overlay_mode(self, mode: str) -> None:
-        m = (mode or "STANDARD").strip().upper()
-        if m == "CROSSHAIR":
-            m = "STANDARD"
-        if m in MAGNIFIER_CURSOR_MODES and m != self.cursor_overlay_mode:
-            self.cursor_overlay_mode = m
-            self._hilbert_cache_key = None
-            self.cursorOverlayModeChanged.emit(m)
-            self.invalidate_cache()
-
-    def set_cursor_mode(self, mode: str) -> None:
-        """Unified cursor mode setter supporting both CURSOR_LOCK_MODES and MAGNIFIER_CURSOR_MODES."""
-        m = (mode or "").strip().upper()
-        if m in CURSOR_LOCK_MODES:
-            self.set_cursor_lock_mode(m)
-        elif m in MAGNIFIER_CURSOR_MODES:
-            self.set_cursor_overlay_mode(m)
-
-    def set_reference_waveform(
-        self,
-        trace_or_array,
-        delta: Optional[float] = None,
-        center_rel_sec: float = 0.0,
-    ) -> None:
-        """Set reference waveform (Trace or 1D numpy array) for REFERENCE / HILBERT cursor overlays."""
-        if trace_or_array is None:
-            self._reference_waveform = None
-            self._ref_version += 1
-            self._hilbert_cache_key = None
-            self.invalidate_cache()
-            return
-        if isinstance(trace_or_array, Trace):
-            arr = np.asarray(trace_or_array.data, dtype=np.float64)
-            dt = float(delta) if (delta is not None and delta > 0) else float(trace_or_array.delta)
-        else:
-            arr = np.asarray(trace_or_array, dtype=np.float64).ravel()
-            default_dt = self.trace.delta if (self.trace is not None and self.trace.delta > 0) else 0.05
-            dt = float(delta) if (delta is not None and delta > 0) else float(default_dt)
-        self._reference_waveform = arr.copy()
-        self._reference_delta = max(1e-6, dt)
-        self._reference_center_rel_sec = float(center_rel_sec)
-        self._ref_version += 1
-        self._hilbert_cache_key = None
-        self.invalidate_cache()
-
-    def capture_reference_window(
-        self,
-        t_lo: Optional[float] = None,
-        t_hi: Optional[float] = None,
-        center_rel_sec: Optional[float] = None,
-    ) -> bool:
-        """Capture the current magnifier window (or [t_lo, t_hi]) as the reference waveform."""
-        if self.trace is None or self.trace.length < 2 or self.trace.delta <= 0:
-            return False
-        lo = self.t_lo if t_lo is None else float(t_lo)
-        hi = self.t_hi if t_hi is None else float(t_hi)
-        if hi < lo:
-            lo, hi = hi, lo
-        tr_rel_start = self.trace.start_epoch + self.trace.display_offset - self.ref_epoch
-        i0 = max(0, int(math.floor((lo - tr_rel_start) / max(1e-9, self.trace.delta))))
-        i1 = min(self.trace.length, int(math.ceil((hi - tr_rel_start) / max(1e-9, self.trace.delta))) + 1)
-        if i1 - i0 < 2:
-            return False
-        seg = self.trace.data[i0:i1].copy()
-        c_sec = 0.5 * (seg.size - 1) * self.trace.delta if center_rel_sec is None else float(center_rel_sec)
-        self.set_reference_waveform(seg, delta=self.trace.delta, center_rel_sec=c_sec)
-        return True
-
-    def set_magnifier_view(
-        self,
-        trace: Optional[Trace],
-        trace_idx: int,
-        ref_epoch: float,
-        t_lo: float,
-        t_hi: float,
-    ) -> None:
-        self.trace = trace
-        self.trace_idx = trace_idx
-        self.ref_epoch = ref_epoch
-        self.t_lo = t_lo
-        self.t_hi = max(t_lo + 0.5, t_hi)
-        self._hilbert_cache_key = None
-        self.invalidate_cache()
-
-    def plot_rect(self) -> QRectF:
-        return QRectF(70, 22, max(80, self.width() - 86), max(40, self.height() - 44))
-
-    def time_to_x(self, rel_t: float) -> float:
-        r = self.plot_rect()
-        return r.left() + (rel_t - self.t_lo) / max(1e-9, self.t_hi - self.t_lo) * r.width()
-
-    def x_to_time(self, x: float) -> float:
-        r = self.plot_rect()
-        return self.t_lo + (x - r.left()) / max(1.0, r.width()) * (self.t_hi - self.t_lo)
-
-    def _current_state_key(self) -> Tuple:
-        tr = self.trace
-        return (
-            self.width(),
-            self.height(),
-            id(tr),
-            self.trace_idx,
-            round(self.ref_epoch, 3),
-            round(self.t_lo, 4),
-            round(self.t_hi, 4),
-            self.cursor_lock_mode,
-            self.cursor_overlay_mode,
-            self.show_pick_error_bars,
-            self._ref_version,
-            tr.filter_name if tr else "",
-            getattr(tr, "overlay_filter_name", "NONE") if tr else "",
-            getattr(tr, "overlay_filter_color", "") if tr else "",
-            len(tr.picks) if tr else 0,
-            tuple((p.name, p.onset, p.quality, p.sign, p.spec) for p in tr.picks) if tr else (),
-            round(float(self.devicePixelRatioF()), 3),
-        )
-
-    def _get_cursor_overlay_waveform(self) -> Optional[Tuple[np.ndarray, float, float]]:
-        """Return (samples, dt, center_rel_sec) for HILBERT or REFERENCE cursor overlay."""
-        mode = self.cursor_overlay_mode
-        if mode == "REFERENCE":
-            if self._reference_waveform is None or self._reference_waveform.size < 2:
-                return None
-            return (self._reference_waveform, self._reference_delta, self._reference_center_rel_sec)
-
-        if mode != "HILBERT":
-            return None
-
-        if self._reference_waveform is not None and self._reference_waveform.size >= 2:
-            hkey = ("REF", self._ref_version, self._reference_delta, self._reference_waveform.size)
-            if self._hilbert_cache_key != hkey:
-                seg = self._reference_waveform - float(np.mean(self._reference_waveform))
-                self._hilbert_cache_data = hilbert_transform(seg)
-                self._hilbert_cache_delta = self._reference_delta
-                self._hilbert_cache_center_rel_sec = self._reference_center_rel_sec
-                self._hilbert_cache_key = hkey
-            if self._hilbert_cache_data is not None:
-                return (self._hilbert_cache_data, self._hilbert_cache_delta, self._hilbert_cache_center_rel_sec)
-            return None
-
-        if self.trace is None or self.trace.length < 2 or self.trace.delta <= 0:
-            return None
-
-        tr = self.trace
-        tr_rel_start = tr.start_epoch + tr.display_offset - self.ref_epoch
-        # Prefer segment around an in-view pick (e.g. P onset), else current magnifier window
-        ref_pk: Optional[PhasePick] = None
-        for pk in tr.picks:
-            if pk.onset:
-                rel_pk = pk.onset_epoch + tr.display_offset - self.ref_epoch
-                if self.t_lo <= rel_pk <= self.t_hi:
-                    ref_pk = pk
-                    break
-        if ref_pk is None:
-            for pk in tr.picks:
-                if pk.onset:
-                    ref_pk = pk
-                    break
-
-        if ref_pk is not None:
-            rel_pk = ref_pk.onset_epoch + tr.display_offset - self.ref_epoch
-            half_w = min(5.0, max(1.0, 0.25 * (self.t_hi - self.t_lo)))
-            w_lo = rel_pk - half_w
-            w_hi = rel_pk + half_w
-            i0 = max(0, int(math.floor((w_lo - tr_rel_start) / tr.delta)))
-            i1 = min(tr.length, int(math.ceil((w_hi - tr_rel_start) / tr.delta)) + 1)
-            if i1 - i0 >= 2:
-                center_rel = rel_pk - (tr_rel_start + i0 * tr.delta)
-            else:
-                i0 = max(0, int(math.floor((self.t_lo - tr_rel_start) / tr.delta)))
-                i1 = min(tr.length, int(math.ceil((self.t_hi - tr_rel_start) / tr.delta)) + 1)
-                center_rel = 0.5 * max(0, i1 - i0 - 1) * tr.delta
-        else:
-            i0 = max(0, int(math.floor((self.t_lo - tr_rel_start) / tr.delta)))
-            i1 = min(tr.length, int(math.ceil((self.t_hi - tr_rel_start) / tr.delta)) + 1)
-            center_rel = 0.5 * max(0, i1 - i0 - 1) * tr.delta
-
-        if i1 - i0 < 2:
-            return None
-
-        hkey = ("TRACE", id(tr), tr.length, i0, i1, round(center_rel, 4))
-        if self._hilbert_cache_key != hkey:
-            seg = tr.data[i0:i1] - float(np.mean(tr.data[i0:i1]))
-            self._hilbert_cache_data = hilbert_transform(seg)
-            self._hilbert_cache_delta = tr.delta
-            self._hilbert_cache_center_rel_sec = center_rel
-            self._hilbert_cache_key = hkey
-        if self._hilbert_cache_data is not None:
-            return (self._hilbert_cache_data, self._hilbert_cache_delta, self._hilbert_cache_center_rel_sec)
-        return None
-
-    def _ensure_static_pixmap(self) -> None:
-        key = self._current_state_key()
-        if (
-            not self._cache_dirty
-            and _pixmap_matches_widget(self._static_pixmap, self)
-            and self._cache_state_key == key
-        ):
-            return
-
-        if not _pixmap_matches_widget(self._static_pixmap, self):
-            self._static_pixmap = _alloc_pixmap_for_widget(self)
-
-        painter = QPainter(self._static_pixmap)
-        painter.fillRect(self.rect(), QColor("#0d1117"))
-
-        r = self.plot_rect()
-        painter.setPen(QPen(QColor("#30363d"), 1.2))
-        painter.drawRect(r)
-        painter.setFont(self._font)
-
-        if self.trace is None or self.trace.length == 0:
-            painter.setPen(QColor("#8b949e"))
-            painter.drawText(r, Qt.AlignmentFlag.AlignCenter, "Magnifier Window (click or right-drag on a trace)")
-            painter.end()
-            self._cache_dirty = False
-            self._cache_state_key = key
-            return
-
-        tr = self.trace
-        tr_rel_start = tr.start_epoch + tr.display_offset - self.ref_epoch
-        i0 = max(0, int(math.floor((self.t_lo - tr_rel_start) / max(1e-9, tr.delta))))
-        i1 = min(tr.length, int(math.ceil((self.t_hi - tr_rel_start) / max(1e-9, tr.delta))) + 1)
-
-        painter.setPen(QColor("#ffd700"))
-        ov_tag = (
-            f"+{tr.overlay_filter_name}"
-            if getattr(tr, "overlay_filter_name", "NONE") not in ("", "NONE")
-            else ""
-        )
-        mode_tag = f"  Cursor: {self.cursor_overlay_mode}" if self.cursor_overlay_mode != "STANDARD" else ""
-        hdr = (
-            f"MAGNIFIER: #{self.trace_idx + 1} {tr.station} {tr.channel3} [{tr.filter_name}{ov_tag}]  "
-            f"[{self.t_lo:.2f}..{self.t_hi:.2f}s]  Lock: {self.cursor_lock_mode}{mode_tag}  "
-            f"(L-click: Pick | M-click: Lock | R-drag: Amp)"
-        )
-        painter.drawText(QRectF(72, 2, r.width(), 18), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, hdr)
-
-        if i1 <= i0:
-            painter.end()
-            self._cache_dirty = False
-            self._cache_state_key = key
-            return
-
-        seg = tr.data[i0:i1]
-        mean_v = float(np.mean(seg))
-        max_amp = max(1e-9, float(np.max(np.abs(seg - mean_v))))
-        y_mid = r.center().y()
-        scale_y = 0.44 * r.height() / max_amp
-
-        # Zero line
-        painter.setPen(QPen(QColor("#21262d"), 0, Qt.PenStyle.DashLine))
-        painter.drawLine(QPointF(r.left(), y_mid), QPointF(r.right(), y_mid))
-
-        # Amplitude scale labels in left margin
-        painter.setPen(QColor("#8b949e"))
-        painter.drawText(QRectF(4, r.top(), 62, 16), Qt.AlignmentFlag.AlignRight, f"+{max_amp:.1f}")
-        painter.drawText(QRectF(4, y_mid - 8, 62, 16), Qt.AlignmentFlag.AlignRight, "0.0")
-        painter.drawText(QRectF(4, r.bottom() - 16, 62, 16), Qt.AlignmentFlag.AlignRight, f"-{max_amp:.1f}")
-
-        poly = _build_trace_polygon(
-            tr.data,
-            i0,
-            i1,
-            tr_rel_start,
-            tr.delta,
-            self.t_lo,
-            self.t_hi,
-            r.left(),
-            r.width(),
-            y_mid,
-            scale_y,
-            r.top() + 1.0,
-            r.bottom() - 1.0,
-            mean_v,
-        )
-
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setPen(QPen(QColor("#79c0ff"), 1.0))
-        painter.drawPolyline(poly)
-
-        # Draw sample dots when zoomed in tightly (< 180 samples)
-        if (i1 - i0) <= 180:
-            painter.setPen(QPen(QColor("#ffd700"), 3.5))
-            painter.drawPoints(poly)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-
-        # Draw picks and [±sigma_t] uncertainty error bars on this trace
-        if tr.picks:
-            pick_pen = QPen(QColor("#ff7b72"), 1.8)
-            for pk in tr.picks:
-                if not pk.onset:
-                    continue
-                rel_pk = pk.onset_epoch + tr.display_offset - self.ref_epoch
-                sigma = pk.sigma_t(tr.delta)
-                if self.show_pick_error_bars and (rel_pk + sigma >= self.t_lo and rel_pk - sigma <= self.t_hi):
-                    _draw_pick_uncertainty_interval(
-                        painter,
-                        self.time_to_x(rel_pk - sigma),
-                        self.time_to_x(rel_pk + sigma),
-                        r.top(),
-                        r.height(),
-                        r.left(),
-                        r.right(),
-                        QColor("#ff7b72"),
-                    )
-                if self.t_lo <= rel_pk <= self.t_hi:
-                    px = self.time_to_x(rel_pk)
-                    painter.setPen(pick_pen)
-                    painter.drawLine(QPointF(px, r.top()), QPointF(px, r.bottom()))
-                    painter.drawText(
-                        QPointF(px + 4, r.top() + 14),
-                        f"{pk.spec}{pk.sign_char}{pk.name} (Q{pk.quality} ±{sigma:.2g}s)",
-                    )
-
-        painter.end()
-        self._cache_dirty = False
-        self._cache_state_key = key
-
-    def paintEvent(self, _event) -> None:
-        self._ensure_static_pixmap()
-
-        painter = QPainter(self)
-        if self._static_pixmap is not None:
-            painter.drawPixmap(0, 0, self._static_pixmap)
-
-        if self.trace is None or self.trace.length == 0:
-            painter.end()
-            return
-
-        r = self.plot_rect()
-        painter.setFont(self._font)
-
-        # Draw right-drag amplitude measurement box
-        if self._drag_start_rel is not None and self._drag_cur_rel is not None:
-            x0 = self.time_to_x(min(self._drag_start_rel, self._drag_cur_rel))
-            x1 = self.time_to_x(max(self._drag_start_rel, self._drag_cur_rel))
-            painter.fillRect(QRectF(x0, r.top(), max(2.0, x1 - x0), r.height()), QColor(63, 185, 80, 55))
-            painter.setPen(QPen(QColor("#3fb950"), 1.2, Qt.PenStyle.DashLine))
-            painter.drawRect(QRectF(x0, r.top(), max(2.0, x1 - x0), r.height()))
-
-        # Draw hover cursor, Hilbert/Reference overlay waveform, and depth-phase check cursors
-        if self._hover_x is not None and r.left() <= self._hover_x <= r.right():
-            hover_t = self.x_to_time(self._hover_x)
-            if self.cursor_lock_mode != "CROSSHAIR":
-                hover_ep = self.ref_epoch + hover_t - self.trace.display_offset
-                snapped_ep = snap_time_to_feature(self.trace, hover_ep, self.cursor_lock_mode)
-                hover_t = snapped_ep + self.trace.display_offset - self.ref_epoch
-            draw_x = self.time_to_x(hover_t)
-
-            ov = self._get_cursor_overlay_waveform()
-            if ov is not None:
-                ov_arr, ov_dt, ov_center = ov
-                if ov_arr.size >= 2 and ov_dt > 0:
-                    ov_dm = ov_arr - float(np.mean(ov_arr))
-                    ov_max = float(np.max(np.abs(ov_dm)))
-                    if ov_max > 1e-12:
-                        y_mid = r.center().y()
-                        ov_scale_y = 0.36 * r.height() / ov_max
-                        ov_rel_start = hover_t - ov_center
-                        ov_poly = _build_trace_polygon(
-                            ov_dm,
-                            0,
-                            ov_dm.size,
-                            ov_rel_start,
-                            ov_dt,
-                            self.t_lo,
-                            self.t_hi,
-                            r.left(),
-                            r.width(),
-                            y_mid,
-                            ov_scale_y,
-                            r.top() + 1.0,
-                            r.bottom() - 1.0,
-                            0.0,
-                        )
-                        if ov_poly.count() >= 2:
-                            painter.save()
-                            painter.setClipRect(r)
-                            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                            if self.cursor_overlay_mode == "HILBERT":
-                                ov_col = QColor(210, 168, 255, 205)
-                                badge = "HILBERT 90°"
-                            else:
-                                ov_col = QColor(63, 185, 80, 195)
-                                badge = "REF"
-                            painter.setPen(QPen(ov_col, 1.6))
-                            painter.drawPolyline(ov_poly)
-                            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-                            painter.setPen(ov_col)
-                            painter.drawText(QPointF(draw_x + 4, r.bottom() - 18), badge)
-                            painter.restore()
-
-            painter.setPen(QPen(QColor("#e6edf3"), 0, Qt.PenStyle.DotLine))
-            painter.drawLine(QPointF(draw_x, r.top()), QPointF(draw_x, r.bottom()))
-            if self.depth_phase_cursors:
-                dp_pen = QPen(QColor("#d2a8ff"), 1.2, Qt.PenStyle.DashDotLine)
-                painter.setPen(dp_pen)
-                for dp_name, dp_off in self.depth_phase_cursors:
-                    dx = self.time_to_x(hover_t + dp_off)
-                    if r.left() <= dx <= r.right():
-                        painter.drawLine(QPointF(dx, r.top()), QPointF(dx, r.bottom()))
-                        painter.drawText(QPointF(dx + 3, r.bottom() - 6), dp_name)
-
-        painter.end()
-
-    def resizeEvent(self, event) -> None:
-        self._cache_dirty = True
-        super().resizeEvent(event)
-
-    def leaveEvent(self, event) -> None:
-        self._hover_x = None
-        self.unsetCursor()
-        self.update()
-        super().leaveEvent(event)
-
-    def pick_at(self, pos: QPointF) -> Optional[PhasePick]:
-        """Return PhasePick on the magnified trace within tolerance of pos, if any."""
-        if self.trace is None or not self.trace.picks:
-            return None
-        r = self.plot_rect()
-        if not r.contains(pos):
-            return None
-        best: Optional[Tuple[float, PhasePick]] = None
-        for pk in self.trace.picks:
-            if not pk.onset:
-                continue
-            rel_pk = pk.onset_epoch + self.trace.display_offset - self.ref_epoch
-            px = self.time_to_x(rel_pk)
-            d = abs(px - pos.x())
-            if d <= 12.0 and (best is None or d < best[0]):
-                best = (d, pk)
-        return best[1] if best else None
-
-    def pick_error_bar_at(self, pos: QPointF) -> Optional[Tuple[PhasePick, str]]:
-        """Return (PhasePick, 'left'|'right') if pos is near an error-bar ±sigma_t boundary."""
-        if not self.show_pick_error_bars or self.trace is None or not self.trace.picks:
-            return None
-        r = self.plot_rect()
-        if not r.contains(pos):
-            return None
-        best: Optional[Tuple[float, PhasePick, str]] = None
-        for pk in self.trace.picks:
-            if not pk.onset:
-                continue
-            rel_pk = pk.onset_epoch + self.trace.display_offset - self.ref_epoch
-            px = self.time_to_x(rel_pk)
-            sigma = pk.sigma_t(self.trace.delta)
-            for side, edge_x in (
-                ("left", self.time_to_x(rel_pk - sigma)),
-                ("right", self.time_to_x(rel_pk + sigma)),
-            ):
-                if r.left() <= edge_x <= r.right() and abs(edge_x - px) >= 3.0:
-                    d = abs(edge_x - pos.x())
-                    if d <= self.ERROR_BAR_HIT_TOLERANCE_PX and d < abs(pos.x() - px):
-                        if best is None or d < best[0]:
-                            best = (d, pk, side)
-        return (best[1], best[2]) if best else None
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if self.trace is None:
-            return
-        r = self.plot_rect()
-        pos = event.position()
-        if not r.contains(pos):
-            return
-        self._hover_x = pos.x()
-        rel_t = self.x_to_time(pos.x())
-        if event.button() == Qt.MouseButton.LeftButton:
-            if self.show_pick_error_bars:
-                eb_hit = self.pick_error_bar_at(pos)
-                if eb_hit is not None:
-                    self._error_bar_drag = eb_hit[0]
-                    self.setCursor(Qt.CursorShape.SizeHorCursor)
-                    self.update()
-                    return
-            ep = self.ref_epoch + rel_t - self.trace.display_offset
-            snapped_ep = snap_time_to_feature(self.trace, ep, self.cursor_lock_mode)
-            self.pickPlaced.emit(self.trace_idx, snapped_ep)
-            self.invalidate_cache()
-        elif event.button() == Qt.MouseButton.MiddleButton:
-            idx_mode = CURSOR_LOCK_MODES.index(self.cursor_lock_mode) if self.cursor_lock_mode in CURSOR_LOCK_MODES else 0
-            nxt = CURSOR_LOCK_MODES[(idx_mode + 1) % len(CURSOR_LOCK_MODES)]
-            self.cursor_lock_mode = nxt
-            self.cursorModeCycled.emit(nxt)
-            self.invalidate_cache()
-        elif event.button() == Qt.MouseButton.RightButton:
-            self._drag_start_rel = rel_t
-            self._drag_cur_rel = rel_t
-            self.update()
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        pos = event.position()
-        r = self.plot_rect()
-        if not event.buttons():
-            eb_hit = self.pick_error_bar_at(pos) if self.show_pick_error_bars else None
-            if eb_hit is not None:
-                eb_pk, _side = eb_hit
-                self.setCursor(Qt.CursorShape.SizeHorCursor)
-                dt = self.trace.delta if self.trace else 0.05
-                self.setToolTip(
-                    f"{eb_pk.name} uncertainty Q={eb_pk.quality} (±{eb_pk.sigma_t(dt):.2g}s)\n"
-                    "Drag error-bar edge to adjust pick uncertainty"
-                )
-            elif r.contains(pos):
-                self.setCursor(Qt.CursorShape.CrossCursor)
-                self.setToolTip("")
-            else:
-                self.unsetCursor()
-                self.setToolTip("")
-            if self._hover_x is not None and abs(pos.x() - self._hover_x) < 0.1:
-                return
-
-        self._hover_x = pos.x()
-
-        if self._error_bar_drag is not None and (event.buttons() & Qt.MouseButton.LeftButton):
-            if self.trace is not None:
-                hover_t = self.x_to_time(pos.x())
-                hover_ep = self.ref_epoch + hover_t - self.trace.display_offset
-                sigma_sec = abs(hover_ep - self._error_bar_drag.onset_epoch)
-                self._error_bar_drag.set_quality(PhasePick.quality_from_sigma_t(sigma_sec))
-                self.invalidate_cache()
-            return
-
-        if (event.buttons() & Qt.MouseButton.RightButton) and self._drag_start_rel is not None:
-            self._drag_cur_rel = self.x_to_time(pos.x())
-        self.update()
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self._error_bar_drag is not None:
-            pk = self._error_bar_drag
-            if self.trace is not None:
-                hover_t = self.x_to_time(event.position().x())
-                hover_ep = self.ref_epoch + hover_t - self.trace.display_offset
-                sigma_sec = abs(hover_ep - pk.onset_epoch)
-                pk.set_quality(PhasePick.quality_from_sigma_t(sigma_sec))
-                self.invalidate_cache()
-                self.pickChanged.emit(self.trace_idx, pk)
-            self._error_bar_drag = None
-            self.unsetCursor()
-            self.update()
-            return
-        if event.button() == Qt.MouseButton.RightButton and self._drag_start_rel is not None and self._drag_cur_rel is not None:
-            if self.trace is not None:
-                tr_rel_start = self.trace.start_epoch + self.trace.display_offset - self.ref_epoch
-                lo = min(self._drag_start_rel, self._drag_cur_rel) - tr_rel_start
-                hi = max(self._drag_start_rel, self._drag_cur_rel) - tr_rel_start
-                if hi - lo > self.trace.delta:
-                    self.amplitudeMeasured.emit(self.trace_idx, lo, hi)
-            self._drag_start_rel = None
-            self._drag_cur_rel = None
-            self.update()

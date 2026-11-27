@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import logging
 import math
 import os
 import re
@@ -12,6 +13,8 @@ import numpy as np
 from shm_app.core.config_station import SHMConfig, get_config
 from shm_app.core.models import Trace
 from shm_app.core.time_utils import format_gse2_time, julian_to_month_day, parse_sh_time
+
+logger = logging.getLogger(__name__)
 
 # CM6 character lookup table matching gsedata.c:
 # '+' -> 0, '-' -> 1, '0'..'9' -> 2..11, 'A'..'Z' -> 12..37, 'a'..'z' -> 38..63
@@ -161,18 +164,26 @@ def _parse_wid1_block(
     """Parse a WID1 + DAT1 + CHK1 block."""
     line1 = lines[start_idx]
     if start_idx + 1 >= len(lines):
+        logger.warning("Truncated WID1 block at line %d in %s", start_idx + 1, filepath)
         return None, start_idx + 1
     line2 = lines[start_idx + 1]
 
     # Parse WID1 line 1
     parts = line1.split()
-    yj = parts[1]
-    year, jday = int(yj[:4]), int(yj[4:7])
-    hour, minute, sec, msec = int(parts[2]), int(parts[3]), int(parts[4]), int(parts[5])
-    nsamps = int(parts[6])
-    station = parts[7].upper()
-    chan_raw = parts[9].upper() if len(parts) > 9 else "BZ"
-    samprat = float(parts[10]) if len(parts) > 10 else 20.0
+    if len(parts) < 8 or len(parts[1]) < 7:
+        logger.warning("Malformed WID1 header at line %d in %s: %r", start_idx + 1, filepath, line1)
+        return None, start_idx + 1
+    try:
+        yj = parts[1]
+        year, jday = int(yj[:4]), int(yj[4:7])
+        hour, minute, sec, msec = int(parts[2]), int(parts[3]), int(parts[4]), int(parts[5])
+        nsamps = max(0, int(parts[6]))
+        station = parts[7].upper()
+        chan_raw = parts[9].upper() if len(parts) > 9 else "BZ"
+        samprat = float(parts[10]) if len(parts) > 10 else 20.0
+    except (ValueError, IndexError) as exc:
+        logger.warning("Invalid WID1 numeric field at line %d in %s: %s", start_idx + 1, filepath, exc)
+        return None, start_idx + 1
 
     # Remaining tokens after samprat: [instype] datatype [diff_flag]
     tail = parts[11:]
@@ -202,8 +213,12 @@ def _parse_wid1_block(
     lat = floats_l2[2] if len(floats_l2) > 2 else 0.0
     lon = floats_l2[3] if len(floats_l2) > 3 else 0.0
 
-    month, day = julian_to_month_day(year, max(1, min(366, jday)))
-    dt_obj = datetime.datetime(year, month, day, hour, minute, 0, tzinfo=datetime.timezone.utc)
+    try:
+        month, day = julian_to_month_day(year, max(1, min(366, jday)))
+        dt_obj = datetime.datetime(year, month, day, max(0, min(23, hour)), max(0, min(59, minute)), 0, tzinfo=datetime.timezone.utc)
+    except ValueError as exc:
+        logger.warning("Invalid WID1 timestamp at line %d in %s: %s", start_idx + 1, filepath, exc)
+        return None, start_idx + 1
     start_epoch = dt_obj.timestamp() + sec + msec / 1000.0
     dt = 1.0 / samprat if samprat > 0 else 0.05
 
@@ -221,10 +236,10 @@ def _parse_wid1_block(
     while idx < len(lines):
         ln = lines[idx]
         if ln.startswith("CHK1"):
-            parts = ln.split()
-            if len(parts) >= 2:
+            chk_parts = ln.split()
+            if len(chk_parts) >= 2:
                 try:
-                    chk_val = int(parts[1])
+                    chk_val = int(chk_parts[1])
                 except ValueError:
                     pass
             idx += 1
@@ -239,11 +254,31 @@ def _parse_wid1_block(
         calc_chk = gse_checksum(raw_samps)
         # Store checksum metadata in extra_headers
         chk_ok = calc_chk == abs(chk_val)
+        if not chk_ok:
+            logger.warning(
+                "GSE1 checksum mismatch for %s.%s in %s: expected=%d, computed=%d",
+                station,
+                chan3,
+                filepath,
+                abs(chk_val),
+                calc_chk,
+            )
     else:
         chk_ok = True
 
     # Convert to velocity (nm/s) if calib & calper given
-    vel_scale = (calib * 2.0 * math.pi / calper) if (calib > 0 and calper > 0) else 1.0
+    if not (math.isfinite(calib) and calib > 0 and math.isfinite(calper) and calper > 0):
+        logger.warning(
+            "GSE1 %s.%s in %s has invalid calibration (calib=%r, calper=%r); falling back to vel_scale=1.0",
+            station,
+            chan3,
+            filepath,
+            calib,
+            calper,
+        )
+        vel_scale = 1.0
+    else:
+        vel_scale = calib * 2.0 * math.pi / calper
     stat_info = cfg.get_station(station)
     tr = Trace(
         data=raw_samps.astype(np.float64) * vel_scale,
@@ -273,31 +308,47 @@ def _parse_wid2_block(
     """Parse a WID2 (+ optional STA2) + DAT2 + CHK2 block."""
     line = lines[start_idx]
     parts = line.split()
+    if len(parts) < 5:
+        logger.warning("Malformed WID2 header at line %d in %s: %r", start_idx + 1, filepath, line)
+        return None, start_idx + 1
+
     # WID2 YYYY/MM/DD HH:MM:SS.SSS STAT CHAN AUX DATATYPE SAMPS SAMPRAT CALIB CALPER INSTYPE HANG VANG
     date_str = f"{parts[1]} {parts[2]}"
-    start_epoch = parse_sh_time(date_str)
-    station = parts[3].upper()
-    chan_raw = parts[4].upper()
+    try:
+        start_epoch = parse_sh_time(date_str)
+    except ValueError as exc:
+        logger.warning("Invalid WID2 timestamp at line %d in %s: %s", start_idx + 1, filepath, exc)
+        return None, start_idx + 1
+
     # Check if AUXID is blank in fixed columns 35..39
-    if len(line) >= 80 and line[44:47].strip().upper() in ("CM6", "INT", "FLT"):
-        station = line[29:34].strip().upper()
-        chan_raw = line[35:38].strip().upper()
-        auxid = line[39:43].strip()
-        datatype = line[44:47].strip().upper()
-        nsamps = int(line[48:56].strip())
-        samprat = float(line[57:68].strip())
-        rem_tokens = line[69:].split()
-        calib = float(rem_tokens[0]) if len(rem_tokens) > 0 else 1.0
-        calper = float(rem_tokens[1]) if len(rem_tokens) > 1 else 1.0
-        instype = rem_tokens[2] if len(rem_tokens) > 2 else ""
-    else:
-        auxid = ""
-        datatype = parts[5].upper()
-        nsamps = int(parts[6])
-        samprat = float(parts[7])
-        calib = float(parts[8]) if len(parts) > 8 else 1.0
-        calper = float(parts[9]) if len(parts) > 9 else 1.0
-        instype = parts[10] if len(parts) > 10 else ""
+    try:
+        if len(line) >= 80 and line[44:47].strip().upper() in ("CM6", "INT", "FLT"):
+            station = line[29:34].strip().upper() or parts[3].upper()
+            chan_raw = line[35:38].strip().upper() or parts[4].upper()
+            auxid = line[39:43].strip()
+            datatype = line[44:47].strip().upper()
+            nsamps = max(0, int(line[48:56].strip()))
+            samprat = float(line[57:68].strip())
+            rem_tokens = line[69:].split()
+            calib = float(rem_tokens[0]) if len(rem_tokens) > 0 else 1.0
+            calper = float(rem_tokens[1]) if len(rem_tokens) > 1 else 1.0
+            instype = rem_tokens[2] if len(rem_tokens) > 2 else ""
+        else:
+            if len(parts) < 8:
+                logger.warning("Truncated WID2 header at line %d in %s: %r", start_idx + 1, filepath, line)
+                return None, start_idx + 1
+            station = parts[3].upper()
+            chan_raw = parts[4].upper()
+            auxid = ""
+            datatype = parts[5].upper()
+            nsamps = max(0, int(parts[6]))
+            samprat = float(parts[7])
+            calib = float(parts[8]) if len(parts) > 8 else 1.0
+            calper = float(parts[9]) if len(parts) > 9 else 1.0
+            instype = parts[10] if len(parts) > 10 else ""
+    except (ValueError, IndexError) as exc:
+        logger.warning("Invalid WID2 field at line %d in %s: %s", start_idx + 1, filepath, exc)
+        return None, start_idx + 1
 
     chan3 = CHAN2_TO_CHAN3.get(chan_raw, chan_raw if len(chan_raw) == 3 else f"BH{chan_raw[-1:] or 'Z'}")
     dt = 1.0 / samprat if samprat > 0 else 0.05
@@ -342,10 +393,30 @@ def _parse_wid2_block(
     if chk_val is not None and raw_samps.size > 0:
         calc_chk = gse_checksum(raw_samps)
         chk_ok = calc_chk == abs(chk_val)
+        if not chk_ok:
+            logger.warning(
+                "GSE2 checksum mismatch for %s.%s in %s: expected=%d, computed=%d",
+                station,
+                chan3,
+                filepath,
+                abs(chk_val),
+                calc_chk,
+            )
     else:
         chk_ok = True
 
-    vel_scale = (calib * 2.0 * math.pi / calper) if (calib > 0 and calper > 0) else 1.0
+    if not (math.isfinite(calib) and calib > 0 and math.isfinite(calper) and calper > 0):
+        logger.warning(
+            "GSE2 %s.%s in %s has invalid calibration (calib=%r, calper=%r); falling back to vel_scale=1.0",
+            station,
+            chan3,
+            filepath,
+            calib,
+            calper,
+        )
+        vel_scale = 1.0
+    else:
+        vel_scale = calib * 2.0 * math.pi / calper
     stat_info = cfg.get_station(station)
     tr = Trace(
         data=raw_samps.astype(np.float64) * vel_scale,

@@ -31,5 +31,5 @@ def resolve_default_shm_root() -> str:
     return os.path.join(repo_root, "sh")
 
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 SHM_DEFAULT_ROOT = resolve_default_shm_root()

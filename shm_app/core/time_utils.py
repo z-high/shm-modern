@@ -57,7 +57,9 @@ def parse_sh_time(timestr: str) -> float:
         if mon_raw.isdigit():
             month = int(mon_raw)
         else:
-            month = MONTH_MAP.get(mon_raw, 1)
+            if mon_raw not in MONTH_MAP:
+                raise ValueError(f"Unrecognized month token {mon_raw!r} in SH time string: {timestr!r}")
+            month = MONTH_MAP[mon_raw]
         year = int(m.group(3))
         if year < 100:
             year += 1900 if year >= 60 else 2000
@@ -88,16 +90,22 @@ def parse_sh_time(timestr: str) -> float:
 
     # Try numeric float directly
     try:
-        return float(s)
+        val = float(s)
     except ValueError as exc:
         raise ValueError(f"Unrecognized SH time string: {timestr!r}") from exc
+    if not math.isfinite(val):
+        raise ValueError(f"Non-finite numeric time value: {timestr!r}")
+    return val
 
 
 def format_sh_time(epoch: float, millis_digits: int = 3) -> str:
     """Format a UTC POSIX epoch float into SHM standard DD-MMM-YYYY_HH:MM:SS.SSS."""
+    ep = float(epoch)
+    if not math.isfinite(ep):
+        raise ValueError(f"Cannot format non-finite epoch: {epoch!r}")
     # Round to desired fractional precision carefully to avoid 60.000 seconds
     scale = 10 ** millis_digits
-    rounded = round(float(epoch) * scale) / scale
+    rounded = round(ep * scale) / scale
     dt = datetime.datetime.fromtimestamp(rounded, tz=datetime.timezone.utc)
     mon_str = MONTH_NAMES[dt.month - 1]
     if millis_digits <= 0:
@@ -114,7 +122,10 @@ def format_sh_time(epoch: float, millis_digits: int = 3) -> str:
 
 def format_gse2_time(epoch: float) -> str:
     """Format a UTC POSIX epoch float into GSE2 WID2 format YYYY/MM/DD HH:MM:SS.SSS."""
-    rounded = round(float(epoch) * 1000.0) / 1000.0
+    ep = float(epoch)
+    if not math.isfinite(ep):
+        raise ValueError(f"Cannot format non-finite epoch: {epoch!r}")
+    rounded = round(ep * 1000.0) / 1000.0
     dt = datetime.datetime.fromtimestamp(rounded, tz=datetime.timezone.utc)
     ms = int(round((rounded - math.floor(rounded)) * 1000.0)) % 1000
     return f"{dt.year:04d}/{dt.month:02d}/{dt.day:02d} {dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}.{ms:03d}"
@@ -146,7 +157,10 @@ def ntime_to_epoch(
 
 def epoch_to_ntime(epoch: float) -> Tuple[int, int, int, int, int, int, int]:
     """Convert UTC epoch float to (year, month, day, hour, minute, second, millisecond)."""
-    rounded = round(float(epoch) * 1000.0) / 1000.0
+    ep = float(epoch)
+    if not math.isfinite(ep):
+        raise ValueError(f"Cannot convert non-finite epoch: {epoch!r}")
+    rounded = round(ep * 1000.0) / 1000.0
     dt = datetime.datetime.fromtimestamp(rounded, tz=datetime.timezone.utc)
     ms = int(round((rounded - math.floor(rounded)) * 1000.0)) % 1000
     return dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, ms

@@ -73,6 +73,10 @@ class TestReactiveLoopAdversarial(unittest.TestCase):
         self.received_requests: list[FitModificationRequest] = []
         self.bridge.recomputeFitRequested.connect(self.received_requests.append)
 
+    def tearDown(self) -> None:
+        self.win.close()
+        app.processEvents()
+
     def test_01_uncheck_then_recheck_station(self) -> None:
         """Requirement 1: Unchecking, then re-checking a station in table_residuals
 
@@ -172,35 +176,36 @@ class TestReactiveLoopAdversarial(unittest.TestCase):
     def test_03_weight_column_adversarial_inputs(self) -> None:
         """Adversarial stress-test on Column 7 text inputs:
 
-        - Negative values ("-1.5") -> unchecks Col 0, excludes station
-        - Non-numeric strings ("abc", "NaN", "???") -> fallback to 1.0, checks Col 0
-        - Empty string -> fallback to 1.0, checks Col 0
-        - Whitespace padded numbers ("  0.50  ") -> correctly parsed as 0.50, checks Col 0
+        - Negative values ("-1.5") -> reverted to previous valid weight (1.00), keeps Col 0 Checked, no spurious recompute
+        - Non-numeric strings ("CORRUPT_INPUT") -> reverted to previous valid weight (1.00), keeps Col 0 Checked, no spurious recompute
+        - Whitespace padded numbers ("   0.42   ") -> normalized to "0.42", emits weight 0.42, keeps Col 0 Checked
         """
         table = self.win.table_residuals
         chk_item = table.item(2, 0)  # BFO
         weight_item = table.item(2, 7)
 
-        # Negative value
+        # Negative value -> rejected and reverted to 1.00
         self.received_requests.clear()
         weight_item.setText("-1.5")
         app.processEvents()
-        self.assertEqual(chk_item.checkState(), Qt.CheckState.Unchecked)
-        self.assertIn("BFO", self.received_requests[-1].excluded_identifiers)
+        self.assertEqual(chk_item.checkState(), Qt.CheckState.Checked)
+        self.assertEqual(weight_item.text(), "1.00")
+        self.assertEqual(len(self.received_requests), 0)
 
-        # Non-numeric string
+        # Non-numeric string -> rejected and reverted to 1.00
         self.received_requests.clear()
         weight_item.setText("CORRUPT_INPUT")
         app.processEvents()
         self.assertEqual(chk_item.checkState(), Qt.CheckState.Checked)
-        self.assertNotIn("BFO", self.received_requests[-1].excluded_identifiers)
-        self.assertEqual(self.received_requests[-1].weight_overrides.get("BFO"), 1.0)
+        self.assertEqual(weight_item.text(), "1.00")
+        self.assertEqual(len(self.received_requests), 0)
 
-        # Whitespace padded
+        # Whitespace padded valid number -> accepted and formatted
         self.received_requests.clear()
         weight_item.setText("   0.42   ")
         app.processEvents()
         self.assertEqual(chk_item.checkState(), Qt.CheckState.Checked)
+        self.assertEqual(weight_item.text(), "0.42")
         self.assertAlmostEqual(self.received_requests[-1].weight_overrides.get("BFO"), 0.42)
 
     def test_04_rapid_oscillation_stress_harness(self) -> None:

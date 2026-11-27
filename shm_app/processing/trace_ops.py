@@ -128,6 +128,7 @@ def cut_trace(
 
     if i0 >= 0 and i1 < out.length:
         out.data = out.data[i0 : i1 + 1].copy()
+        out.start_epoch = out.start_epoch + i0 * dt
     elif pad_zeros:
         buf = np.zeros(n_out, dtype=np.float64)
         src_start = max(0, i0)
@@ -136,13 +137,33 @@ def cut_trace(
             dst_start = src_start - i0
             buf[dst_start : dst_start + (src_end - src_start)] = out.data[src_start:src_end]
         out.data = buf
+        out.start_epoch = out.start_epoch + i0 * dt
     else:
-        s0 = max(0, min(out.length - 1, i0))
-        s1 = max(s0 + 1, min(out.length, i1 + 1))
-        out.data = out.data[s0:s1].copy()
-        i0 = s0
+        s0 = max(0, i0)
+        s1 = min(out.length, i1 + 1)
+        if s1 <= s0:
+            out.data = np.empty(0, dtype=np.float64)
+            out.start_epoch = out.start_epoch + i0 * dt
+        else:
+            out.data = out.data[s0:s1].copy()
+            out.start_epoch = out.start_epoch + s0 * dt
 
-    out.start_epoch = out.start_epoch + i0 * dt
+    if out.length == 0:
+        out.picks = []
+        out.theo_picks = {}
+    else:
+        tol = max(1e-3, 0.5 * dt)
+        win_start = out.start_epoch - tol
+        win_end = out.end_epoch + tol
+        out.picks = [
+            p for p in out.picks
+            if p.onset and (win_start <= p.onset_epoch <= win_end)
+        ]
+        out.theo_picks = {
+            ph: ep for ph, ep in out.theo_picks.items()
+            if win_start <= ep <= win_end
+        }
+
     return out
 
 
@@ -227,6 +248,9 @@ def instantaneous_phase_trace(tr: Trace) -> Trace:
     return out
 
 
+MAX_COMMON_GRID_SAMPLES = 10_000_000
+
+
 def resample_traces_to_common_grid(
     traces: List[Trace],
     offsets_sec: Optional[Sequence[float]] = None,
@@ -239,7 +263,10 @@ def resample_traces_to_common_grid(
     """
     if not traces:
         raise ValueError("Cannot build common time grid for empty trace list")
-    dt = traces[0].delta
+    for tr in traces:
+        if not math.isfinite(tr.delta) or tr.delta <= 0.0:
+            raise ValueError(f"All traces must have positive finite delta, got {tr.delta} on {tr.station}")
+    dt = float(traces[0].delta)
     eff_offsets = (
         [
             float(off) + (tr.display_offset if include_display_offset else 0.0)
@@ -255,11 +282,21 @@ def resample_traces_to_common_grid(
     else:
         t0 = min(tr.start_epoch for tr in traces)
         t1 = max(tr.start_epoch + tr.duration for tr in traces)
+    if not (math.isfinite(t0) and math.isfinite(t1)):
+        raise ValueError("Trace time bounds must be finite for common-grid resampling")
     n_samps = max(1, int(round((t1 - t0) / dt)) + 1)
+    if n_samps > MAX_COMMON_GRID_SAMPLES:
+        raise ValueError(
+            f"Common time grid requires {n_samps} samples (span {t1 - t0:.2f}s at dt={dt}s), "
+            f"exceeding maximum {MAX_COMMON_GRID_SAMPLES}"
+        )
     grid_t = t0 + np.arange(n_samps, dtype=np.float64) * dt
 
     aligned: List[np.ndarray] = []
     for tr, s in zip(traces, starts):
+        if tr.length == 0:
+            aligned.append(np.zeros(grid_t.size, dtype=np.float64))
+            continue
         tr_t = s + np.arange(tr.length, dtype=np.float64) * tr.delta
         aligned.append(np.interp(grid_t, tr_t, tr.data, left=0.0, right=0.0))
     return t0, dt, grid_t, aligned
@@ -275,7 +312,9 @@ def sum_traces(traces: List[Trace], normalize_weights: bool = True) -> Optional[
     accum = np.zeros(grid_t.size, dtype=np.float64)
     w_sum = 0.0
     for tr, interp_y in zip(traces, aligned):
-        w = tr.weight if tr.weight != 0.0 else 1.0
+        w = float(tr.weight)
+        if not math.isfinite(w) or w == 0.0:
+            continue
         accum += w * interp_y
         w_sum += abs(w)
 

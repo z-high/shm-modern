@@ -571,6 +571,45 @@ def parse_stationxml(xml_or_path: str) -> StationXMLInventory:
     return inv
 
 
+def _eval_poles_zeros(
+    pz: StationXMLPolesZeros,
+    freqs: np.ndarray,
+    sample_rate: float,
+) -> np.ndarray:
+    """Evaluate a StationXML PolesZeros transfer function over frequency array freqs (Hz)."""
+    pz_type = (pz.pz_transfer_function_type or "").strip().upper()
+    if "RADIANS" in pz_type:
+        s = 1j * 2.0 * math.pi * freqs
+    elif "HERTZ" in pz_type:
+        s = 1j * freqs
+    elif "DIGITAL" in pz_type or "Z-TRANSFORM" in pz_type:
+        sr = sample_rate if sample_rate > 0 else 20.0
+        dt = 1.0 / sr
+        s = np.exp(1j * 2.0 * math.pi * freqs * dt)
+    else:
+        s = 1j * 2.0 * math.pi * freqs
+
+    num = np.full(freqs.shape, complex(pz.normalization_factor, 0.0), dtype=np.complex128)
+    for z in pz.zeros:
+        num = num * (s - z)
+    den = np.ones(freqs.shape, dtype=np.complex128)
+    for p in pz.poles:
+        den = den * (s - p)
+
+    pz_val = np.zeros(freqs.shape, dtype=np.complex128)
+    mask = np.abs(den) > 1e-30
+    pz_val[mask] = num[mask] / den[mask]
+    return pz_val
+
+
+def _eval_horner(coeffs: Sequence[float], x: np.ndarray) -> np.ndarray:
+    """Evaluate sum_{k=0}^{N-1} coeffs[k] * x^k using Horner's method."""
+    acc = np.zeros(x.shape, dtype=np.complex128)
+    for c in reversed(coeffs):
+        acc = acc * x + float(c)
+    return acc
+
+
 def eval_stationxml_response(
     channel: StationXMLChannel,
     freqs_hz: Union[np.ndarray, Sequence[float], float],
@@ -593,58 +632,27 @@ def eval_stationxml_response(
     if channel.stages:
         for stg in channel.stages:
             stg_resp = np.ones(freqs.shape, dtype=np.complex128)
+            sr = (
+                stg.decimation_input_sample_rate
+                if stg.decimation_input_sample_rate and stg.decimation_input_sample_rate > 0
+                else (channel.sample_rate if channel.sample_rate > 0 else 20.0)
+            )
 
             if stg.poles_zeros is not None:
-                pz = stg.poles_zeros
-                pz_type = (pz.pz_transfer_function_type or "").strip().upper()
-                if "RADIANS" in pz_type:
-                    s = 1j * 2.0 * math.pi * freqs
-                elif "HERTZ" in pz_type:
-                    s = 1j * freqs
-                elif "DIGITAL" in pz_type or "Z-TRANSFORM" in pz_type:
-                    sr = (
-                        stg.decimation_input_sample_rate
-                        if stg.decimation_input_sample_rate and stg.decimation_input_sample_rate > 0
-                        else (channel.sample_rate if channel.sample_rate > 0 else 20.0)
-                    )
-                    dt = 1.0 / sr
-                    s = np.exp(1j * 2.0 * math.pi * freqs * dt)
-                else:
-                    s = 1j * 2.0 * math.pi * freqs
-
-                num = np.full(freqs.shape, complex(pz.normalization_factor, 0.0), dtype=np.complex128)
-                for z in pz.zeros:
-                    num = num * (s - z)
-                den = np.ones(freqs.shape, dtype=np.complex128)
-                for p in pz.poles:
-                    den = den * (s - p)
-
-                pz_val = np.zeros(freqs.shape, dtype=np.complex128)
-                mask = np.abs(den) > 1e-30
-                pz_val[mask] = num[mask] / den[mask]
-                stg_resp = stg_resp * pz_val
+                stg_resp = stg_resp * _eval_poles_zeros(stg.poles_zeros, freqs, sr)
 
             elif stg.coefficients is not None:
                 cf = stg.coefficients
-                sr = (
-                    stg.decimation_input_sample_rate
-                    if stg.decimation_input_sample_rate and stg.decimation_input_sample_rate > 0
-                    else (channel.sample_rate if channel.sample_rate > 0 else 20.0)
-                )
                 dt = 1.0 / sr
                 z_inv = np.exp(-1j * 2.0 * math.pi * freqs * dt)
 
                 if cf.numerator:
-                    num = np.zeros(freqs.shape, dtype=np.complex128)
-                    for k, b_k in enumerate(cf.numerator):
-                        num = num + b_k * (z_inv ** k)
+                    num = _eval_horner(cf.numerator, z_inv)
                 else:
                     num = np.ones(freqs.shape, dtype=np.complex128)
 
                 if cf.denominator:
-                    den = np.zeros(freqs.shape, dtype=np.complex128)
-                    for m, a_m in enumerate(cf.denominator):
-                        den = den + a_m * (z_inv ** m)
+                    den = _eval_horner(cf.denominator, z_inv)
                 else:
                     den = np.ones(freqs.shape, dtype=np.complex128)
 
@@ -659,6 +667,9 @@ def eval_stationxml_response(
                     stg_resp = stg_resp * float(stg.stage_gain.value)
 
             resp = resp * stg_resp
+    elif channel.poles_zeros is not None:
+        sr = channel.sample_rate if channel.sample_rate > 0 else 20.0
+        resp = resp * _eval_poles_zeros(channel.poles_zeros, freqs, sr)
 
     if include_sensitivity and not has_stage_gain and channel.instrument_sensitivity is not None:
         resp = resp * float(channel.instrument_sensitivity.value)

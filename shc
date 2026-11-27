@@ -4,18 +4,30 @@
 import argparse
 import os
 import sys
+from typing import Optional, Sequence
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 if APP_ROOT not in sys.path:
     sys.path.insert(0, APP_ROOT)
 
 from shm_app import SHM_DEFAULT_ROOT
+from shm_app.__version__ import __version__
 from shm_app.core.config_station import get_config
 from shm_app.interpreter.sh_engine import SHCommandEngine
 
 
-def main() -> int:
+def _has_sh_error(text: str) -> bool:
+    return any(ln.lstrip().startswith("SH Error") for ln in text.splitlines())
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="SeismicHandler Command Interpreter (SHC) Modernized CLI")
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"shc {__version__}",
+    )
     parser.add_argument(
         "--shm-root",
         default=SHM_DEFAULT_ROOT,
@@ -36,36 +48,83 @@ def main() -> int:
         nargs="*",
         help="Optional positional arguments (#1, #2, ...) for the script",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    if args.command is not None and args.script is not None:
+        parser.error("Cannot specify both -c/--command and a script file")
+
+    had_error = False
+
+    def _cli_emit(msg: str) -> None:
+        nonlocal had_error
+        if _has_sh_error(msg):
+            had_error = True
+            print(msg, file=sys.stderr)
+        else:
+            print(msg)
 
     cfg = get_config(args.shm_root)
-    engine = SHCommandEngine(config=cfg)
+    engine = SHCommandEngine(config=cfg, output_callback=_cli_emit)
 
-    if args.command:
-        engine.execute_line(args.command)
-        return 0
+    if args.command is not None:
+        if args.command.strip():
+            res = engine.execute_line(args.command)
+            if res and _has_sh_error(res):
+                had_error = True
+        return 1 if had_error else 0
 
-    if args.script:
+    if args.script is not None:
         if not os.path.isfile(args.script):
             print(f"Error: Script file not found: {args.script}", file=sys.stderr)
             return 1
         with open(args.script, "r", encoding="latin-1", errors="ignore") as f:
-            engine.execute_script(f.read(), args=args.script_args)
+            logs = engine.execute_script(f.read(), args=args.script_args)
+        if any(_has_sh_error(entry) for entry in logs):
+            had_error = True
+        return 1 if had_error else 0
+
+    if sys.stdin.isatty():
+        readline_mod = None
+        hist_file = os.path.expanduser("~/.shc_history")
+        try:
+            import readline as readline_mod
+
+            if os.path.isfile(hist_file):
+                try:
+                    readline_mod.read_history_file(hist_file)
+                except OSError:
+                    pass
+        except ImportError:
+            readline_mod = None
+
+        print(f"SeismicHandler Command Interpreter (SHC {__version__} Modernized)")
+        print("Type HELP for commands or QUIT to exit.")
+        try:
+            while not engine.quit_requested:
+                try:
+                    line = input("SH> ")
+                except EOFError:
+                    break
+                except KeyboardInterrupt:
+                    print()
+                    continue
+                engine.execute_line(line)
+        finally:
+            if readline_mod is not None:
+                try:
+                    readline_mod.set_history_length(1000)
+                    readline_mod.write_history_file(hist_file)
+                except OSError:
+                    pass
         return 0
 
-    print("SeismicHandler Command Interpreter (SHC 3.0 Modernized)")
-    print("Type HELP for commands or QUIT to exit.")
-    while not engine.quit_requested:
-        try:
-            line = input("SH> ")
-        except EOFError:
+    for raw_line in sys.stdin:
+        if engine.quit_requested:
             break
-        except KeyboardInterrupt:
-            print()
-            continue
-        engine.execute_line(line)
-
-    return 0
+        res = engine.execute_line(raw_line.rstrip("\r\n"))
+        if res and _has_sh_error(res):
+            had_error = True
+    return 1 if had_error else 0
 
 
 if __name__ == "__main__":

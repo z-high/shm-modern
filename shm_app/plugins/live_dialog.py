@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -633,9 +634,35 @@ class LiveEventDialog(QDialog):
 
     # ---- Top Bar & Rule Handlers ----
 
+    def _validate_and_warn(self, show_popup: bool = True) -> List[str]:
+        warnings_list: List[str] = []
+        if not any((self.chk_z.isChecked(), self.chk_n.isChecked(), self.chk_e.isChecked())):
+            warnings_list.append("No waveform components (Z, N, E) were selected; defaulting to Z.")
+            self.chk_z.setChecked(True)
+        raw_ref = self.edit_ref_station.text().strip().upper()
+        if raw_ref:
+            st = self.coordinator.shm_config.stations.get(raw_ref)
+            if st is None or (abs(st.lat) <= 1e-6 and abs(st.lon) <= 1e-6):
+                warnings_list.append(
+                    f"Unknown reference station '{raw_ref}'; keeping coordinates "
+                    f"({self.coordinator.live_config.ref_lat:.3f}°, {self.coordinator.live_config.ref_lon:.3f}°)."
+                )
+        if warnings_list:
+            msg = " ".join(warnings_list)
+            self.lbl_footer_hint.setStyleSheet("color: #f85149; font-weight: bold;")
+            self.lbl_footer_hint.setText(msg)
+            self._append_log(f"[Live Warning] {msg}")
+            if show_popup:
+                QMessageBox.warning(self, "Live Event Configuration", "\n".join(warnings_list))
+        else:
+            self.lbl_footer_hint.setStyleSheet("")
+        return warnings_list
+
     def _on_live_toggled(self, checked: bool) -> None:
         if self._suppress_ui_signals:
             return
+        if checked:
+            self._validate_and_warn(show_popup=True)
         self.coordinator.update_config(self.build_config_from_widgets(), reevaluate_existing=False)
         self.coordinator.set_enabled(checked)
 
@@ -671,6 +698,7 @@ class LiveEventDialog(QDialog):
         self.lbl_stream_status.setText(f"<span style='color:{dot_color};'>●</span> {clean_detail}")
 
     def _on_replay_24h(self) -> None:
+        self._validate_and_warn(show_popup=True)
         self.coordinator.update_config(self.build_config_from_widgets(), reevaluate_existing=False)
         self.coordinator.fetch_recent_catalog(lookback_hours=24.0, context_label="Replay (24h)")
 
@@ -697,6 +725,7 @@ class LiveEventDialog(QDialog):
         self._load_config_to_widgets(LiveConfig())
 
     def _apply_config_from_widgets(self) -> None:
+        self._validate_and_warn(show_popup=True)
         cfg = self.build_config_from_widgets()
         self.lbl_ref_coords.setText(f"({cfg.ref_lat:.3f}°, {cfg.ref_lon:.3f}°)")
         self.coordinator.update_config(cfg, reevaluate_existing=True)

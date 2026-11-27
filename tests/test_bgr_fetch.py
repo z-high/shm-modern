@@ -236,6 +236,22 @@ class TestBGRFetchEngineAndGUI(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def setUp(self) -> None:
+        self._sess_dir = tempfile.TemporaryDirectory()
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {
+                "SHM_SESSION_PATH": os.path.join(self._sess_dir.name, "session.json"),
+                "SHM_NO_SESSION_PROMPT": "1",
+            },
+        )
+        self._env_patch.start()
+
+    def tearDown(self) -> None:
+        self.app.processEvents()
+        self._env_patch.stop()
+        self._sess_dir.cleanup()
+
     def test_sh_engine_fetch_command(self) -> None:
         t0 = parse_sh_time("2024-05-01T12:00:00")
         raw = _make_steim1_mseed_bytes("BFO", "BHZ", t0, n_samples=600)
@@ -344,6 +360,7 @@ class TestBGRFetchEngineAndGUI(unittest.TestCase):
             for d in list(win._open_dialogs):
                 d.close()
             win.close()
+            self.app.processEvents()
 
 
 if __name__ == "__main__":

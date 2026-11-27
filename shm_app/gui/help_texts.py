@@ -627,6 +627,52 @@ HELP_TEXTS: Dict[str, Tuple[str, str, str]] = {
     "sample_grf": ("Loads the bundled GRF array example (GSE). For trying out the program.", "", ""),
     "sample_grsn": ("Loads the bundled GRSN network example (GSE).", "", ""),
     "sample_mseed": ("Loads the bundled Mini-SEED example directory.", "", ""),
+    # ---- Fit Diagnostics Window ----
+    "fit_domain": (
+        "Selects the seismological modeling or inversion domain displayed in the diagnostic tabs.",
+        "",
+        "FIT",
+    ),
+    "fit_tabs": (
+        "Switches between Global Overview, Travel Time & Geiger Residuals, Array FK, Spectral Source, 3C Polarization & Beachball, and Restitution tabs.",
+        "",
+        "",
+    ),
+    "fit_residuals_table": (
+        "Interactive observation table. Toggle Active checkboxes or edit Weights (>= 0) to re-weight stations; double-click a row to zoom the Magnifier to that station/phase.",
+        "",
+        "",
+    ),
+    "fit_auto_refit": (
+        "When checked, toggling checkboxes or editing weights immediately triggers a reactive re-fit.",
+        "",
+        "",
+    ),
+    "fit_deactivate_outliers": (
+        "Unchecks all rows marked as OUTLIER (>3 sigma) and triggers a clean re-inversion.",
+        "",
+        "",
+    ),
+    "fit_recompute": (
+        "Recomputes the current fit domain using the active station inclusions and weights.",
+        "",
+        "",
+    ),
+    "fit_adopt": (
+        "Copies the inverted hypocenter (Location fits) or double-couple focal mechanism into the workspace Parameter Box.",
+        "",
+        "",
+    ),
+    "fit_export_csv": (
+        "Exports the current observation residual table to a CSV file.",
+        "",
+        "",
+    ),
+    "fit_export_png": (
+        "Saves the active diagnostic tab's primary plot (or beachball when displaying a focal mechanism) as a PNG image.",
+        "",
+        "",
+    ),
 }
 
 

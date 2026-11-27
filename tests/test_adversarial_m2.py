@@ -27,7 +27,10 @@ Tests:
 from __future__ import annotations
 
 import math
+import os
+import tempfile
 import unittest
+from unittest import mock
 import numpy as np
 
 from PyQt6.QtCore import Qt
@@ -60,6 +63,15 @@ class TestAdversarialMilestone2(unittest.TestCase):
     """Adversarial verification and stress harness for Milestone 2."""
 
     def setUp(self) -> None:
+        self._sess_dir = tempfile.TemporaryDirectory()
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {
+                "SHM_SESSION_PATH": os.path.join(self._sess_dir.name, "session.json"),
+                "SHM_NO_SESSION_PROMPT": "1",
+            },
+        )
+        self._env_patch.start()
         self.cfg = get_config()
         self.ttt = get_ttt_manager(self.cfg.inputs_dir)
 
@@ -76,6 +88,11 @@ class TestAdversarialMilestone2(unittest.TestCase):
         ]
         self.dt = 0.05
         self.n_samples = 400
+
+    def tearDown(self) -> None:
+        app.processEvents()
+        self._env_patch.stop()
+        self._sess_dir.cleanup()
 
     def _generate_synthetic_traces_and_picks(
         self, outlier_station: str | None = None, outlier_sec: float = 0.0
@@ -124,64 +141,68 @@ class TestAdversarialMilestone2(unittest.TestCase):
         traces = self._generate_synthetic_traces_and_picks(outlier_station="BUG", outlier_sec=15.0)
 
         win = MainWindow(autoload_example=False)
-        win.engine.traces = traces
-        win.engine.current_params.depth = self.true_depth
-        win.refresh_views()
+        try:
+            win.engine.traces = traces
+            win.engine.current_params.depth = self.true_depth
+            win.refresh_views()
 
-        # Open Fit Diagnostics Window -> triggers initial location
-        win.action_open_fit_diagnostic_window()
-        app.processEvents()
+            # Open Fit Diagnostics Window -> triggers initial location
+            win.action_open_fit_diagnostic_window()
+            app.processEvents()
 
-        # Verify initial location solution is affected by BUG outlier
-        p_initial = win.engine.current_params
-        self.assertTrue(p_initial.lat != 0.0 or p_initial.lon != 0.0)
-        rmse_initial = p_initial.rmse
-        self.assertIsNotNone(rmse_initial)
-        self.assertTrue(rmse_initial > 2.0, f"Expected high RMSE due to outlier, got {rmse_initial}")
+            # Verify initial location solution is affected by BUG outlier
+            p_initial = win.engine.current_params
+            self.assertTrue(p_initial.lat != 0.0 or p_initial.lon != 0.0)
+            rmse_initial = p_initial.rmse
+            self.assertIsNotNone(rmse_initial)
+            self.assertTrue(rmse_initial > 2.0, f"Expected high RMSE due to outlier, got {rmse_initial}")
 
-        # Note initial theoretical arrival on GRA1
-        gra1_tr = next(t for t in win.engine.traces if t.station == "GRA1")
-        initial_theo_p = gra1_tr.theo_picks.get("P")
-        self.assertIsNotNone(initial_theo_p)
+            # Note initial theoretical arrival on GRA1
+            gra1_tr = next(t for t in win.engine.traces if t.station == "GRA1")
+            initial_theo_p = gra1_tr.theo_picks.get("P")
+            self.assertIsNotNone(initial_theo_p)
 
-        # Locate BUG row in residual table
-        table = win.fit_dock.table_residuals
-        bug_row = -1
-        for r in range(table.rowCount()):
-            st_item = table.item(r, 1)
-            if st_item and st_item.text().upper() == "BUG":
-                bug_row = r
-                break
-        self.assertNotEqual(bug_row, -1, "BUG station row not found in residual table")
+            # Locate BUG row in residual table
+            table = win.fit_dock.table_residuals
+            bug_row = -1
+            for r in range(table.rowCount()):
+                st_item = table.item(r, 1)
+                if st_item and st_item.text().upper() == "BUG":
+                    bug_row = r
+                    break
+            self.assertNotEqual(bug_row, -1, "BUG station row not found in residual table")
 
-        # Verify BUG row has status OUTLIER
-        status_item = table.item(bug_row, 10)
-        self.assertIn("OUTLIER", status_item.text())
+            # Verify BUG row has status OUTLIER
+            status_item = table.item(bug_row, 10)
+            self.assertIn("OUTLIER", status_item.text())
 
-        # Uncheck BUG active checkbox in Column 0 -> triggers itemChanged -> _dispatch_recompute_request
-        chk_item = table.item(bug_row, 0)
-        self.assertEqual(chk_item.checkState(), Qt.CheckState.Checked)
+            # Uncheck BUG active checkbox in Column 0 -> triggers itemChanged -> _dispatch_recompute_request
+            chk_item = table.item(bug_row, 0)
+            self.assertEqual(chk_item.checkState(), Qt.CheckState.Checked)
 
-        chk_item.setCheckState(Qt.CheckState.Unchecked)
-        app.processEvents()
+            chk_item.setCheckState(Qt.CheckState.Unchecked)
+            app.processEvents()
 
-        # Verify that AnalysisParamSet was updated with new solution
-        p_refit = win.engine.current_params
-        self.assertIsNotNone(p_refit.rmse)
-        self.assertTrue(
-            p_refit.rmse < rmse_initial * 0.1,
-            f"Expected RMSE to drop significantly after excluding BUG: {rmse_initial} -> {p_refit.rmse}",
-        )
-        self.assertAlmostEqual(p_refit.lat, self.true_lat, delta=0.1)
-        self.assertAlmostEqual(p_refit.lon, self.true_lon, delta=0.1)
+            # Verify that AnalysisParamSet was updated with new solution
+            p_refit = win.engine.current_params
+            self.assertIsNotNone(p_refit.rmse)
+            self.assertTrue(
+                p_refit.rmse < rmse_initial * 0.1,
+                f"Expected RMSE to drop significantly after excluding BUG: {rmse_initial} -> {p_refit.rmse}",
+            )
+            self.assertAlmostEqual(p_refit.lat, self.true_lat, delta=0.1)
+            self.assertAlmostEqual(p_refit.lon, self.true_lon, delta=0.1)
 
-        # Verify theoretical arrivals on MainTraceCanvas refreshed
-        refreshed_theo_p = gra1_tr.theo_picks.get("P")
-        self.assertIsNotNone(refreshed_theo_p)
-        self.assertNotEqual(initial_theo_p, refreshed_theo_p)
+            # Verify theoretical arrivals on MainTraceCanvas refreshed
+            refreshed_theo_p = gra1_tr.theo_picks.get("P")
+            self.assertIsNotNone(refreshed_theo_p)
+            self.assertNotEqual(initial_theo_p, refreshed_theo_p)
 
-        # Verify canvas marks cache dirty on refresh
-        self.assertTrue(win.main_canvas._cache_dirty or win.main_canvas.isVisible() is False)
+            # Verify canvas marks cache dirty on refresh
+            self.assertTrue(win.main_canvas._cache_dirty or win.main_canvas.isVisible() is False)
+        finally:
+            win.close()
+            app.processEvents()
 
     def test_01b_checkbox_reinclusion_deadlock(self) -> None:
         """Adversarial reproducer: Re-checking an excluded station should re-include it.
@@ -194,39 +215,43 @@ class TestAdversarialMilestone2(unittest.TestCase):
         traces = self._generate_synthetic_traces_and_picks(outlier_station="BUG", outlier_sec=15.0)
 
         win = MainWindow(autoload_example=False)
-        win.engine.traces = traces
-        win.engine.current_params.depth = self.true_depth
-        win.refresh_views()
-        win.action_open_fit_diagnostic_window()
-        app.processEvents()
+        try:
+            win.engine.traces = traces
+            win.engine.current_params.depth = self.true_depth
+            win.refresh_views()
+            win.action_open_fit_diagnostic_window()
+            app.processEvents()
 
-        table = win.fit_dock.table_residuals
-        bug_row = -1
-        for r in range(table.rowCount()):
-            if table.item(r, 1).text().upper() == "BUG":
-                bug_row = r
-                break
+            table = win.fit_dock.table_residuals
+            bug_row = -1
+            for r in range(table.rowCount()):
+                if table.item(r, 1).text().upper() == "BUG":
+                    bug_row = r
+                    break
 
-        # Step 1: Uncheck BUG -> excludes BUG
-        table.item(bug_row, 0).setCheckState(Qt.CheckState.Unchecked)
-        app.processEvents()
-        p_refit_rmse = win.engine.current_params.rmse
+            # Step 1: Uncheck BUG -> excludes BUG
+            table.item(bug_row, 0).setCheckState(Qt.CheckState.Unchecked)
+            app.processEvents()
+            p_refit_rmse = win.engine.current_params.rmse
 
-        # Step 2: Attempt to re-include BUG by checking the box
-        table = win.fit_dock.table_residuals
-        bug_chk_item = table.item(bug_row, 0)
-        self.assertEqual(bug_chk_item.checkState(), Qt.CheckState.Unchecked)
+            # Step 2: Attempt to re-include BUG by checking the box
+            table = win.fit_dock.table_residuals
+            bug_chk_item = table.item(bug_row, 0)
+            self.assertEqual(bug_chk_item.checkState(), Qt.CheckState.Unchecked)
 
-        bug_chk_item.setCheckState(Qt.CheckState.Checked)
-        app.processEvents()
+            bug_chk_item.setCheckState(Qt.CheckState.Checked)
+            app.processEvents()
 
-        # Verification: BUG should be re-included and RMSE should increase back
-        p_restored = win.engine.current_params
-        self.assertGreater(
-            p_restored.rmse,
-            p_refit_rmse * 10.0,
-            "Re-checking station checkbox failed to re-include station in Geiger inversion",
-        )
+            # Verification: BUG should be re-included and RMSE should increase back
+            p_restored = win.engine.current_params
+            self.assertGreater(
+                p_restored.rmse,
+                p_refit_rmse * 10.0,
+                "Re-checking station checkbox failed to re-include station in Geiger inversion",
+            )
+        finally:
+            win.close()
+            app.processEvents()
 
     def test_02_rapid_tab_switching_empty_and_partial(self) -> None:
         """Adversarial stress-test: Rapid tab switching across all 6 tabs in FitDiagnosticWindow
@@ -235,89 +260,92 @@ class TestAdversarialMilestone2(unittest.TestCase):
         """
         bridge = FitDiagnosticBridge()
         win = FitDiagnosticWindow(bridge=bridge)
+        try:
+            # Phase A: Empty state (current_result = None) - rapid switching across all tabs
+            tab_sequence = [0, 1, 2, 3, 4, 5, 4, 2, 0, 3, 1, 5, 0, 1, 2, 3, 4, 5]
+            for _ in range(5):
+                for t_idx in tab_sequence:
+                    win.tabs.setCurrentIndex(t_idx)
+                    app.processEvents()
+            self.assertIsNone(win.current_result)
 
-        # Phase A: Empty state (current_result = None) - rapid switching across all tabs
-        tab_sequence = [0, 1, 2, 3, 4, 5, 4, 2, 0, 3, 1, 5, 0, 1, 2, 3, 4, 5]
-        for _ in range(5):
+            # Phase B: Partially populated state with missing / None fields
+            partial_res = FitDiagnosticResult(
+                fit_type=FitType.HYPOCENTER_GEIGER,
+                title="Partial Diagnostic",
+                converged=False,
+                iterations=0,
+                dof=0,
+                rmse=0.0,
+                wrmse=0.0,
+                chi2_reduced=0.0,
+                condition_number=1e12,
+                parameters={},
+                correlation_matrix=None,  # None correlation matrix
+                confidence_ellipse=None,  # None confidence ellipse
+                residuals=[],  # Empty residuals
+                outlier_count=0,
+                normality_p_value=0.0,
+                skewness=0.0,
+                kurtosis=0.0,
+            )
+            win.set_fit_result(partial_res)
+            app.processEvents()
+
+            # Rapid switching on partial result
+            for _ in range(5):
+                for t_idx in tab_sequence:
+                    win.tabs.setCurrentIndex(t_idx)
+                    app.processEvents()
+
+            self.assertEqual(win.table_params.rowCount(), 0)
+            self.assertEqual(win.table_residuals.rowCount(), 0)
+            self.assertIn("Inf", win.kpi_cond.lbl_value.text())
+
+            # Phase C: Extreme values (NaN, Inf, single entry)
+            extreme_res = FitDiagnosticResult(
+                fit_type=FitType.BRUNE_SPECTRUM,
+                title="Extreme Result",
+                converged=True,
+                iterations=99,
+                dof=1,
+                rmse=999.9,
+                wrmse=999.9,
+                chi2_reduced=99.9,
+                condition_number=999.9,
+                parameters={
+                    "omega_0": ParameterUncertainty("omega_0", 1e6, 1e4, (9e5, 1.1e6), "nm·s"),
+                },
+                correlation_matrix=np.array([[1.0]]),
+                residuals=[
+                    ResidualEntry(
+                        identifier="TEST.Z.P",
+                        observed=100.0,
+                        calculated=0.0,
+                        residual=100.0,
+                        weight=0.0,
+                        is_outlier=True,
+                    )
+                ],
+                outlier_count=1,
+            )
+            win.set_fit_result(extreme_res)
+            app.processEvents()
+
+            # Rapid switching on extreme result
             for t_idx in tab_sequence:
                 win.tabs.setCurrentIndex(t_idx)
                 app.processEvents()
-        self.assertIsNone(win.current_result)
 
-        # Phase B: Partially populated state with missing / None fields
-        partial_res = FitDiagnosticResult(
-            fit_type=FitType.HYPOCENTER_GEIGER,
-            title="Partial Diagnostic",
-            converged=False,
-            iterations=0,
-            dof=0,
-            rmse=0.0,
-            wrmse=0.0,
-            chi2_reduced=0.0,
-            condition_number=1e12,
-            parameters={},
-            correlation_matrix=None,  # None correlation matrix
-            confidence_ellipse=None,  # None confidence ellipse
-            residuals=[],  # Empty residuals
-            outlier_count=0,
-            normality_p_value=0.0,
-            skewness=0.0,
-            kurtosis=0.0,
-        )
-        win.set_fit_result(partial_res)
-        app.processEvents()
-
-        # Rapid switching on partial result
-        for _ in range(5):
-            for t_idx in tab_sequence:
-                win.tabs.setCurrentIndex(t_idx)
+            # Phase D: Rapid switching through all domain combobox entries
+            for dom_idx in range(win.domain_combo.count()):
+                win.domain_combo.setCurrentIndex(dom_idx)
                 app.processEvents()
-
-        self.assertEqual(win.table_params.rowCount(), 0)
-        self.assertEqual(win.table_residuals.rowCount(), 0)
-        self.assertIn("Inf", win.kpi_cond.lbl_value.text())
-
-        # Phase C: Extreme values (NaN, Inf, single entry)
-        extreme_res = FitDiagnosticResult(
-            fit_type=FitType.BRUNE_SPECTRUM,
-            title="Extreme Result",
-            converged=True,
-            iterations=99,
-            dof=1,
-            rmse=999.9,
-            wrmse=999.9,
-            chi2_reduced=99.9,
-            condition_number=999.9,
-            parameters={
-                "omega_0": ParameterUncertainty("omega_0", 1e6, 1e4, (9e5, 1.1e6), "nm·s"),
-            },
-            correlation_matrix=np.array([[1.0]]),
-            residuals=[
-                ResidualEntry(
-                    identifier="TEST.Z.P",
-                    observed=100.0,
-                    calculated=0.0,
-                    residual=100.0,
-                    weight=0.0,
-                    is_outlier=True,
-                )
-            ],
-            outlier_count=1,
-        )
-        win.set_fit_result(extreme_res)
-        app.processEvents()
-
-        # Rapid switching on extreme result
-        for t_idx in tab_sequence:
-            win.tabs.setCurrentIndex(t_idx)
+                # Must map cleanly to a valid tab index (0 <= idx < 6)
+                self.assertTrue(0 <= win.tabs.currentIndex() < 6)
+        finally:
+            win.close()
             app.processEvents()
-
-        # Phase D: Rapid switching through all 11 domain combobox entries
-        for dom_idx in range(win.domain_combo.count()):
-            win.domain_combo.setCurrentIndex(dom_idx)
-            app.processEvents()
-            # Must map cleanly to a valid tab index (0 <= idx < 6)
-            self.assertTrue(0 <= win.tabs.currentIndex() < 6)
 
     def test_03_closed_loop_outlier_exclusion_rmse_and_ellipse_shrink(self) -> None:
         """Adversarial closed-loop verification:
@@ -394,76 +422,89 @@ class TestAdversarialMilestone2(unittest.TestCase):
         # 4. Verify UI 'Deactivate Outliers' button performs same closed-loop workflow
         bridge = FitDiagnosticBridge()
         win = FitDiagnosticWindow(bridge=bridge)
-        win.set_fit_result(diag_with_outlier)
-        app.processEvents()
+        try:
+            win.set_fit_result(diag_with_outlier)
+            app.processEvents()
 
-        requests = []
-        bridge.recomputeFitRequested.connect(lambda req: requests.append(req))
+            requests = []
+            bridge.recomputeFitRequested.connect(lambda req: requests.append(req))
 
-        win.btn_deactivate_outliers.click()
-        app.processEvents()
+            win.btn_deactivate_outliers.click()
+            app.processEvents()
 
-        self.assertTrue(len(requests) >= 1)
-        last_req = requests[-1]
-        self.assertIn("BUG", last_req.excluded_identifiers)
-        self.assertEqual(last_req.weight_overrides.get("BUG"), 0.0)
+            self.assertTrue(len(requests) >= 1)
+            last_req = requests[-1]
+            self.assertIn("BUG", last_req.excluded_identifiers)
+            self.assertEqual(last_req.weight_overrides.get("BUG"), 0.0)
+        finally:
+            win.close()
+            app.processEvents()
 
     def test_04_adversarial_edge_cases_and_robustness(self) -> None:
         """Adversarial stress-test: Edge cases in table edits, exclusions, and UI buttons."""
         bridge = FitDiagnosticBridge()
         win = FitDiagnosticWindow(bridge=bridge)
+        try:
+            # Populate with standard result
+            traces = self._generate_synthetic_traces_and_picks()
+            picks = [tr.picks[0] for tr in traces]
+            _, _, diag_res = locate_network_geiger(picks, return_diagnostics=True)
+            win.set_fit_result(diag_res)
+            app.processEvents()
 
-        # Populate with standard result
-        traces = self._generate_synthetic_traces_and_picks()
-        picks = [tr.picks[0] for tr in traces]
-        _, _, diag_res = locate_network_geiger(picks, return_diagnostics=True)
-        win.set_fit_result(diag_res)
-        app.processEvents()
+            requests = []
+            bridge.recomputeFitRequested.connect(lambda req: requests.append(req))
 
-        requests = []
-        bridge.recomputeFitRequested.connect(lambda req: requests.append(req))
+            # A: Invalid non-numeric text / negative text in weight column ('not-a-number', '-2.5')
+            w_item = win.table_residuals.item(0, 7)
+            self.assertIsNotNone(w_item)
+            orig_w = w_item.text()
+            w_item.setText("not-a-number")
+            app.processEvents()
+            self.assertEqual(w_item.text(), orig_w)
+            self.assertEqual(len(requests), 0)
 
-        # A: Invalid non-numeric text in weight column ('invalid', '---', '-5.0')
-        w_item = win.table_residuals.item(0, 7)
-        self.assertIsNotNone(w_item)
-        w_item.setText("not-a-number")
-        app.processEvents()
-        self.assertTrue(len(requests) >= 1)
-        # Fallback to weight 1.0
-        self.assertEqual(requests[-1].weight_overrides.get(self.station_codes[0]), 1.0)
+            # Negative weight should also be rejected/reverted without spurious recompute
+            requests.clear()
+            w_item.setText("-2.5")
+            app.processEvents()
+            self.assertEqual(w_item.text(), orig_w)
+            self.assertEqual(len(requests), 0)
 
-        # Negative weight should deactivate station
-        requests.clear()
-        w_item.setText("-2.5")
-        app.processEvents()
-        self.assertTrue(len(requests) >= 1)
-        self.assertIn(self.station_codes[0], requests[-1].excluded_identifiers)
+            # Valid zero weight deactivates station cleanly
+            w_item.setText("0.00")
+            app.processEvents()
+            self.assertTrue(len(requests) >= 1)
+            self.assertIn(self.station_codes[0], requests[-1].excluded_identifiers)
 
-        # B: Exclude ALL stations in residual table -> should not crash locate_network_geiger
-        all_excluded_req = FitModificationRequest(
-            fit_type=FitType.HYPOCENTER_GEIGER,
-            excluded_identifiers=list(self.station_codes),
-        )
-        # Should gracefully fall back to valid picks without raising
-        p_fallback, _, diag_fallback = locate_network_geiger(
-            picks,
-            excluded_stations=all_excluded_req.excluded_identifiers,
-            return_diagnostics=True,
-        )
-        self.assertIsNotNone(p_fallback)
-        self.assertIsNotNone(diag_fallback)
+            # B: Exclude ALL stations in residual table -> should not crash locate_network_geiger
+            all_excluded_req = FitModificationRequest(
+                fit_type=FitType.HYPOCENTER_GEIGER,
+                excluded_identifiers=list(self.station_codes),
+            )
+            # Should gracefully fall back to valid picks without raising
+            p_fallback, _, diag_fallback = locate_network_geiger(
+                picks,
+                excluded_stations=all_excluded_req.excluded_identifiers,
+                return_diagnostics=True,
+            )
+            self.assertIsNotNone(p_fallback)
+            self.assertIsNotNone(diag_fallback)
 
-        # C: Click and double-click handlers with invalid row/col indices
-        win._on_table_row_clicked(-1, -1)
-        win._on_table_row_clicked(999, 999)
-        win._on_table_row_double_clicked(-1, -1)
-        win._on_table_row_double_clicked(999, 999)
+            # C: Click and double-click handlers with invalid row/col indices
+            win._on_table_row_clicked(-1, -1)
+            win._on_table_row_clicked(999, 999)
+            win._on_table_row_double_clicked(-1, -1)
+            win._on_table_row_double_clicked(999, 999)
 
-        # D: Adopt clicked with and without context_data
-        adopted = []
-        bridge.adoptParametersRequested.connect(lambda p: adopted.append(p))
-        win._on_adopt_clicked()  # context_data has lat/lon
-        self.assertTrue(len(adopted) >= 1)
+            # D: Adopt clicked with and without context_data
+            adopted = []
+            bridge.adoptParametersRequested.connect(lambda p: adopted.append(p))
+            win._on_adopt_clicked()  # context_data has lat/lon
+            self.assertTrue(len(adopted) >= 1)
+        finally:
+            win.close()
+            app.processEvents()
 
 
 if __name__ == "__main__":

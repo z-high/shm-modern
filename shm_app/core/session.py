@@ -6,6 +6,7 @@ Pure Python + NumPy + stdlib implementation (GUI-independent).
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -16,6 +17,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 import numpy as np
 
 from shm_app.core.models import AnalysisParamSet, PhasePick, Trace
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SESSION_FILENAME = ".shm_session.json"
 SESSION_SCHEMA_VERSION = 1
@@ -80,8 +83,12 @@ def _safe_str(val: Any, default: str = "") -> str:
 def resolve_session_path(path: Optional[Union[str, os.PathLike]] = None) -> Path:
     """Resolve a target file or directory path to a concrete `.shm_session.json` file."""
     if path is None:
-        return Path.cwd() / DEFAULT_SESSION_FILENAME
-    raw_str = os.fspath(path)
+        env_path = os.environ.get("SHM_SESSION_PATH", "").strip()
+        if not env_path:
+            return Path.cwd() / DEFAULT_SESSION_FILENAME
+        raw_str = env_path
+    else:
+        raw_str = os.fspath(path)
     p = Path(raw_str)
     if p.is_dir() or (isinstance(raw_str, str) and raw_str.endswith((os.sep, "/"))):
         return p / DEFAULT_SESSION_FILENAME
@@ -308,24 +315,40 @@ def serialize_trace(
     *,
     include_inline_waveforms: bool = True,
     force_inline_waveforms: bool = False,
+    store_inline: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Serialize Trace metadata, picks, filter state, and optional inline waveform fallback."""
     src_path = _safe_str(tr.source_path, "")
     has_disk_source = bool(src_path and os.path.isfile(src_path))
-    store_inline = bool(force_inline_waveforms or (include_inline_waveforms and not has_disk_source))
+    is_modified = bool(
+        (tr.filter_name and tr.filter_name != "NONE")
+        or tr.extra_headers.get("waveform_modified")
+    )
+    if store_inline is None:
+        store_inline_flag = bool(
+            force_inline_waveforms
+            or (include_inline_waveforms and (not has_disk_source or is_modified))
+        )
+    else:
+        store_inline_flag = bool(store_inline)
 
     inline_data: Optional[List[Optional[float]]] = None
-    if store_inline:
-        inline_data = [
-            float(x) if math.isfinite(float(x)) else 0.0
-            for x in np.asarray(tr.data, dtype=np.float64).tolist()
-        ]
+    if store_inline_flag:
+        arr = np.asarray(tr.data, dtype=np.float64)
+        if arr.size > 0 and not np.all(np.isfinite(arr)):
+            logger.warning(
+                "Trace %s.%s contains non-finite samples during session serialization; sanitizing to 0.0",
+                tr.station,
+                tr.channel3,
+            )
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        inline_data = arr.tolist()
 
     return _json_safe(
         {
             "source_path": src_path,
             "length": int(tr.length),
-            "has_inline_data": store_inline,
+            "has_inline_data": store_inline_flag,
             "data": inline_data,
             "delta": tr.delta,
             "station": tr.station,
@@ -402,9 +425,18 @@ def deserialize_trace(
     hist_raw = raw.get("filter_history")
     filter_history = [str(item) for item in hist_raw] if isinstance(hist_raw, list) else []
 
+    delta = _safe_float(raw.get("delta"), 0.05)
+    if delta <= 0.0:
+        logger.warning(
+            "Invalid non-positive delta=%r for trace %r; falling back to 0.05s",
+            raw.get("delta"),
+            raw.get("station"),
+        )
+        delta = 0.05
+
     return Trace(
         data=arr,
-        delta=_safe_float(raw.get("delta"), 0.05),
+        delta=delta,
         station=_safe_str(raw.get("station"), "STAT"),
         comp=_safe_str(raw.get("comp"), "Z"),
         chan1=_safe_str(raw.get("chan1"), "B"),
@@ -591,7 +623,7 @@ def atomic_write_json(path: Union[str, os.PathLike], payload: Dict[str, Any]) ->
             delete=False,
         ) as tmp_file:
             tmp_path = tmp_file.name
-            json.dump(safe_payload, tmp_file, indent=2, ensure_ascii=False, allow_nan=False)
+            json.dump(safe_payload, tmp_file, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
             tmp_file.flush()
             os.fsync(tmp_file.fileno())
         os.replace(tmp_path, str(target))

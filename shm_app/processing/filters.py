@@ -10,6 +10,7 @@ import math
 import os
 import re
 from typing import List, Optional, Sequence, Tuple, Union
+import warnings
 import numpy as np
 
 from shm_app.core.config_station import SHMConfig, get_config
@@ -252,8 +253,14 @@ def evaluate_stage_freq(stage: FilterStage, omega: np.ndarray) -> np.ndarray:
     elif stage.store_id == 2:
         freqs = omega / (2.0 * math.pi)
         tab_f = np.asarray(stage.freqs_hz, dtype=np.float64)
+        if tab_f.size == 0:
+            return np.zeros(omega.shape, dtype=np.complex128)
         tab_a = np.asarray(stage.amplitudes, dtype=np.float64)
-        tab_p = np.radians(np.asarray(stage.phases_deg, dtype=np.float64))
+        tab_p_raw = np.asarray(stage.phases_deg, dtype=np.float64)
+        order = np.argsort(tab_f)
+        tab_f = tab_f[order]
+        tab_a = tab_a[order]
+        tab_p = np.unwrap(np.radians(tab_p_raw[order]))
         amp_interp = np.interp(freqs, tab_f, tab_a, left=0.0, right=0.0)
         ph_interp = np.interp(freqs, tab_f, tab_p, left=0.0, right=0.0)
         return amp_interp * np.exp(1j * ph_interp)
@@ -293,8 +300,11 @@ def apply_fft_filter(
     stages: List[FilterStage],
     taper_frac: float = 0.05,
     demean_first: bool = True,
+    zero_phase: bool = False,
 ) -> np.ndarray:
     """Apply one or more FilterStages in the frequency domain matching fftfiltr.c."""
+    if not math.isfinite(dt) or dt <= 0.0:
+        raise ValueError(f"dt must be positive and finite, got {dt}")
     x = np.asarray(data, dtype=np.float64).copy()
     n = x.size
     if n == 0 or not stages:
@@ -323,8 +333,21 @@ def apply_fft_filter(
     for stg in stages:
         total_resp *= evaluate_stage_freq(stg, omega)
 
-    # Zero DC component if filter has a zero at s=0 or pole at s=0
-    total_resp[0] = 0.0
+    # Zero DC component only if a filter stage has a zero or pole at s=0 (or zero DC gain)
+    has_dc_zero_or_pole = any(
+        stg.store_id == 1
+        and (
+            any(abs(z) <= 1e-12 for z in stg.zeros)
+            or any(abs(p) <= 1e-12 for p in stg.poles)
+        )
+        for stg in stages
+    )
+    if has_dc_zero_or_pole or abs(total_resp[0]) < 1e-12:
+        total_resp[0] = 0.0
+
+    if zero_phase:
+        total_resp = np.abs(total_resp).astype(np.complex128)
+
     filtered_spec = spec * total_resp
     out = np.fft.irfft(filtered_spec, n=nfft)[:n]
     return out
@@ -515,7 +538,7 @@ def _apply_direct_iir_array(a: np.ndarray, b: np.ndarray, work: np.ndarray) -> n
             acc += a_list[i] * work_list[idx - i]
         for j in range(1, min(nb, idx + 1)):
             acc -= b_list[j] * y_list[idx - j]
-        if abs(acc) < 1e-30:
+        if abs(acc) < 1e-300:
             acc = 0.0
         y_list[idx] = acc
     y[:] = y_list
@@ -531,6 +554,8 @@ def apply_recursive_filter(
     zero_phase: bool = False,
 ) -> np.ndarray:
     """Apply cascade recursive IIR FilterStages in the time domain matching recfiltr.c."""
+    if not math.isfinite(dt) or dt <= 0.0:
+        raise ValueError(f"dt must be positive and finite, got {dt}")
     x = np.asarray(data, dtype=np.float64).copy()
     n = x.size
     if n == 0 or not stages:
@@ -541,7 +566,7 @@ def apply_recursive_filter(
 
     # Check if any stage is s-plane (store_id=1); if so, convert or apply via FFT
     if any(stg.store_id != 3 for stg in stages):
-        return apply_fft_filter(x, dt, stages, demean_first=False)
+        return apply_fft_filter(x, dt, stages, demean_first=False, zero_phase=zero_phase)
 
     if use_lpc and n > 40:
         pre = _burg_ar_predict_backward(x, order=min(20, n // 4), n_back=min(200, n))
@@ -665,7 +690,14 @@ def butterworth_sos(
     sections: List[List[float]] = []
 
     if ftype in ("LP", "LOWPASS"):
-        f1 = max(1e-4, min(float(freq_lo), 0.99 * nyq))
+        f_req = float(freq_lo)
+        if f_req > 0.99 * nyq:
+            warnings.warn(
+                f"Butterworth {ftype} corner frequency {f_req:.4g} Hz clamped below Nyquist ({nyq:.4g} Hz)",
+                UserWarning,
+                stacklevel=2,
+            )
+        f1 = max(1e-4, min(f_req, 0.99 * nyq))
         w1 = c * math.tan(math.pi * f1 * dt)
         w1_sq = w1 * w1
         if has_real:
@@ -688,7 +720,14 @@ def butterworth_sos(
             ])
 
     elif ftype in ("HP", "HIGHPASS"):
-        f1 = max(1e-4, min(float(freq_lo), 0.99 * nyq))
+        f_req = float(freq_lo)
+        if f_req > 0.99 * nyq:
+            warnings.warn(
+                f"Butterworth {ftype} corner frequency {f_req:.4g} Hz clamped below Nyquist ({nyq:.4g} Hz)",
+                UserWarning,
+                stacklevel=2,
+            )
+        f1 = max(1e-4, min(f_req, 0.99 * nyq))
         w1 = c * math.tan(math.pi * f1 * dt)
         w1_sq = w1 * w1
         c_sq = c * c
@@ -714,6 +753,12 @@ def butterworth_sos(
     elif ftype in ("BP", "BANDPASS"):
         f_lo_in = min(float(freq_lo), float(freq_hi))
         f_hi_in = max(float(freq_lo), float(freq_hi))
+        if f_lo_in > 0.985 * nyq or f_hi_in > 0.99 * nyq:
+            warnings.warn(
+                f"Butterworth {ftype} corner frequencies ({f_lo_in:.4g}, {f_hi_in:.4g}) Hz clamped below Nyquist ({nyq:.4g} Hz)",
+                UserWarning,
+                stacklevel=2,
+            )
         f1 = max(1e-4, min(f_lo_in, 0.985 * nyq))
         f2 = max(f1 + 1e-4, min(f_hi_in, 0.99 * nyq))
         w1 = c * math.tan(math.pi * f1 * dt)
@@ -753,6 +798,12 @@ def butterworth_sos(
     else:  # BS / BANDSTOP / BR
         f_lo_in = min(float(freq_lo), float(freq_hi))
         f_hi_in = max(float(freq_lo), float(freq_hi))
+        if f_lo_in > 0.985 * nyq or f_hi_in > 0.99 * nyq:
+            warnings.warn(
+                f"Butterworth {ftype} corner frequencies ({f_lo_in:.4g}, {f_hi_in:.4g}) Hz clamped below Nyquist ({nyq:.4g} Hz)",
+                UserWarning,
+                stacklevel=2,
+            )
         f1 = max(1e-4, min(f_lo_in, 0.985 * nyq))
         f2 = max(f1 + 1e-4, min(f_hi_in, 0.99 * nyq))
         w1 = c * math.tan(math.pi * f1 * dt)
@@ -1266,7 +1317,9 @@ def filter_trace(
             tr.data, tr.delta, stages, use_lpc=use_lpc, zero_phase=zero_phase
         )
     else:
-        out_tr.data = apply_fft_filter(tr.data, tr.delta, stages, taper_frac=taper_frac)
+        out_tr.data = apply_fft_filter(
+            tr.data, tr.delta, stages, taper_frac=taper_frac, zero_phase=zero_phase
+        )
     out_tr.filter_name = filter_expr.strip()
     if autocut:
         autocut_trace(out_tr, stages=stages, zero_phase=zero_phase, in_place=True)

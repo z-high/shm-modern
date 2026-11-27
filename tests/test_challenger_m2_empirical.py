@@ -308,9 +308,13 @@ class TestChallengerParameterUncertaintyUnits(unittest.TestCase):
         self.assertAlmostEqual(lon_unc.standard_error, expected_lon_se, places=7)
 
         # 4. Consistency with AnalysisParamSet d_lat / d_lon in km:
-        # param.d_lat is in km = lat_se * DEG_TO_KM
+        # param.d_lat is in km = lat_se * DEG_TO_KM; param.d_lon is in km = lon_se * DEG_TO_KM * cos(lat)
         self.assertAlmostEqual(lat_unc.standard_error * DEG_TO_KM, param.d_lat, places=2)
-        self.assertAlmostEqual(lon_unc.standard_error * DEG_TO_KM, param.d_lon, places=2)
+        self.assertAlmostEqual(
+            lon_unc.standard_error * DEG_TO_KM * math.cos(math.radians(param.lat)),
+            param.d_lon,
+            places=2,
+        )
 
         # 5. 95% confidence interval sanity check
         self.assertAlmostEqual(

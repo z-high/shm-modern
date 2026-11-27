@@ -35,6 +35,9 @@ class FitDiagnosticBridge(QObject):
     # Dispatched when user adopts solution parameters into parameter box / workspace
     adoptParametersRequested = pyqtSignal(object)  # AnalysisParamSet
 
+    # Dispatched when user adopts a focal mechanism solution without overwriting hypocenter
+    adoptFocalMechanismRequested = pyqtSignal(object)  # dict focal mechanism payload
+
     # Dispatched to zoom waveform magnifier canvas to a specific station phase
     zoomToPhaseRequested = pyqtSignal(str, str)  # (station, phase_name)
 

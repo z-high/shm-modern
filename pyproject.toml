@@ -1,18 +1,30 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "shm-modern"
-version = "3.0.0"
+version = "3.1.0"
 description = "Modern Python/PyQt6 rewrite of SeismicHandler Motif (SHM) & Command Interpreter (SHC)"
 readme = "README.md"
 license = "GPL-3.0-or-later"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
 dependencies = [
     "PyQt6>=6.4.0",
     "numpy>=1.23.0",
     "matplotlib>=3.6.0",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Physics",
 ]
 keywords = [
     "seismology",

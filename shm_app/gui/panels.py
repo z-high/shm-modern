@@ -98,10 +98,10 @@ class PhaseDialogPanel(QWidget):
         form.addRow("First Motion:", self.sign_combo)
 
         self.qual_spin = QSpinBox()
-        self.qual_spin.setRange(0, 10)
+        self.qual_spin.setRange(0, 9)
         self.qual_spin.setValue(4)
         self.qual_spin.valueChanged.connect(self._on_quality_changed)
-        form.addRow("Quality (0-10):", self.qual_spin)
+        form.addRow("Quality (0-9):", self.qual_spin)
 
         self.weight_label = QLabel("2")
         form.addRow("SHM Weight:", self.weight_label)
@@ -134,8 +134,12 @@ class PhaseDialogPanel(QWidget):
         apply_c_locale(self)
 
     def set_phase_name(self, name: str) -> None:
-        self.active_phase = name
+        cleaned = name.strip()
+        if cleaned:
+            self.active_phase = cleaned
+        self.phase_edit.blockSignals(True)
         self.phase_edit.setText(name)
+        self.phase_edit.blockSignals(False)
         self.phaseConfigChanged.emit()
 
     def _on_phase_text_changed(self, txt: str) -> None:
@@ -264,7 +268,8 @@ class ParameterBoxPanel(QWidget):
         self.region_lbl.setWordWrap(True)
         form.addRow("F-E Region:", self.region_lbl)
 
-        self.mags_lbl = QLabel("ML: 0.0  mb: 0.0  MS: 0.0")
+        self.mags_lbl = QLabel("ML: 0.00  mb: 0.00  mB: 0.00\nMS: 0.00  Mw: 0.00")
+        self.mags_lbl.setWordWrap(True)
         form.addRow("Magnitudes:", self.mags_lbl)
 
         self.evtype_combo = QComboBox()
@@ -366,7 +371,10 @@ class ParameterBoxPanel(QWidget):
             self.lon_spin.setValue(p.lon)
             reg_txt = f"[{p.region_id}] {p.region_name}" if p.region_name else "-"
             self.region_lbl.setText(reg_txt)
-            self.mags_lbl.setText(f"ML:{p.mag_ml:.2f} mb:{p.mag_mb:.2f} MS:{p.mag_ms:.2f}")
+            self.mags_lbl.setText(
+                f"ML:{p.mag_ml:.2f}  mb:{p.mag_mb:.2f}  mB:{p.mag_mbb:.2f}\n"
+                f"MS:{p.mag_ms:.2f}  Mw:{p.mag_mw:.2f}"
+            )
             ev_code = normalize_shm_event_type(p.event_type, dist_deg=p.distance)
             ev_codes = [c for c, _ in SHM_EVENT_TYPES]
             ev_idx = ev_codes.index(ev_code) if ev_code in ev_codes else 0

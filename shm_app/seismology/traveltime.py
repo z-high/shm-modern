@@ -1,17 +1,21 @@
 """Travel-time table (.TTT) loader, 2D (distance, depth) interpolator, slowness calculator,
-slowness/differential-time distance inversion, depth-phase solver, .VEL model loader,
-and spherical trigonometry matching ptusrdef.c and earthloc.c.
+slowness/differential-time distance inversion, and depth-phase solver matching ptusrdef.c.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import math
 import os
 from typing import Dict, List, Optional, Tuple
+import warnings
 import numpy as np
 
 from shm_app import SHM_DEFAULT_ROOT
+from shm_app.seismology.geodesy import sphere_add, sphere_diff
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -76,7 +80,10 @@ class TravelTimeTable:
 
     def slowness(self, dist_deg: float, depth_km: float) -> Optional[float]:
         """Compute horizontal slowness p = dT / dDelta (sec/deg) matching pt_slowness."""
-        step = 0.5
+        span = float(self.max_dist) - float(self.min_dist)
+        if span <= 0.0:
+            return None
+        step = min(0.5, 0.25 * span)
         d_lo = max(self.min_dist, dist_deg - step)
         d_hi = min(self.max_dist, dist_deg + step)
         if d_hi <= d_lo:
@@ -144,14 +151,27 @@ def parse_ttt_file(filepath: str, phase_name: Optional[str] = None) -> TravelTim
             except ValueError:
                 pass
 
+    if len(tokens) < 3:
+        raise ValueError(f"Truncated .TTT header metadata in {filepath}")
+
     min_dist = tokens[0]
     max_dist = tokens[1]
+    if not (math.isfinite(min_dist) and math.isfinite(max_dist) and math.isfinite(tokens[2])):
+        raise ValueError(f"Non-finite .TTT header values in {filepath}")
     n_depths = int(round(tokens[2]))
+    if n_depths <= 0:
+        raise ValueError(f"Invalid depth count ({n_depths}) in .TTT file {filepath}")
+    if len(tokens) < 3 + n_depths:
+        raise ValueError(
+            f"Truncated depth header in {filepath}: expected {n_depths} depths, got {len(tokens) - 3}"
+        )
     depths = np.array(tokens[3 : 3 + n_depths], dtype=np.float64)
 
     rem = tokens[3 + n_depths :]
     row_size = 1 + n_depths
     n_rows = len(rem) // row_size
+    if n_rows <= 0:
+        raise ValueError(f"No travel-time rows found in .TTT file {filepath}")
     arr = np.array(rem[: n_rows * row_size], dtype=np.float64).reshape(n_rows, row_size)
     distances = arr[:, 0]
     times = arr[:, 1:]
@@ -224,7 +244,10 @@ class TravelTimeManager:
                 tbl = parse_ttt_file(fpath, phase_name=phase)
                 self._cache[phase] = tbl
                 return tbl
-            except Exception:
+            except Exception as exc:
+                msg = f"Failed to parse travel-time table {fpath} for phase {phase!r}: {exc}"
+                logger.warning(msg)
+                warnings.warn(msg, RuntimeWarning, stacklevel=2)
                 return None
         return None
 
@@ -236,21 +259,35 @@ class TravelTimeManager:
             t = tbl.travel_time(dist_deg, depth_km)
             if t is not None:
                 return t
-        # Analytic regional/local fallback for Pg, Sg, Pn, Sn, Lg
+        p_up = phase.strip()
+        if p_up == "P" and dist_deg > 98.0:
+            pdiff_tbl = self.get_table("Pdiff")
+            if pdiff_tbl is not None:
+                t_diff = pdiff_tbl.travel_time(dist_deg, depth_km)
+                if t_diff is not None:
+                    return t_diff
+            return None
+        if p_up == "S" and dist_deg > 98.0:
+            sdiff_tbl = self.get_table("Sdiff")
+            if sdiff_tbl is not None:
+                t_diff = sdiff_tbl.travel_time(dist_deg, depth_km)
+                if t_diff is not None:
+                    return t_diff
+            return None
+        # Analytic regional/local fallback for Pg, Sg, Pn, Sn, Lg (strictly local/regional distances)
         dist_km = dist_deg * 111.1949266
         hypo_km = math.hypot(dist_km, max(0.0, depth_km))
-        p_up = phase.strip()
-        if p_up in ("Pg", "P"):
+        if p_up in ("Pg", "P") and dist_deg <= 20.0:
             return hypo_km / 5.85
-        if p_up in ("Sg", "S"):
+        if p_up in ("Sg", "S") and dist_deg <= 20.0:
             return hypo_km / 3.46
         if p_up == "Pn" and dist_deg <= 20.0:
             return 6.8 + dist_km / 8.04
         if p_up == "Sn" and dist_deg <= 20.0:
             return 11.5 + dist_km / 4.48
-        if p_up == "Lg":
+        if p_up == "Lg" and dist_deg <= 30.0:
             return hypo_km / 3.50
-        if p_up == "Rg":
+        if p_up == "Rg" and dist_deg <= 30.0:
             return dist_km / 3.05
         return None
 
@@ -278,7 +315,16 @@ class TravelTimeManager:
         if tbl is None:
             return None
 
-        dists = np.linspace(tbl.min_dist + 0.5, tbl.max_dist - 0.5, 360)
+        span = float(tbl.max_dist) - float(tbl.min_dist)
+        if span <= 0.0:
+            return float(tbl.min_dist) if tbl.distances.size > 0 else None
+        margin = min(0.5, 0.1 * span)
+        d_lo = float(tbl.min_dist) + margin
+        d_hi = float(tbl.max_dist) - margin
+        if d_hi <= d_lo:
+            d_lo, d_hi = float(tbl.min_dist), float(tbl.max_dist)
+
+        dists = np.linspace(d_lo, d_hi, 360)
         slows: List[Tuple[float, float]] = []
         for d in dists:
             s = tbl.slowness(float(d), depth_km)
@@ -379,96 +425,6 @@ class TravelTimeManager:
             if tt is not None and tt > 0:
                 out[ph] = origin_epoch + tt
         return out
-
-
-def sphere_add(lat_deg: float, lon_deg: float, dist_deg: float, azim_deg: float) -> Tuple[float, float]:
-    """Compute target (elat, elon) from starting (slat, slon), angular distance dist_deg,
-    and azimuth azim_deg matching mb_sphereadd in earthloc.c.
-    """
-    slat = 90.0 - float(lat_deg)
-    slon = float(lon_deg)
-    if slon < 0.0:
-        slon += 360.0
-
-    bazim = float(azim_deg) % 360.0
-    invert = bazim > 180.0
-    if invert:
-        bazim = 360.0 - bazim
-
-    slat_r = math.radians(slat)
-    dist_r = math.radians(float(dist_deg))
-    bazim_r = math.radians(bazim)
-
-    arg = math.cos(dist_r) * math.cos(slat_r) + math.sin(dist_r) * math.sin(slat_r) * math.cos(bazim_r)
-    arg = max(-1.0, min(1.0, arg))
-    elat_r = math.acos(arg)
-
-    denom = math.sin(elat_r) * math.sin(slat_r)
-    if abs(denom) < 1e-12:
-        gamma_r = 0.0
-    else:
-        arg2 = (math.cos(dist_r) - math.cos(elat_r) * math.cos(slat_r)) / denom
-        arg2 = max(-1.0, min(1.0, arg2))
-        gamma_r = math.acos(arg2)
-
-    elat = math.degrees(elat_r)
-    gamma = math.degrees(gamma_r)
-    if invert:
-        gamma = 360.0 - gamma
-    elon = slon + gamma
-    if elon > 360.0:
-        elon -= 360.0
-
-    elat = 90.0 - elat
-    if elon > 180.0:
-        elon -= 360.0
-    return elat, elon
-
-
-def sphere_diff(lat1_deg: float, lon1_deg: float, lat2_deg: float, lon2_deg: float) -> Tuple[float, float, float]:
-    """Compute (distance_deg, azim_1_to_2_deg, backazim_2_to_1_deg) between two geographic coordinates
-    matching mb_spherediff in earthloc.c.
-    """
-    def _one_way(s_lat: float, s_lon: float, e_lat: float, e_lon: float) -> Tuple[float, float]:
-        slat = 90.0 - float(s_lat)
-        elat = 90.0 - float(e_lat)
-        slon = float(s_lon) + 360.0 if s_lon < 0.0 else float(s_lon)
-        elon = float(e_lon) + 360.0 if e_lon < 0.0 else float(e_lon)
-
-        gamma = elon - slon
-        if gamma < 0.0:
-            gamma += 360.0
-        invert = gamma > 180.0
-        if invert:
-            gamma = 360.0 - gamma
-
-        slat_r = math.radians(slat)
-        elat_r = math.radians(elat)
-        gamma_r = math.radians(gamma)
-
-        arg = math.cos(elat_r) * math.cos(slat_r) + math.sin(elat_r) * math.sin(slat_r) * math.cos(gamma_r)
-        arg = max(-1.0, min(1.0, arg))
-        dist_r = math.acos(arg)
-        if dist_r < 1e-9:
-            return 0.0, 0.0
-
-        denom = math.sin(slat_r) * math.sin(dist_r)
-        if abs(denom) < 1e-12:
-            baz_r = 0.0
-        else:
-            arg2 = (math.cos(elat_r) - math.cos(slat_r) * math.cos(dist_r)) / denom
-            arg2 = max(-1.0, min(1.0, arg2))
-            baz_r = math.acos(arg2)
-
-        dist_deg = math.degrees(dist_r)
-        baz_deg = math.degrees(baz_r)
-        if invert:
-            baz_deg = 360.0 - baz_deg
-        return dist_deg, baz_deg % 360.0
-
-    dist_12, az_12 = _one_way(lat1_deg, lon1_deg, lat2_deg, lon2_deg)
-    _, az_21 = _one_way(lat2_deg, lon2_deg, lat1_deg, lon1_deg)
-    return dist_12, az_12, az_21
 
 
 DEFAULT_TTT: Optional[TravelTimeManager] = None

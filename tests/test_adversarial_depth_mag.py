@@ -210,15 +210,15 @@ class TestAdversarialDepthPhase(unittest.TestCase):
 
         tr = Trace(data=np.zeros(50), station="GRA1", distance=dist, start_epoch=t0)
         tr.add_or_replace_pick(PhasePick(name="P", onset=format_sh_time(t0), station="GRA1"))
-        # High quality pP (quality=5 -> depth 50)
-        tr.add_or_replace_pick(PhasePick(name="pP", onset=format_sh_time(t0 + dt_pp), station="GRA1", quality=5))
-        # Low quality sP (quality=0 -> depth 120)
-        tr.add_or_replace_pick(PhasePick(name="sP", onset=format_sh_time(t0 + dt_sp), station="GRA1", quality=0))
+        # High quality pP (SHM quality=1 -> weight=9, depth 50)
+        tr.add_or_replace_pick(PhasePick(name="pP", onset=format_sh_time(t0 + dt_pp), station="GRA1", quality=1))
+        # Low quality sP (SHM quality=8 -> weight=0 -> floor 0.1, depth 120)
+        tr.add_or_replace_pick(PhasePick(name="sP", onset=format_sh_time(t0 + dt_sp), station="GRA1", quality=8))
 
         res = fit_depth_phase([tr], dist, ttt=self.ttt, config=self.cfg)
         self.assertIsNotNone(res)
         self.assertEqual(res["count"], 2)
-        # Quality 5 weight vs Quality 0 weight (>20x ratio)
+        # SHM Quality 1 (weight=9) vs Quality 8 (weight=0 -> 0.1 floor) (>20x ratio)
         w_pp = res["details"][0]["weight"]
         w_sp = res["details"][1]["weight"]
         self.assertGreater(w_pp, w_sp * 20)

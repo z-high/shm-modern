@@ -591,8 +591,14 @@ class BGRFetchDialog(QDialog):
             return
         try:
             self.set_start_time(self._origin_str)
-        except Exception:
-            pass
+        except Exception as exc:
+            self.status_label.setText(f"Invalid origin timestamp '{self._origin_str}': {exc}")
+            self.status_label.setStyleSheet("color: #f85149; font-weight: bold;")
+            QMessageBox.warning(
+                self,
+                "Invalid Origin Timestamp",
+                f"Could not parse event origin timestamp '{self._origin_str}':\n{exc}",
+            )
 
     def _prompt_paste_time(self) -> None:
         current = format_sh_time(self.start_epoch())
@@ -677,10 +683,35 @@ class BGRFetchDialog(QDialog):
         start_epoch = self.start_epoch()
 
         duration = float(self.dur_spin.value())
-        out_dir = self.out_dir_edit.text().strip() or DEFAULT_DOWNLOAD_DIR
+        out_dir = os.path.abspath(os.path.expanduser(self.out_dir_edit.text().strip() or DEFAULT_DOWNLOAD_DIR))
         network = self.network_combo.currentText().strip().upper() or "GR"
         location = self.location_combo.currentText().strip() or "*"
         base_url = self.url_edit.text().strip() or BGR_FDSN_DATASELECT_URL
+
+        import urllib.parse
+
+        parsed_url = urllib.parse.urlparse(base_url)
+        if parsed_url.scheme.lower() not in ("http", "https") or not parsed_url.netloc:
+            QMessageBox.warning(
+                self,
+                "BGR Download",
+                f"Invalid FDSN dataselect URL (must start with http:// or https://):\n{base_url}",
+            )
+            return
+
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            probe_path = os.path.join(out_dir, f".shm_write_test_{os.getpid()}")
+            with open(probe_path, "wb") as fp:
+                fp.write(b"")
+            os.remove(probe_path)
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                "BGR Download",
+                f"Output directory is not writable:\n{out_dir}\n\n{exc}",
+            )
+            return
 
         self.btn_toggle_log.setChecked(True)
         self.log_box.setVisible(True)
@@ -691,6 +722,7 @@ class BGRFetchDialog(QDialog):
         )
         self.progress_bar.setRange(0, len(stations))
         self.progress_bar.setValue(0)
+        self.status_label.setStyleSheet("")
         self.status_label.setText(f"Downloading 0 / {len(stations)} stations from BGR...")
         self.btn_download.setEnabled(False)
         self.btn_cancel.setEnabled(True)

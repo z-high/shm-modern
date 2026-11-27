@@ -13,18 +13,42 @@ from shm_app.seismology.traveltime import sphere_add
 KM_PER_DEG = 111.1949266
 
 
+def _json_safe(obj: Any) -> Any:
+    """Recursively convert values into strict RFC-8259 JSON-safe primitives (no NaN/Inf)."""
+    if obj is None or isinstance(obj, (bool, str)):
+        return obj
+    if isinstance(obj, int):
+        return obj
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if type(obj).__module__ == "numpy":
+        if hasattr(obj, "tolist"):
+            return _json_safe(obj.tolist())
+        try:
+            val = float(obj)
+            return val if math.isfinite(val) else None
+        except (TypeError, ValueError):
+            return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(x) for x in obj]
+    return str(obj)
+
+
 def _resolve_ellipse(params: AnalysisParamSet) -> Optional[Tuple[float, float, float]]:
-    """Return (semi_major_km, semi_minor_km, strike_deg) if available and positive."""
+    """Return (semi_major_km, semi_minor_km, strike_deg) if available, finite, and positive."""
     err_ell = getattr(params, "error_ellipse", None)
     if err_ell is not None and len(err_ell) == 3:
         a_km, b_km, strike_deg = float(err_ell[0]), float(err_ell[1]), float(err_ell[2])
-        if b_km > a_km:
-            a_km, b_km = b_km, a_km
-        if a_km > 0.0 and b_km > 0.0:
-            return a_km, b_km, strike_deg % 180.0
+        if all(math.isfinite(v) for v in (a_km, b_km, strike_deg)):
+            if b_km > a_km:
+                a_km, b_km = b_km, a_km
+            if a_km > 0.0 and b_km > 0.0:
+                return a_km, b_km, strike_deg % 180.0
     d_lat = float(getattr(params, "d_lat", 0.0) or 0.0)
     d_lon = float(getattr(params, "d_lon", 0.0) or 0.0)
-    if d_lat > 0.0 and d_lon > 0.0:
+    if math.isfinite(d_lat) and math.isfinite(d_lon) and d_lat > 0.0 and d_lon > 0.0:
         if d_lat >= d_lon:
             return d_lat, d_lon, 0.0
         return d_lon, d_lat, 90.0
@@ -121,7 +145,12 @@ def export_geojson(
     )
 
     # 2. 95% Confidence Ellipse Polygon Feature
-    if include_ellipse and ellipse_tuple is not None:
+    if (
+        include_ellipse
+        and ellipse_tuple is not None
+        and math.isfinite(float(params.lat))
+        and math.isfinite(float(params.lon))
+    ):
         a_km, b_km, strike_deg = ellipse_tuple
         ring = _build_confidence_ellipse_ring(params.lat, params.lon, a_km, b_km, strike_deg)
         features.append(
@@ -219,10 +248,12 @@ def export_geojson(
                 }
             )
 
-    return {
-        "type": "FeatureCollection",
-        "features": features,
-    }
+    return _json_safe(
+        {
+            "type": "FeatureCollection",
+            "features": features,
+        }
+    )
 
 
 def write_geojson(
@@ -236,15 +267,17 @@ def write_geojson(
 ) -> None:
     """Write RFC 7946 GeoJSON FeatureCollection to disk."""
     os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
-    payload = export_geojson(
-        traces=traces,
-        params=params,
-        include_stations=include_stations,
-        include_ellipse=include_ellipse,
-        focal_mechanism=focal_mechanism,
+    payload = _json_safe(
+        export_geojson(
+            traces=traces,
+            params=params,
+            include_stations=include_stations,
+            include_ellipse=include_ellipse,
+            focal_mechanism=focal_mechanism,
+        )
     )
     with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=indent)
+        json.dump(payload, f, indent=indent, allow_nan=False)
 
 
 def parse_geojson(data_or_path: Union[str, Dict[str, Any]]) -> Dict[str, Any]:

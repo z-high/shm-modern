@@ -195,8 +195,8 @@ def render_header_and_metadata(
     origin_str = params.origin or (
         traces[0].start_time_str if traces else "N/A"
     )
-    lat_str = f"{params.lat:+.4f}° (±{params.d_lat:.3f}°)" if (params.lat or params.d_lat) else f"{params.lat:+.4f}°"
-    lon_str = f"{params.lon:+.4f}° (±{params.d_lon:.3f}°)" if (params.lon or params.d_lon) else f"{params.lon:+.4f}°"
+    lat_str = f"{params.lat:+.4f}° (±{params.d_lat:.2f} km)" if params.d_lat else f"{params.lat:+.4f}°"
+    lon_str = f"{params.lon:+.4f}° (±{params.d_lon:.2f} km)" if params.d_lon else f"{params.lon:+.4f}°"
     depth_str = f"{params.depth:.1f} km (±{params.d_depth:.1f})" if params.d_depth else f"{params.depth:.1f} km"
 
     mags = []
@@ -450,7 +450,11 @@ def render_beachball(
             if len(item) < 3:
                 continue
             p_az, p_ih, p_pol = float(item[0]), float(item[1]), int(item[2])
-            r_p = math.sqrt(2.0) * math.sin(math.radians(max(0.0, min(90.0, p_ih))) / 2.0)
+            if p_ih > 90.0:
+                p_az = (p_az + 180.0) % 360.0
+                p_ih = 180.0 - p_ih
+            p_ih = max(0.0, min(90.0, p_ih))
+            r_p = math.sqrt(2.0) * math.sin(math.radians(p_ih) / 2.0)
             px = r_p * math.sin(math.radians(p_az))
             py = r_p * math.cos(math.radians(p_az))
             if p_pol > 0:
@@ -522,11 +526,12 @@ def render_waveform_panels(
             sig = pk.sigma_t(tr.delta)
             ph_up = (pk.name or "").upper()
             pcol = "#dc2626" if ph_up.startswith("P") else ("#2563eb" if ph_up.startswith("S") else "#059669")
+            y_span = float(n_tr) + 0.2
             ax.axvspan(
                 t_rel - sig,
                 t_rel + sig,
-                ymin=(y_base + 0.12) / max(1.0, float(n_tr)),
-                ymax=(y_base + 0.88) / max(1.0, float(n_tr)),
+                ymin=(y_base - 0.38 - (-0.6)) / y_span,
+                ymax=(y_base + 0.38 - (-0.6)) / y_span,
                 color=pcol,
                 alpha=0.14,
                 zorder=1,

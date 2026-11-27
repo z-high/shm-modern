@@ -204,7 +204,7 @@ def export_quakeml(
             pick_records.append((pick_id, tr, pk))
 
     # Build <origin>
-    origin_el = _bed(ev_params_el if False else event_el, "origin", publicID=origin_id)
+    origin_el = _bed(event_el, "origin", publicID=origin_id)
     fallback_origin_ep = traces[0].torig if traces and traces[0].torig > 0 else None
     _bed(_bed(origin_el, "time"), "value", _sh_or_iso_to_iso(params.origin, fallback_origin_ep))
 
@@ -229,7 +229,8 @@ def export_quakeml(
     if not stations_used and traces:
         stations_used = {tr.station.upper() for tr in traces if tr.station}
     dists = [float(tr.distance) for _, tr, _ in pick_records if tr.distance > 0.0]
-    azims = sorted([float(tr.azimuth) % 360.0 for _, tr, _ in pick_records if tr.azimuth != 0.0])
+    has_geometry = any(tr.azimuth != 0.0 or tr.distance > 0.0 for _, tr, _ in pick_records)
+    azims = sorted([float(tr.azimuth) % 360.0 for _, tr, _ in pick_records]) if has_geometry else []
     az_gap = 0.0
     if len(azims) >= 2:
         gaps = [azims[i + 1] - azims[i] for i in range(len(azims) - 1)]
@@ -291,7 +292,7 @@ def export_quakeml(
         arr_el = _bed(origin_el, "arrival", publicID=f"{prefix}/arrival/{ev_uid}/{idx}")
         _bed(arr_el, "pickID", pick_id)
         _bed(arr_el, "phase", pk.name or "P")
-        az_val = tr.azimuth if tr.azimuth != 0.0 else pk.beam_azim
+        az_val = tr.azimuth if (tr.azimuth != 0.0 or tr.distance > 0.0) else pk.beam_azim
         _bed(arr_el, "azimuth", f"{float(az_val):.4f}")
         _bed(arr_el, "distance", f"{float(tr.distance):.4f}")
         _bed(arr_el, "timeResidual", f"{float(pk.resid):.4f}")
@@ -643,6 +644,18 @@ def parse_quakeml(xml_text_or_path: str) -> Dict[str, Any]:
                 b_km = float(ou["minHorizontalUncertainty"]) / scale
                 az = float(ou.get("azimuthMaxHorizontalUncertainty", 0.0))
                 params.error_ellipse = (a_km, b_km, az)
+            elif isinstance(ou.get("confidenceEllipsoid"), dict):
+                ce = ou["confidenceEllipsoid"]
+                scale = 1000.0 if is_v12 else 1.0
+                a_val = ce.get("semiMajorAxisLength")
+                b_val = ce.get("semiMinorAxisLength")
+                if a_val is not None and b_val is not None and (float(a_val) > 0.0 or float(b_val) > 0.0):
+                    a_km = float(a_val) / scale
+                    b_km = float(b_val) / scale
+                    if b_km > a_km:
+                        a_km, b_km = b_km, a_km
+                    az = float(ce.get("majorAxisAzimuth") or 0.0)
+                    params.error_ellipse = (a_km, b_km, az)
 
         for mag in primary_ev.get("magnitudes", []):
             mtype = (mag.get("type") or "").strip().lower()

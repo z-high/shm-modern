@@ -24,6 +24,7 @@ import numpy as np
 def compute_rmse(residuals: Union[np.ndarray, Sequence[float]]) -> float:
     """Compute Root Mean Square Error: sqrt( (1/N) * sum(r_i^2) )."""
     arr = np.asarray(residuals, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
     if arr.size == 0:
         return 0.0
     return float(np.sqrt(np.mean(arr ** 2)))
@@ -40,15 +41,21 @@ def compute_wrmse(
         return 0.0
     if r.shape != w.shape:
         raise ValueError(f"Shape mismatch: residuals {r.shape} vs weights {w.shape}")
-    sum_w = float(np.sum(w))
+    valid = np.isfinite(r) & np.isfinite(w) & (w >= 0.0)
+    r_v = r[valid]
+    w_v = w[valid]
+    if r_v.size == 0:
+        return 0.0
+    sum_w = float(np.sum(w_v))
     if sum_w <= 0.0:
-        return compute_rmse(r)
-    return float(np.sqrt(np.sum(w * (r ** 2)) / sum_w))
+        return compute_rmse(r_v)
+    return float(np.sqrt(np.sum(w_v * (r_v ** 2)) / sum_w))
 
 
 def compute_mad(residuals: Union[np.ndarray, Sequence[float]]) -> float:
     """Compute Median Absolute Deviation: median( |r_i - median(r)| )."""
     arr = np.asarray(residuals, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
     if arr.size == 0:
         return 0.0
     med = np.median(arr)
@@ -72,13 +79,21 @@ def compute_reduced_chi2(
         return 0.0
     nu = max(1, int(dof))
     if uncertainties is None:
-        return float(np.sum(r ** 2) / nu)
+        r_v = r[np.isfinite(r)]
+        if r_v.size == 0:
+            return 0.0
+        return float(np.sum(r_v ** 2) / nu)
     sig = np.asarray(uncertainties, dtype=np.float64)
     if sig.shape != r.shape:
         raise ValueError(f"Shape mismatch: residuals {r.shape} vs uncertainties {sig.shape}")
+    valid = np.isfinite(r) & np.isfinite(sig)
+    r_v = r[valid]
+    sig_v = sig[valid]
+    if r_v.size == 0:
+        return 0.0
     # Guard against zero uncertainties
-    sig = np.where(sig > 1e-12, sig, 1e-12)
-    return float(np.sum((r / sig) ** 2) / nu)
+    sig_v = np.where(sig_v > 1e-12, sig_v, 1e-12)
+    return float(np.sum((r_v / sig_v) ** 2) / nu)
 
 
 def compute_r_squared(
@@ -92,9 +107,14 @@ def compute_r_squared(
         return 0.0
     if y_obs.shape != y_calc.shape:
         raise ValueError(f"Shape mismatch: observed {y_obs.shape} vs calculated {y_calc.shape}")
-    ss_res = float(np.sum((y_obs - y_calc) ** 2))
-    mean_obs = float(np.mean(y_obs))
-    ss_tot = float(np.sum((y_obs - mean_obs) ** 2))
+    valid = np.isfinite(y_obs) & np.isfinite(y_calc)
+    yo = y_obs[valid]
+    yc = y_calc[valid]
+    if yo.size == 0:
+        return 0.0
+    ss_res = float(np.sum((yo - yc) ** 2))
+    mean_obs = float(np.mean(yo))
+    ss_tot = float(np.sum((yo - mean_obs) ** 2))
     if ss_tot < 1e-14:
         return 1.0 if ss_res < 1e-14 else 0.0
     r2 = 1.0 - (ss_res / ss_tot)
@@ -113,19 +133,23 @@ def compute_huber_weights(
     r = np.asarray(residuals, dtype=np.float64)
     if r.size == 0:
         return np.array([], dtype=np.float64)
+    finite_mask = np.isfinite(r)
+    if not np.any(finite_mask):
+        return np.zeros_like(r, dtype=np.float64)
+    r_fin = r[finite_mask]
     if delta is None:
-        sigma_hat = compute_robust_sigma(r)
+        sigma_hat = compute_robust_sigma(r_fin)
         if sigma_hat < 1e-12:
-            sigma_hat = float(np.std(r)) if r.size > 1 else 1.0
+            sigma_hat = float(np.std(r_fin)) if r_fin.size > 1 else 1.0
         if sigma_hat < 1e-12:
             sigma_hat = 1.0
         delta = k * sigma_hat
     delta = max(float(delta), 1e-12)
 
-    abs_r = np.abs(r)
-    weights = np.ones_like(r, dtype=np.float64)
-    mask = abs_r > delta
-    weights[mask] = delta / abs_r[mask]
+    abs_fin = np.abs(r_fin)
+    w_fin = np.where(abs_fin <= delta, 1.0, delta / np.maximum(abs_fin, 1e-30))
+    weights = np.zeros_like(r, dtype=np.float64)
+    weights[finite_mask] = w_fin
     return weights
 
 
@@ -140,17 +164,23 @@ def compute_tukey_weights(
     r = np.asarray(residuals, dtype=np.float64)
     if r.size == 0:
         return np.array([], dtype=np.float64)
-    sigma_hat = compute_robust_sigma(r)
+    finite_mask = np.isfinite(r)
+    if not np.any(finite_mask):
+        return np.zeros_like(r, dtype=np.float64)
+    r_fin = r[finite_mask]
+    sigma_hat = compute_robust_sigma(r_fin)
     if sigma_hat < 1e-12:
-        sigma_hat = float(np.std(r)) if r.size > 1 else 1.0
+        sigma_hat = float(np.std(r_fin)) if r_fin.size > 1 else 1.0
     if sigma_hat < 1e-12:
         sigma_hat = 1.0
     cutoff = max(c * sigma_hat, 1e-12)
 
     weights = np.zeros_like(r, dtype=np.float64)
-    abs_r = np.abs(r)
-    mask = abs_r <= cutoff
-    weights[mask] = (1.0 - (abs_r[mask] / cutoff) ** 2) ** 2
+    abs_fin = np.abs(r_fin)
+    in_mask = abs_fin <= cutoff
+    w_fin = np.zeros_like(r_fin, dtype=np.float64)
+    w_fin[in_mask] = (1.0 - (abs_fin[in_mask] / cutoff) ** 2) ** 2
+    weights[finite_mask] = w_fin
     return weights
 
 
@@ -162,13 +192,19 @@ def detect_outliers_3sigma(
     r = np.asarray(residuals, dtype=np.float64)
     if r.size == 0:
         return np.array([], dtype=bool)
-    med = float(np.median(r))
-    sigma = compute_robust_sigma(r)
+    finite_mask = np.isfinite(r)
+    if not np.any(finite_mask):
+        return np.ones(r.shape, dtype=bool)
+    r_fin = r[finite_mask]
+    med = float(np.median(r_fin))
+    sigma = compute_robust_sigma(r_fin)
     if sigma < 1e-12:
-        sigma = float(np.std(r)) if r.size > 1 else 1.0
+        sigma = float(np.std(r_fin)) if r_fin.size > 1 else 1.0
     if sigma < 1e-12:
         sigma = 1.0
-    return np.abs(r - med) > (threshold * sigma)
+    out = np.ones(r.shape, dtype=bool)
+    out[finite_mask] = np.abs(r_fin - med) > (threshold * sigma)
+    return out
 
 
 def compute_covariance_matrix(
@@ -278,7 +314,7 @@ def compute_condition_number(J: np.ndarray) -> float:
 
 def compute_confidence_ellipse_2d(
     cov_2x2: np.ndarray,
-    dof: int = 20,
+    dof: Optional[int] = None,
     confidence: float = 0.95,
     deg_to_km: float = 111.195,
 ) -> Tuple[float, float, float]:
@@ -289,8 +325,9 @@ def compute_confidence_ellipse_2d(
     cov_2x2 : np.ndarray
         2x2 horizontal covariance matrix [[C_yy, C_yx], [C_xy, C_xx]], where index 0 is Latitude
         (North/South, y) and index 1 is Longitude (East/West, x).
-    dof : int
-        Degrees of freedom (N - P). For Chi2(2)=5.991 at 95% confidence, scale = 2.4477.
+    dof : Optional[int]
+        Degrees of freedom (N - P). When provided, scales by ``sqrt(2 * F_{2, dof}(confidence))``;
+        when ``None``, uses asymptotic Chi2(2) scaling (``sqrt(-2 * ln(1 - confidence))``, 2.4477 at 95%).
     confidence : float
         Confidence level, default 0.95 (95%).
     deg_to_km : float
@@ -309,6 +346,8 @@ def compute_confidence_ellipse_2d(
     c = np.asarray(cov_2x2, dtype=np.float64)
     if c.shape != (2, 2):
         raise ValueError(f"Horizontal covariance must be 2x2, got {c.shape}")
+    if not np.all(np.isfinite(c)):
+        return (0.0, 0.0, 0.0)
 
     # Scale to kilometers if deg_to_km > 0 and != 1.0
     scale_dist = float(deg_to_km) if deg_to_km is not None else 1.0
@@ -331,12 +370,16 @@ def compute_confidence_ellipse_2d(
     mu1 = max(0.0, mu1)
     mu2 = max(0.0, mu2)
 
-    # 95% confidence scaling factor:
-    # Chi2(2) for 0.95 is 5.99146 -> sqrt(5.99146) = 2.447746...
-    # If confidence != 0.95, quantile = -2 * ln(1 - confidence)
+    # Confidence scaling factor:
+    # Finite DOF: 2 * F_{2, nu}(conf) = nu * ((1 - conf)^(-2 / nu) - 1)
+    # Asymptotic (dof is None): Chi2(2)(conf) = -2 * ln(1 - conf)
     conf = max(0.01, min(0.9999, float(confidence)))
-    chi2_val = -2.0 * math.log(1.0 - conf)
-    scale = math.sqrt(chi2_val)
+    if dof is not None:
+        nu = max(1, int(dof))
+        scale_sq = nu * ((1.0 - conf) ** (-2.0 / nu) - 1.0)
+    else:
+        scale_sq = -2.0 * math.log(1.0 - conf)
+    scale = math.sqrt(max(0.0, scale_sq))
 
     semi_major = float(scale * math.sqrt(mu1))
     semi_minor = float(scale * math.sqrt(mu2))
@@ -362,6 +405,7 @@ def compute_normality_stats(residuals: Union[np.ndarray, Sequence[float]]) -> Di
     For Chi2(2), the survival function has exact closed form: p = exp(-JB / 2).
     """
     r = np.asarray(residuals, dtype=np.float64)
+    r = r[np.isfinite(r)]
     n = r.size
     if n < 4:
         return {"skewness": 0.0, "kurtosis": 0.0, "p_value": 1.0, "jb_stat": 0.0}

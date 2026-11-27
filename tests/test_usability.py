@@ -167,6 +167,67 @@ class TestPickEditing(UsabilityBase):
         self.cv.keyPressEvent(QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_Delete, NOMOD))
         self.assertEqual(self.win.engine.traces[1].picks, [])
 
+    def test_switching_trace_focuses_magnifier_without_creating_pick(self) -> None:
+        self.cv.mag_trace_idx = 0
+        x = self.cv.time_to_x(35.0)
+        y3 = self.slot_center_y(3)
+
+        # First click switches active trace to #3 without creating a pick
+        mouse(self.cv, "press", x, y3, L, L)
+        mouse(self.cv, "release", x, y3, L, NO)
+        self.assertEqual(self.cv.mag_trace_idx, 3)
+        self.assertEqual(self.win.mag_canvas.trace_idx, 3)
+        self.assertEqual(self.win.engine.traces[3].picks, [])
+
+        # Subsequent click on the already-active trace #3 places a pick
+        mouse(self.cv, "press", x, y3, L, L)
+        mouse(self.cv, "release", x, y3, L, NO)
+        self.assertEqual(len(self.win.engine.traces[3].picks), 1)
+
+    def test_magnifier_double_click_and_drag_pick(self) -> None:
+        self.win._focus_magnifier(2, 35.0)
+        mag = self.win.mag_canvas
+        mag.resize(800, 220)
+        self.app.processEvents()
+        self.assertEqual(mag.trace_idx, 2)
+
+        y_mid = mag.plot_rect().center().y()
+        x_pick = mag.time_to_x(35.0)
+        mouse(mag, "press", x_pick, y_mid, L, L)
+        mouse(mag, "release", x_pick, y_mid, L, NO)
+        tr = self.win.engine.traces[2]
+        self.assertEqual(len(tr.picks), 1)
+        t_orig = tr.picks[0].onset_epoch
+
+        # Dragging the pick inside Magnifier moves it without duplicating
+        x_moved = mag.time_to_x(38.0)
+        mouse(mag, "press", x_pick, y_mid, L, L)
+        mouse(mag, "move", x_moved, y_mid, NO, L)
+        mouse(mag, "release", x_moved, y_mid, L, NO)
+        self.assertEqual(len(tr.picks), 1)
+        self.assertGreater(tr.picks[0].onset_epoch, t_orig + 2.0)
+
+        # Full double-click sequence deletes the pick cleanly with a single Undo step
+        px_now = mag.time_to_x(tr.picks[0].onset_epoch + tr.display_offset - mag.ref_epoch)
+        mouse(mag, "press", px_now, y_mid, L, L)
+        mouse(mag, "release", px_now, y_mid, L, NO)
+        mouse(mag, "dbl", px_now, y_mid, L, L)
+        mouse(mag, "release", px_now, y_mid, L, NO)
+        self.assertEqual(tr.picks, [])
+
+        self.win.action_undo()
+        tr = self.win.engine.traces[2]
+        self.assertIs(self.win.mag_canvas.trace, tr)
+        self.assertEqual(len(tr.picks), 1)
+
+        # Hover + Del key in Magnifier also deletes the pick
+        px_restored = mag.time_to_x(tr.picks[0].onset_epoch + tr.display_offset - mag.ref_epoch)
+        mouse(mag, "move", px_restored, y_mid)
+        from PyQt6.QtGui import QKeyEvent
+
+        mag.keyPressEvent(QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_Delete, NOMOD))
+        self.assertEqual(tr.picks, [])
+
     def test_undo_redo_of_picks(self) -> None:
         self.add_pick(0, 20.0)
         self.assertEqual(len(self.win.engine.traces[0].picks), 1)

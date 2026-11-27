@@ -13,14 +13,17 @@ NO PyQt6, scipy, or obspy imports — pure NumPy + Python stdlib only.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+import warnings
 import numpy as np
 
 from shm_app.core.config_station import SHMConfig, get_config
 from shm_app.core.models import PhasePick, Trace
 from shm_app.seismology.traveltime import TravelTimeManager, get_ttt_manager, sphere_diff
 
+logger = logging.getLogger(__name__)
 EARTH_RADIUS_KM = 6371.0
 
 
@@ -358,8 +361,16 @@ def estimate_takeoff_angle(
     """Estimate P-wave takeoff angle i_h in degrees (0 = straight down, 90 = horizontal, >90 upgoing)."""
     dist = max(0.0, float(dist_deg))
     z = max(0.0, float(depth_km))
+    p_up = (phase or "P").strip().upper()
     if dist < 1e-6:
-        return 0.0
+        return 180.0 if (z > 0.0 and p_up in ("PG", "SG")) else 0.0
+
+    # Direct crustal Pg/Sg rays from a subsurface focus travel upward to surface stations
+    if p_up in ("PG", "SG") and dist < 3.0:
+        if z > 0.0:
+            dist_km = dist * 111.1949266
+            return float(90.0 + math.degrees(math.atan2(z, max(1e-3, dist_km))))
+        return 90.0
 
     tm = ttt if ttt is not None else get_ttt_manager()
     slo = tm.slowness(phase, dist, z)
@@ -367,6 +378,8 @@ def estimate_takeoff_angle(
         slo = tm.slowness("P", dist, z)
 
     vp_src = _source_vp_kms(z)
+    if p_up.startswith("S"):
+        vp_src = vp_src / 1.7320508
     r_src = max(100.0, EARTH_RADIUS_KM - z)
 
     if slo is not None and slo > 0.0:
@@ -437,6 +450,13 @@ def extract_polarities_from_traces(
             elif tr.lat != 0.0 or tr.lon != 0.0:
                 st_lat = float(tr.lat)
                 st_lon = float(tr.lon)
+
+        if not (math.isfinite(st_lat) and math.isfinite(st_lon)) or (abs(st_lat) < 1e-9 and abs(st_lon) < 1e-9):
+            sta_lbl = tr.station or pk.station or "<unknown>"
+            msg = f"Skipping station {sta_lbl!r}: unresolved (0, 0) or non-finite coordinates"
+            logger.warning(msg)
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
+            continue
 
         dist_deg, az_ev_to_sta, _ = sphere_diff(float(event_lat), float(event_lon), st_lat, st_lon)
         takeoff_deg = estimate_takeoff_angle(dist_deg, depth_km=depth_km, phase=pk.name, ttt=tm)

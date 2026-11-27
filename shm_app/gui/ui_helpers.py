@@ -419,3 +419,51 @@ def safe_tight_layout(fig: Any, canvas: Optional[Any] = None, min_px: int = 80) 
             fig.tight_layout()
         except (LinAlgError, ValueError, RuntimeError):
             pass
+
+
+def cleanup_mpl_canvases(widget: Optional[QWidget]) -> None:
+    """Cancel pending Matplotlib draw_idle callbacks, disconnect mpl CIDs, and detach windowHandle event filters."""
+    if widget is None:
+        return
+    try:
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+    except Exception:
+        FigureCanvasQTAgg = None  # type: ignore[assignment]
+
+    win_handle = None
+    try:
+        win_handle = widget.windowHandle()
+    except Exception:
+        win_handle = None
+
+    widget_cids = getattr(widget, "_mpl_cids", None)
+    canvases = widget.findChildren(FigureCanvasQTAgg) if FigureCanvasQTAgg is not None else []
+    for canvas in canvases:
+        if widget_cids:
+            for cid in list(widget_cids):
+                try:
+                    canvas.mpl_disconnect(cid)
+                except Exception:
+                    pass
+        canvas_cids = getattr(canvas, "_mpl_cids", None)
+        if canvas_cids:
+            for cid in list(canvas_cids):
+                try:
+                    canvas.mpl_disconnect(cid)
+                except Exception:
+                    pass
+        try:
+            canvas._draw_pending = False
+        except Exception:
+            pass
+        if win_handle is not None:
+            try:
+                win_handle.removeEventFilter(canvas)
+            except Exception:
+                pass
+    if hasattr(widget, "_mpl_cids"):
+        try:
+            widget._mpl_cids = []
+        except Exception:
+            pass
+

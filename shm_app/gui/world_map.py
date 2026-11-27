@@ -12,6 +12,7 @@ from matplotlib.collections import LineCollection
 from matplotlib.figure import Figure
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -35,6 +36,7 @@ from shm_app.core.config_station import (
     resolve_reference_station,
 )
 from shm_app.core.models import AnalysisParamSet
+from shm_app.core.time_utils import parse_sh_time
 from shm_app.gui.help_texts import register_tutorial_help
 from shm_app.gui.map_helpers import (
     distance_ring_segments,
@@ -44,7 +46,7 @@ from shm_app.gui.map_helpers import (
     load_world_countries,
     split_antimeridian_polyline,
 )
-from shm_app.gui.ui_helpers import apply_c_locale, disable_button_autodefault
+from shm_app.gui.ui_helpers import apply_c_locale, cleanup_mpl_canvases, disable_button_autodefault
 from shm_app.plugins.live_service import (
     STATE_ERROR,
     STATE_FETCHING,
@@ -248,12 +250,18 @@ class WorldMapDialog(QDialog):
         disable_button_autodefault(self)
         apply_c_locale(self)
 
-        self.canvas.mpl_connect("scroll_event", self._on_scroll)
-        self.canvas.mpl_connect("button_press_event", self._on_press)
-        self.canvas.mpl_connect("motion_notify_event", self._on_motion)
-        self.canvas.mpl_connect("button_release_event", self._on_release)
+        self._mpl_cids = [
+            self.canvas.mpl_connect("scroll_event", self._on_scroll),
+            self.canvas.mpl_connect("button_press_event", self._on_press),
+            self.canvas.mpl_connect("motion_notify_event", self._on_motion),
+            self.canvas.mpl_connect("button_release_event", self._on_release),
+        ]
 
         self._update_inspector_ui()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        cleanup_mpl_canvases(self)
+        super().closeEvent(event)
 
     def _build_top_toolbar(self) -> QHBoxLayout:
         bar = QHBoxLayout()
@@ -523,9 +531,15 @@ class WorldMapDialog(QDialog):
             if elat == 0.0 and elon == 0.0 and pset.distance > 0.0:
                 elat, elon = sphere_add(ref_lat, ref_lon, pset.distance, pset.azimuth)
             if abs(elat) > 1e-4 or abs(elon) > 1e-4:
-                dist_deg, _az, baz_deg = sphere_diff(ref_lat, ref_lon, elat, elon)
+                dist_deg, baz_deg, _az_ev_to_ref = sphere_diff(ref_lat, ref_lon, elat, elon)
                 best_mag = max(pset.mag_mw, pset.mag_mb, pset.mag_ms, pset.mag_ml, pset.mag_mbb, 0.0)
                 reg = pset.region_name or self.config.fer.lookup(elat, elon)[1]
+                origin_ep = 0.0
+                if pset.origin and pset.origin.strip():
+                    try:
+                        origin_ep = float(parse_sh_time(pset.origin.strip()))
+                    except Exception:
+                        origin_ep = 0.0
                 events.append(
                     MapEventItem(
                         event_id="ACTIVE_PARAM_SET",
@@ -537,7 +551,7 @@ class WorldMapDialog(QDialog):
                         magnitude=float(best_mag),
                         mag_type="M",
                         origin_sh=pset.origin or "",
-                        origin_epoch=0.0,
+                        origin_epoch=origin_ep,
                         region=reg,
                         dist_deg=dist_deg,
                         baz_deg=baz_deg,
@@ -973,7 +987,7 @@ class WorldMapDialog(QDialog):
         lon = _norm_lon(event.xdata)
         lat = max(-90.0, min(90.0, float(event.ydata)))
         ref_code, ref_lat, ref_lon = self._ref_station_code_and_pos()
-        d_ref, _az, baz = sphere_diff(ref_lat, ref_lon, lat, lon)
+        d_ref, baz, _az_pt_to_ref = sphere_diff(ref_lat, ref_lon, lat, lon)
         hit = self.hit_test(float(event.x), float(event.y))
         hover_txt = ""
         if hit is not None:
@@ -1050,7 +1064,7 @@ class WorldMapDialog(QDialog):
                 lines.append(f"<b>Workspace Picks:</b> {st.pick_count}")
             active_ev = next((e for e in self._event_items if e.is_active_param), None)
             if active_ev is not None:
-                d_ev, _az_se, baz_se = sphere_diff(st.lat, st.lon, active_ev.lat, active_ev.lon)
+                d_ev, baz_se, _az_ev_to_st = sphere_diff(st.lat, st.lon, active_ev.lat, active_ev.lon)
                 lines.append(f"<b>From Active Event:</b> Δ = {d_ev:.2f}°, BAZ = {baz_se:.1f}°")
             self.lbl_selected_details.setText("<br>".join(lines))
             self.btn_select_traces.setEnabled(bool(st.channels))

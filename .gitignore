@@ -61,3 +61,9 @@ shm_bgr_downloads/
 shm_live_events/
 *.mseed
 sfdlist.sfd
+
+# Session autosave & crash recovery artifacts
+.shm_session.json
+.shm_session.json.*
+..shm_session.json.*
+

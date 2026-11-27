@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -544,131 +545,168 @@ class TestSHMDesktopGUI(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def setUp(self) -> None:
+        self._sess_dir = tempfile.TemporaryDirectory()
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {
+                "SHM_SESSION_PATH": os.path.join(self._sess_dir.name, "session.json"),
+                "SHM_NO_SESSION_PROMPT": "1",
+            },
+        )
+        self._env_patch.start()
+
+    def tearDown(self) -> None:
+        self.app.processEvents()
+        self._env_patch.stop()
+        self._sess_dir.cleanup()
+
     def test_main_window_menus_canvases_dialogs_and_shortcuts(self) -> None:
         win = SHMMainWindow(autoload_example=True)
-        win.show()
-        self.app.processEvents()
+        try:
+            win.show()
+            self.app.processEvents()
 
-        self.assertEqual(len(win.engine.traces), 19)
+            self.assertEqual(len(win.engine.traces), 19)
 
-        # Render MainTraceCanvas and MagnifierCanvas
-        win.main_canvas.repaint()
-        win.mag_canvas.repaint()
-        self.app.processEvents()
+            # Render MainTraceCanvas and MagnifierCanvas
+            win.main_canvas.repaint()
+            win.mag_canvas.repaint()
+            self.app.processEvents()
 
-        # Simulate single-key shortcuts ('+', 'i', '6')
-        for ch in ("+", "i", "6"):
-            ev = QKeyEvent(QKeyEvent.Type.KeyPress, 0, Qt.KeyboardModifier.NoModifier, ch)
-            win.keyPressEvent(ev)
-        self.assertEqual(win.phase_panel.active_sign, 1)
-        self.assertEqual(win.phase_panel.active_spec, "i")
-        self.assertEqual(win.phase_panel.active_quality, 6)
+            # Simulate single-key shortcuts ('+', 'i', '6')
+            for ch in ("+", "i", "6"):
+                ev = QKeyEvent(QKeyEvent.Type.KeyPress, 0, Qt.KeyboardModifier.NoModifier, ch)
+                win.keyPressEvent(ev)
+            self.assertEqual(win.phase_panel.active_sign, 1)
+            self.assertEqual(win.phase_panel.active_spec, "i")
+            self.assertEqual(win.phase_panel.active_quality, 6)
 
-        # Simulate clicking on trace 0 to pick P phase
-        ref_ep = win.main_canvas.reference_epoch()
-        win._on_main_trace_clicked(0, ref_ep + 25.0, 25.0)
-        self.assertIsNotNone(win.engine.traces[0].get_pick("P"))
+            # Simulate clicking on trace 0 to pick P phase
+            ref_ep = win.main_canvas.reference_epoch()
+            win._on_main_trace_clicked(0, ref_ep + 25.0, 25.0)
+            self.assertIsNotNone(win.engine.traces[0].get_pick("P"))
 
-        # Test Magnifier amplitude measurement callback
-        win._on_magnifier_amplitude_measured(0, 20.0, 30.0)
-        self.assertGreater(win.engine.current_params.mag_mb, 0.0)
+            # Test Magnifier amplitude measurement callback
+            win._on_magnifier_amplitude_measured(0, 20.0, 30.0)
+            self.assertGreater(win.engine.current_params.mag_mb, 0.0)
 
-        # Exercise Work / Array / Locate menu actions
-        win.action_demean()
-        win.action_detrend()
-        win.action_auto_pick()
-        win.action_corr_pick()
-        win.action_locate_plane_wave()
-        win.action_form_beam()
-        win.action_align_phase()
-        win.action_theoretical_phases()
-        win.action_compute_magnitudes()
-        win.action_unfilter()
-        self.app.processEvents()
+            # Exercise Work / Array / Locate menu actions
+            win.action_demean()
+            win.action_detrend()
+            win.action_auto_pick()
+            win.action_corr_pick()
+            win.action_locate_plane_wave()
+            win.action_form_beam()
+            win.action_align_phase()
+            win.action_theoretical_phases()
+            win.action_compute_magnitudes()
+            win.action_unfilter()
+            self.app.processEvents()
 
-        # Instantiate and test every interactive dialog in offscreen mode
-        read_dlg = ReadDataDialog(config=win.config, parent=win)
-        self.assertGreater(len(read_dlg.station_checks), 20)
-        read_dlg.close()
+            # Instantiate and test every interactive dialog in offscreen mode
+            read_dlg = ReadDataDialog(config=win.config, parent=win)
+            try:
+                self.assertGreater(len(read_dlg.station_checks), 20)
+            finally:
+                read_dlg.close()
 
-        flt_dlg = FilterDialog(dt=0.05, config=win.config, parent=win)
-        flt_dlg.but_type.setCurrentIndex(0)
-        flt_dlg._update_preview()
-        flt_dlg.close()
+            flt_dlg = FilterDialog(dt=0.05, config=win.config, parent=win)
+            try:
+                flt_dlg.but_type.setCurrentIndex(0)
+                flt_dlg._update_preview()
+            finally:
+                flt_dlg.close()
 
-        fk_dlg = FKAnalysisDialog(win.engine.visible_traces()[:6], t_lo=10.0, t_hi=30.0, config=win.config, parent=win)
-        self.assertIsNotNone(fk_dlg.last_result)
-        fk_dlg.close()
+            fk_dlg = FKAnalysisDialog(win.engine.visible_traces()[:6], t_lo=10.0, t_hi=30.0, config=win.config, parent=win)
+            try:
+                self.assertIsNotNone(fk_dlg.last_result)
+            finally:
+                fk_dlg.close()
 
-        vespa_dlg = VespagramDialog(win.engine.visible_traces()[:6], azimuth_deg=45.0, config=win.config, parent=win)
-        self.assertGreater(len(vespa_dlg.vespa_traces), 0)
-        vespa_dlg.close()
+            vespa_dlg = VespagramDialog(win.engine.visible_traces()[:6], azimuth_deg=45.0, config=win.config, parent=win)
+            try:
+                self.assertGreater(len(vespa_dlg.vespa_traces), 0)
+            finally:
+                vespa_dlg.close()
 
-        spec_dlg = SpectrumDialog(win.engine.traces[0], parent=win)
-        for m_i in range(5):
-            spec_dlg.method_combo.setCurrentIndex(m_i)
-        spec_dlg.close()
+            spec_dlg = SpectrumDialog(win.engine.traces[0], parent=win)
+            try:
+                for m_i in range(5):
+                    spec_dlg.method_combo.setCurrentIndex(m_i)
+            finally:
+                spec_dlg.close()
 
-        pm_dlg = ParticleMotionDialog(win.engine.traces[0], win.engine.traces[1], win.engine.traces[2], parent=win)
-        pm_dlg.chk_rotated.setChecked(True)
-        pm_dlg.close()
+            pm_dlg = ParticleMotionDialog(win.engine.traces[0], win.engine.traces[1], win.engine.traces[2], parent=win)
+            try:
+                pm_dlg.chk_rotated.setChecked(True)
+            finally:
+                pm_dlg.close()
 
-        all_picks = [pk for tr in win.engine.traces for pk in tr.picks]
-        net_dlg = NetworkLocationDialog(all_picks, config=win.config, parent=win)
-        net_dlg.close()
+            all_picks = [pk for tr in win.engine.traces for pk in tr.picks]
+            net_dlg = NetworkLocationDialog(all_picks, config=win.config, parent=win)
+            net_dlg.close()
 
-        ev_dlg = EventSummaryDialog(win.engine.current_params, all_picks, config=win.config, parent=win)
-        ev_dlg.close()
+            ev_dlg = EventSummaryDialog(win.engine.current_params, all_picks, config=win.config, parent=win)
+            ev_dlg.close()
+            self.app.processEvents()
 
-        # Execute command via bottom GUI console
-        win.cmd_input.setText("BUTTER BP 0.8 3.0 3")
-        win._on_run_command_line()
-        self.assertIn("BUTTER", win.engine.traces[0].filter_name)
-
-        win.close()
+            # Execute command via bottom GUI console
+            win.cmd_input.setText("BUTTER BP 0.8 3.0 3")
+            win._on_run_command_line()
+            self.assertIn("BUTTER", win.engine.traces[0].filter_name)
+        finally:
+            for d in list(win._open_dialogs):
+                d.close()
+            win.close()
+            self.app.processEvents()
 
     def test_canvas_selection_and_frame_rate_performance(self):
         import time
         from PyQt6.QtCore import QPointF
 
         win = SHMMainWindow(autoload_example=True)
-        win.resize(1600, 900)
-        win.show()
-        self.app.processEvents()
+        try:
+            win.resize(1600, 900)
+            win.show()
+            self.app.processEvents()
 
-        # Load 36-trace Mini-SEED dataset
-        win.load_example_dataset("mseed")
-        self.app.processEvents()
-        self.assertEqual(len(win.engine.traces), 36)
+            # Load 36-trace Mini-SEED dataset
+            win.load_example_dataset("mseed")
+            self.app.processEvents()
+            self.assertEqual(len(win.engine.traces), 36)
 
-        # 1. Interactive hover repaint must be well under 5 ms/frame (typically ~0.35 ms)
-        t0 = time.perf_counter()
-        n_hover = 40
-        for i in range(n_hover):
-            win.main_canvas._hover_pos = QPointF(250.0 + (i % 300), 150.0 + (i % 200))
+            # 1. Interactive hover repaint must be well under 5 ms/frame (typically ~0.35 ms)
+            t0 = time.perf_counter()
+            n_hover = 40
+            for i in range(n_hover):
+                win.main_canvas._hover_pos = QPointF(250.0 + (i % 300), 150.0 + (i % 200))
+                win.main_canvas.repaint()
+            avg_hover_ms = (time.perf_counter() - t0) * 1000.0 / n_hover
+            self.assertLess(avg_hover_ms, 5.0)
+
+            # 2. Single-trace selection toggle via invalidate_slot must be well under 8 ms/frame (typically ~1.6 ms)
+            t0 = time.perf_counter()
+            n_sel = 24
+            for i in range(n_sel):
+                win.engine.traces[i].selected = not win.engine.traces[i].selected
+                win.main_canvas.invalidate_slot(i)
+                win.main_canvas.repaint()
+            avg_slot_ms = (time.perf_counter() - t0) * 1000.0 / n_sel
+            self.assertLess(avg_slot_ms, 8.0)
+
+            # 3. Select all & deselect all must invalidate cache cleanly
+            win.action_select_all()
             win.main_canvas.repaint()
-        avg_hover_ms = (time.perf_counter() - t0) * 1000.0 / n_hover
-        self.assertLess(avg_hover_ms, 5.0)
-
-        # 2. Single-trace selection toggle via invalidate_slot must be well under 8 ms/frame (typically ~1.6 ms)
-        t0 = time.perf_counter()
-        n_sel = 24
-        for i in range(n_sel):
-            win.engine.traces[i].selected = not win.engine.traces[i].selected
-            win.main_canvas.invalidate_slot(i)
+            self.assertTrue(all(t.selected for t in win.engine.traces))
+            win.action_deselect_all()
             win.main_canvas.repaint()
-        avg_slot_ms = (time.perf_counter() - t0) * 1000.0 / n_sel
-        self.assertLess(avg_slot_ms, 8.0)
-
-        # 3. Select all & deselect all must invalidate cache cleanly
-        win.action_select_all()
-        win.main_canvas.repaint()
-        self.assertTrue(all(t.selected for t in win.engine.traces))
-        win.action_deselect_all()
-        win.main_canvas.repaint()
-        self.assertFalse(any(t.selected for t in win.engine.traces))
-
-        win.close()
+            self.assertFalse(any(t.selected for t in win.engine.traces))
+        finally:
+            for d in list(win._open_dialogs):
+                d.close()
+            win.close()
+            self.app.processEvents()
 
 
 if __name__ == "__main__":

@@ -162,6 +162,7 @@ class TestPhase3Dialogs(unittest.TestCase):
             np.testing.assert_allclose(phase_line.get_ydata(), 0.0, atol=1e-9)
         finally:
             dlg.close()
+            app.processEvents()
 
     def test_fk_dialog_calibration_toggle_arf_and_diagnostic_signal(self) -> None:
         cfg = get_config()
@@ -212,6 +213,7 @@ class TestPhase3Dialogs(unittest.TestCase):
             self.assertTrue(emitted[-1].context_data["calib_applied"])
         finally:
             dlg.close()
+            app.processEvents()
 
     def test_spectrum_dialog_brune_and_boatwright_inversion_and_signal(self) -> None:
         tr = _make_synthetic_brune_trace(fc=1.5, omega0=1000.0, t_star=0.03)
@@ -270,6 +272,7 @@ class TestPhase3Dialogs(unittest.TestCase):
             self.assertEqual(emitted[-1].context_data["model_type"], "boatwright")
         finally:
             dlg.close()
+            app.processEvents()
 
     def test_particle_motion_dialog_color_hodogram_cones_and_signal(self) -> None:
         tr_z, tr_n, tr_e = _make_3c_synthetic_traces(baz_deg=60.0, inc_deg=30.0)
@@ -278,7 +281,16 @@ class TestPhase3Dialogs(unittest.TestCase):
             emitted: list[FitDiagnosticResult] = []
             dlg.fitDiagnosticReady.connect(emitted.append)
 
+            # Changing spinboxes / rotation checkbox must NOT trigger redundant diagnostic emission
+            dlg.az_spin.setValue(75.0)
+            dlg.inc_spin.setValue(35.0)
+            dlg.chk_rotated.setChecked(True)
             dlg.replot()
+            app.processEvents()
+            self.assertEqual(len(emitted), 0)
+
+            # Explicit diagnostic action emits FitDiagnosticResult
+            dlg.btn_emit_diag.click()
             app.processEvents()
 
             self.assertEqual(len(emitted), 1)
@@ -302,12 +314,13 @@ class TestPhase3Dialogs(unittest.TestCase):
                 self.assertEqual(lcs[0].cmap.name, "gyr_hodogram")
                 self.assertGreater(len(lcs[0].get_segments()), 10)
 
-            # Toggle L-Q-T rotated mode and verify re-emission
-            dlg.chk_rotated.setChecked(True)
+            # Direct emit_diagnostic() also emits cleanly
+            dlg.emit_diagnostic()
             app.processEvents()
             self.assertEqual(len(emitted), 2)
         finally:
             dlg.close()
+            app.processEvents()
 
 
 if __name__ == "__main__":

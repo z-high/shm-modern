@@ -58,6 +58,9 @@ class FitType(str, Enum):
     # 11. Surface Wave Dispersion Curve Inversion
     SURFACE_DISPERSION = "SURFACE_DISPERSION"
 
+    # 12. Double-Couple Focal Mechanism Inversion
+    FOCAL_MECHANISM = "focal_mechanism"
+
 
 @dataclass
 class ResidualEntry:

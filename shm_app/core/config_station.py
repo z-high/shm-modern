@@ -1,14 +1,19 @@
-"""Configuration, station inventory, sensitivity, filter lookup, and Flinn-Engdahl region tables."""
+"""Configuration, station inventory, sensitivity, and filter lookup tables."""
 
 from __future__ import annotations
 
 import fnmatch
+import logging
 import math
 import os
 import re
+import warnings
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
+logger = logging.getLogger(__name__)
+
 from shm_app import SHM_DEFAULT_ROOT
+from shm_app.core.flinn_engdahl import FlinnEngdahlLookup
 from shm_app.core.models import StationInfo
 from shm_app.core.time_utils import parse_sh_time
 from shm_app.io.stationxml import (
@@ -63,130 +68,6 @@ def parse_station_list(spec: Union[str, Sequence[str]]) -> List[str]:
     return out
 
 
-class FlinnEngdahlLookup:
-    """Flinn-Engdahl (1995) Geographical and Seismic Region Lookup matching earthloc.c & fereg.dat/fername.dat."""
-
-    def __init__(self, inputs_dir: Optional[str] = None, shm_root: Optional[str] = None) -> None:
-        self.shm_root = shm_root or (
-            os.path.dirname(os.path.normpath(inputs_dir)) if inputs_dir else SHM_DEFAULT_ROOT
-        )
-        self.inputs_dir = inputs_dir or os.path.join(self.shm_root, "inputs")
-        self.greg_names: Dict[int, str] = {}
-        self.sreg_names: Dict[int, str] = {}
-        self.nsreg: List[int] = []
-        self.quad_ind: Dict[int, int] = {}
-        self.quad_num: Dict[int, int] = {}
-        self.lln: List[Tuple[int, int, int]] = []
-        self._loaded = False
-        self._load()
-
-    def _load(self) -> None:
-        for cand_fn in ("FERNAME.DAT", "fername.dat"):
-            fername_path = os.path.join(self.inputs_dir, cand_fn)
-            if os.path.isfile(fername_path):
-                with open(fername_path, "r", encoding="latin-1", errors="ignore") as f:
-                    for line in f:
-                        line_s = line.strip()
-                        if not line_s or line_s.startswith("!"):
-                            continue
-                        parts = line_s.split(None, 1)
-                        if len(parts) == 2 and parts[0].isdigit():
-                            self.greg_names[int(parts[0])] = parts[1].strip()
-                break
-
-        # Parse earthloc.c tables directly so all 757 geographical regions, 50 seismic regions,
-        # and the exact 1995 quadrant lat/lon grid are always available.
-        earthloc_candidates = [
-            os.path.join(self.shm_root, "source", "earthloc.c"),
-            os.path.join(SHM_DEFAULT_ROOT, "source", "earthloc.c"),
-        ]
-        earthloc_path = next((p for p in earthloc_candidates if os.path.isfile(p)), "")
-        if earthloc_path:
-            with open(earthloc_path, "r", encoding="latin-1", errors="ignore") as f:
-                src = f.read()
-
-            # Extract lln[6060][3]
-            m_lln = re.search(r"lln\[\d+\]\[3\]\s*=\s*\{(.*?)\};", src, re.DOTALL)
-            if m_lln:
-                nums = [int(x) for x in re.findall(r"-?\d+", m_lln.group(1))]
-                self.lln = [
-                    (nums[i], nums[i + 1], nums[i + 2])
-                    for i in range(0, len(nums) - 2, 3)
-                ]
-
-            # Extract nsreg[759]
-            m_ns = re.search(r"nsreg\[\d+\]\s*=\s*\{(.*?)\};", src, re.DOTALL)
-            if m_ns:
-                self.nsreg = [int(x) for x in re.findall(r"-?\d+", m_ns.group(1))]
-
-            # Extract sreg[]
-            m_sreg = re.search(r"static char \*sreg\[\]\s*=\s*\{(.*?)\};", src, re.DOTALL)
-            if m_sreg:
-                strs = re.findall(r'"([^"]*)"', m_sreg.group(1))
-                for idx, val in enumerate(strs):
-                    self.sreg_names[idx] = val.strip()
-
-            # Extract greg[]
-            m_greg = re.search(r"static char \*greg\[\]\s*=\s*\{(.*?)\};", src, re.DOTALL)
-            if m_greg:
-                strs = re.findall(r'"([^"]*)"', m_greg.group(1))
-                for idx, val in enumerate(strs):
-                    if idx not in self.greg_names or not self.greg_names[idx]:
-                        self.greg_names[idx] = val.strip()
-
-        self.quad_ind = {1: 0, 2: 1919, 3: 3535, 4: 4747}
-        self.quad_num = {1: 1914, 2: 1579, 3: 1161, 4: 1304}
-        self._loaded = True
-
-    def lookup(self, lat: float, lon: float) -> Tuple[int, str, int, str]:
-        """Return (igreg, grname, isreg, srname) for (lat, lon) in degrees."""
-        if not self.lln:
-            return 0, "Unknown Region", 0, ""
-
-        alat = float(lat)
-        alng = float(lon)
-        while alng > 180.0:
-            alng -= 360.0
-        while alng < -180.0:
-            alng += 360.0
-
-        if alat >= 0.0 and alng >= 0.0:
-            quad = 1
-        elif alat >= 0.0 and alng < 0.0:
-            quad = 2
-        elif alat < 0.0 and alng < 0.0:
-            quad = 3
-        else:
-            quad = 4
-
-        ilat = min(90, abs(int(alat)))
-        ilng = min(180, abs(int(alng)))
-
-        n = self.quad_ind[quad]
-        qnum = self.quad_num[quad]
-        i = 0
-        while i < qnum and ilat > self.lln[i + n][0]:
-            i += 1
-        igreg = 0
-        if i < qnum:
-            j = i
-            while j < qnum and ilat == self.lln[j + n][0] and ilng >= self.lln[j + n][1]:
-                j += 1
-            igreg = self.lln[max(0, j - 1) + n][2]
-
-        if igreg <= 0 or igreg >= len(self.nsreg):
-            igreg = 0
-        isreg = self.nsreg[igreg] if 0 <= igreg < len(self.nsreg) else 0
-        grname = self.greg_names.get(igreg, "")
-        srname = self.sreg_names.get(isreg, "")
-        return igreg, grname, isreg, srname
-
-    def region_by_id(self, igreg: int) -> Tuple[str, int, str]:
-        """Return (grname, isreg, srname) for geographical region number igreg."""
-        isreg = self.nsreg[igreg] if 0 <= igreg < len(self.nsreg) else 0
-        return self.greg_names.get(igreg, ""), isreg, self.sreg_names.get(isreg, "")
-
-
 class SHMConfig:
     """Manages SHM configuration, station database, sensitivities, and filter lookups."""
 
@@ -214,6 +95,18 @@ class SHMConfig:
     @root.setter
     def root(self, val: str) -> None:
         self.shm_root = val
+        self.inputs_dir = os.path.join(val, "inputs")
+        self.filter_dir = os.path.join(val, "filter")
+        self.globals_dir = os.path.join(val, "globals")
+        self.data_examples_dir = os.path.join(val, "data-examples")
+        self.params.clear()
+        self.stations.clear()
+        self.sensitivities.clear()
+        self.filter_rules.clear()
+        self.station_groups.clear()
+        self.stationxml_channels.clear()
+        self.fer = FlinnEngdahlLookup(self.inputs_dir, shm_root=self.shm_root)
+        self.load_all()
 
     def load_all(self) -> None:
         self._load_shm_config()
@@ -576,40 +469,65 @@ class SHMConfig:
         if not infos:
             return []
 
+        ref_u = (ref_station or "").strip().upper()
+        use_centre = ref_u in ("CENTRE", "CENTER", "")
+        ref_inf: Optional[StationInfo] = None
+        if not use_centre:
+            ref_inf = self.get_station(ref_u)
+            ref_known = (
+                ref_u in self.stations
+                or abs(ref_inf.lat) > 1e-9
+                or abs(ref_inf.lon) > 1e-9
+                or ref_inf.array_id > 0
+                or ref_inf.xrel != 0.0
+                or ref_inf.yrel != 0.0
+            )
+            if not ref_known:
+                msg = f"Unknown reference station {ref_station!r} in relative_xy_km; falling back to CENTRE"
+                logger.warning(msg)
+                warnings.warn(msg, RuntimeWarning, stacklevel=2)
+                use_centre = True
+                ref_inf = None
+
         # Check if all stations belong to the same array with xrel/yrel populated
         array_ids = {inf.array_id for inf in infos if inf.array_id > 0}
-        use_array_xy = len(array_ids) == 1 and all(
-            (inf.xrel != 0.0 or inf.yrel != 0.0 or inf.code in ("GRA1", "BFO")) for inf in infos
+        zero_xy_count = sum(1 for inf in infos if inf.xrel == 0.0 and inf.yrel == 0.0)
+        has_nonzero_xy = any(inf.xrel != 0.0 or inf.yrel != 0.0 for inf in infos)
+        use_array_xy = (
+            len(array_ids) == 1
+            and all(inf.array_id > 0 for inf in infos)
+            and (len(infos) == 1 or (has_nonzero_xy and zero_xy_count <= 1))
         )
+        if not use_centre and ref_inf is not None and use_array_xy:
+            if ref_inf.array_id not in array_ids:
+                use_array_xy = False
 
+        deg_to_km = 111.1949266
         if use_array_xy:
             coords = [(inf.xrel, inf.yrel, inf.elevation, inf.velocity) for inf in infos]
         else:
             ref_lat = sum(inf.lat for inf in infos) / len(infos)
-            ref_lon = sum(inf.lon for inf in infos) / len(infos)
-            deg_to_km = 111.1949266
+            sin_lon = sum(math.sin(math.radians(inf.lon)) for inf in infos)
+            cos_lon = sum(math.cos(math.radians(inf.lon)) for inf in infos)
+            ref_lon = math.degrees(math.atan2(sin_lon, cos_lon)) if (sin_lon != 0.0 or cos_lon != 0.0) else 0.0
             coords = []
             for inf in infos:
-                x_km = (inf.lon - ref_lon) * deg_to_km * math.cos(math.radians(inf.lat))
+                dlon = ((inf.lon - ref_lon + 180.0) % 360.0) - 180.0
+                x_km = dlon * deg_to_km * math.cos(math.radians(inf.lat))
                 y_km = (inf.lat - ref_lat) * deg_to_km
                 coords.append((x_km, y_km, inf.elevation, inf.velocity))
 
-        ref_u = ref_station.strip().upper()
-        if ref_u in ("CENTRE", "CENTER", ""):
+        if use_centre or ref_inf is None:
             xm = sum(c[0] for c in coords) / len(coords)
             ym = sum(c[1] for c in coords) / len(coords)
             em = sum(c[2] for c in coords) / len(coords)
+        elif use_array_xy:
+            xm, ym, em = ref_inf.xrel, ref_inf.yrel, ref_inf.elevation
         else:
-            ref_inf = self.get_station(ref_u)
-            if use_array_xy and ref_inf.array_id in array_ids:
-                xm, ym, em = ref_inf.xrel, ref_inf.yrel, ref_inf.elevation
-            else:
-                deg_to_km = 111.1949266
-                ref_lat0 = sum(inf.lat for inf in infos) / len(infos)
-                ref_lon0 = sum(inf.lon for inf in infos) / len(infos)
-                xm = (ref_inf.lon - ref_lon0) * deg_to_km * math.cos(math.radians(ref_inf.lat))
-                ym = (ref_inf.lat - ref_lat0) * deg_to_km
-                em = ref_inf.elevation
+            dlon_ref = ((ref_inf.lon - ref_lon + 180.0) % 360.0) - 180.0
+            xm = dlon_ref * deg_to_km * math.cos(math.radians(ref_inf.lat))
+            ym = (ref_inf.lat - ref_lat) * deg_to_km
+            em = ref_inf.elevation
 
         return [(c[0] - xm, c[1] - ym, c[2] - em, c[3]) for c in coords]
 

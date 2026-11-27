@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -67,6 +69,15 @@ class TestWorldMapAndTutorialUI(unittest.TestCase):
         cls.app = _app()
 
     def setUp(self) -> None:
+        self._sess_dir = tempfile.TemporaryDirectory()
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {
+                "SHM_SESSION_PATH": os.path.join(self._sess_dir.name, "session.json"),
+                "SHM_NO_SESSION_PROMPT": "1",
+            },
+        )
+        self._env_patch.start()
         self.win = SHMMainWindow()
         self.win.resize(1280, 820)
         self.win.load_example_dataset("GRF_031102_0225.GSE")
@@ -77,6 +88,8 @@ class TestWorldMapAndTutorialUI(unittest.TestCase):
             d.close()
         self.win.close()
         self.app.processEvents()
+        self._env_patch.stop()
+        self._sess_dir.cleanup()
 
     def test_tutorial_mode_covers_docks_sliders_console_and_dialogs(self) -> None:
         # Initially off
@@ -321,6 +334,15 @@ class TestWorldMapDialogQualityAndRegressions(unittest.TestCase):
         cls.app = _app()
 
     def setUp(self) -> None:
+        self._sess_dir = tempfile.TemporaryDirectory()
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {
+                "SHM_SESSION_PATH": os.path.join(self._sess_dir.name, "session.json"),
+                "SHM_NO_SESSION_PROMPT": "1",
+            },
+        )
+        self._env_patch.start()
         self.win = SHMMainWindow()
         self.win.resize(1280, 820)
         self.win.load_example_dataset("GRF_031102_0225.GSE")
@@ -331,6 +353,8 @@ class TestWorldMapDialogQualityAndRegressions(unittest.TestCase):
             d.close()
         self.win.close()
         self.app.processEvents()
+        self._env_patch.stop()
+        self._sess_dir.cleanup()
 
     def test_world_map_dialog_quality_standards(self) -> None:
         wmap_dlg = WorldMapDialog(
@@ -354,6 +378,7 @@ class TestWorldMapDialogQualityAndRegressions(unittest.TestCase):
                 self.assertIn(".", sb.textFromValue(1.5), f"Comma decimal leaked in {sb}")
         finally:
             wmap_dlg.close()
+            self.app.processEvents()
 
     def test_world_map_dialog_preset_zooms_and_path_toggles(self) -> None:
         wmap_dlg = WorldMapDialog(
@@ -387,6 +412,7 @@ class TestWorldMapDialogQualityAndRegressions(unittest.TestCase):
             wmap_dlg.canvas.draw()
         finally:
             wmap_dlg.close()
+            self.app.processEvents()
 
 
 if __name__ == "__main__":

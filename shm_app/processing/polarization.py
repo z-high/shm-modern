@@ -1,6 +1,5 @@
-"""2D & 3D coordinate rotations, covariance eigendecomposition (MDIR),
-particle motion hodograms, and sliding-window polarization filtering matching
-shmath.c, pmotion.c, and polfil.c.
+"""Covariance eigendecomposition (MDIR), particle motion hodograms, and
+sliding-window polarization filtering matching pmotion.c and polfil.c.
 """
 
 from __future__ import annotations
@@ -16,127 +15,19 @@ from shm_app.core.fit_models import (
     ResidualEntry,
 )
 from shm_app.core.models import Trace
+from shm_app.processing.rotation import (
+    MAX_POLARIZATION_ALIGN_SAMPLES,
+    _align_traces_for_polarization,
+    rotate_2d,
+    rotate_3d_lqt,
+    rotate_STS2_zne_to_uvw,
+    rotate_zne_to_zrt,
+)
 from shm_app.seismology.diagnostics import (
     compute_mad,
     compute_normality_stats,
     compute_reduced_chi2,
 )
-
-
-def rotate_2d(
-    tr_n: Trace,
-    tr_e: Trace,
-    angle_deg: float,
-    labels: Tuple[str, str] = ("R", "T"),
-) -> Tuple[Trace, Trace]:
-    """2D horizontal rotation matching mt_rot2 in shmath.c.
-
-    Note: In SHM, for backazimuth BAZ, rotation to Radial/Transverse (L->Q or R->T away from source)
-    uses angle = BAZ - 180 (or for BAZ directly: R = -N*cos(BAZ) - E*sin(BAZ), T = N*sin(BAZ) - E*cos(BAZ)).
-    Here angle_deg is the clockwise rotation angle of the North/East coordinate axes:
-        r =  n * cos(a) + e * sin(a)
-        t = -n * sin(a) + e * cos(a)
-    """
-    n_len = min(tr_n.length, tr_e.length)
-    a = math.radians(angle_deg)
-    ca, sa = math.cos(a), math.sin(a)
-
-    n_dat = tr_n.data[:n_len]
-    e_dat = tr_e.data[:n_len]
-
-    out_r = tr_n.copy()
-    out_t = tr_e.copy()
-    out_r.data = n_dat * ca + e_dat * sa
-    out_t.data = -n_dat * sa + e_dat * ca
-    out_r.comp = labels[0]
-    out_t.comp = labels[1]
-    out_r.azimuth = angle_deg
-    out_t.azimuth = angle_deg
-    return out_r, out_t
-
-
-def rotate_zne_to_zrt(tr_z: Trace, tr_n: Trace, tr_e: Trace, baz_deg: float) -> Tuple[Trace, Trace, Trace]:
-    """Rotate (Z, N, E) to (Z, R, T) given event backazimuth baz_deg (0..360)."""
-    # Radial points from source to station (azimuth = baz_deg - 180)
-    phi = baz_deg - 180.0
-    out_z = tr_z.copy()
-    out_r, out_t = rotate_2d(tr_n, tr_e, phi, labels=("R", "T"))
-    return out_z, out_r, out_t
-
-
-def rotate_3d_lqt(
-    tr_z: Trace,
-    tr_n: Trace,
-    tr_e: Trace,
-    azimuth_deg: float,
-    incidence_deg: float,
-) -> Tuple[Trace, Trace, Trace]:
-    """3D rotation from (Z, N, E) into ray-aligned (L, Q, T) coordinates matching mt_rot3 in shmath.c.
-
-    Parameters
-    ----------
-    azimuth_deg : backazimuth in degrees (or propagation azimuth following SHM convention)
-    incidence_deg : incidence angle in degrees (0 = vertical up along Z)
-    """
-    lth = min(tr_z.length, tr_n.length, tr_e.length)
-    az = math.radians(azimuth_deg)
-    inc = math.radians(incidence_deg)
-
-    ci, si = math.cos(inc), math.sin(inc)
-    ca, sa = math.cos(az), math.sin(az)
-
-    z = tr_z.data[:lth]
-    n = tr_n.data[:lth]
-    e = tr_e.data[:lth]
-
-    # Exact mt_rot3 transformation matrix from shmath.c:
-    # l =  z * cos(i) - n * sin(i)*cos(a) - e * sin(i)*sin(a)
-    # q =  z * sin(i) + n * cos(i)*cos(a) + e * cos(i)*sin(a)
-    # t =               n * sin(a)        - e * cos(a)
-    l_dat = z * ci - n * si * ca - e * si * sa
-    q_dat = z * si + n * ci * ca + e * ci * sa
-    t_dat = n * sa - e * ca
-
-    out_l = tr_z.copy()
-    out_q = tr_n.copy()
-    out_t = tr_e.copy()
-    out_l.data, out_l.comp, out_l.azimuth, out_l.inci = l_dat, "L", azimuth_deg, incidence_deg
-    out_q.data, out_q.comp, out_q.azimuth, out_q.inci = q_dat, "Q", azimuth_deg, incidence_deg
-    out_t.data, out_t.comp, out_t.azimuth, out_t.inci = t_dat, "T", azimuth_deg, incidence_deg
-    return out_l, out_q, out_t
-
-
-def rotate_STS2_zne_to_uvw(tr_z: Trace, tr_n: Trace, tr_e: Trace, inverse: bool = False) -> Tuple[Trace, Trace, Trace]:
-    """Transform between geographic (Z, N, E) and STS-2 triaxial sensor (U, V, W) coordinates."""
-    lth = min(tr_z.length, tr_n.length, tr_e.length)
-    s23 = math.sqrt(2.0 / 3.0)
-    s16 = 1.0 / math.sqrt(6.0)
-    s12 = 1.0 / math.sqrt(2.0)
-    s13 = 1.0 / math.sqrt(3.0)
-
-    # STS-2 matrix M where [U, V, W]^T = M * [E, N, Z]^T
-    mat = np.array(
-        [
-            [-s23, 0.0, s13],
-            [s16, s12, s13],
-            [s16, -s12, s13],
-        ],
-        dtype=np.float64,
-    )
-    t1, t2, t3 = tr_z.copy(), tr_n.copy(), tr_e.copy()
-    if not inverse:
-        enz = np.vstack([tr_e.data[:lth], tr_n.data[:lth], tr_z.data[:lth]])
-        res = mat @ enz
-        t1.data, t1.comp = res[0], "U"
-        t2.data, t2.comp = res[1], "V"
-        t3.data, t3.comp = res[2], "W"
-    else:
-        uvw = np.vstack([tr_z.data[:lth], tr_n.data[:lth], tr_e.data[:lth]])
-        res = mat.T @ uvw
-        t1.data, t1.comp = res[2], "Z"
-        t2.data, t2.comp = res[1], "N"
-        t3.data, t3.comp = res[0], "E"
-    return t1, t2, t3
 
 
 def _polarization_window_indices(
@@ -160,6 +51,22 @@ def _polarization_window_indices(
     return i0, i1
 
 
+def _empty_mdir_result() -> Dict[str, float]:
+    return {
+        "azimuth": 0.0,
+        "incidence": 0.0,
+        "rectilinearity": 0.0,
+        "planarity": 0.0,
+        "lambda1": 0.0,
+        "lambda2": 0.0,
+        "lambda3": 0.0,
+        "rms_pol": 0.0,
+        "rms_pol_norm": 0.0,
+        "sigma_theta_deg": 0.0,
+        "sigma_phi_deg": 0.0,
+    }
+
+
 def compute_mdir(
     tr_z: Trace,
     tr_n: Trace,
@@ -170,32 +77,46 @@ def compute_mdir(
     """Compute 3D covariance eigendecomposition (MDIR) for P-wave backazimuth, incidence angle,
     rectilinearity, trajectory misfit RMS, and Jurkevics confidence cones.
     """
-    lth = min(tr_z.length, tr_n.length, tr_e.length)
-    dt = tr_z.delta if tr_z.delta > 0 else 0.05
-    i0, i1 = _polarization_window_indices(lth, dt, t_lo, t_hi)
+    t_start, dt, (z_all, n_all, e_all) = _align_traces_for_polarization(tr_z, tr_n, tr_e)
+    shift = t_start - float(tr_z.start_epoch)
+    lo_adj = (float(t_lo) - shift) if (t_lo is not None and t_hi is not None) else t_lo
+    hi_adj = (float(t_hi) - shift) if (t_lo is not None and t_hi is not None) else t_hi
+    lth = z_all.size
+    i0, i1 = _polarization_window_indices(lth, dt, lo_adj, hi_adj)
 
     if i1 <= i0:
-        return {
-            "azimuth": 0.0,
-            "incidence": 0.0,
-            "rectilinearity": 0.0,
-            "planarity": 0.0,
-            "lambda1": 0.0,
-            "lambda2": 0.0,
-            "lambda3": 0.0,
-            "rms_pol": 0.0,
-            "rms_pol_norm": 0.0,
-            "sigma_theta_deg": 0.0,
-            "sigma_phi_deg": 0.0,
-        }
+        return _empty_mdir_result()
 
-    z = tr_z.data[i0:i1] - np.mean(tr_z.data[i0:i1])
-    n = tr_n.data[i0:i1] - np.mean(tr_n.data[i0:i1])
-    e = tr_e.data[i0:i1] - np.mean(tr_e.data[i0:i1])
+    z_seg = z_all[i0:i1]
+    n_seg = n_all[i0:i1]
+    e_seg = e_all[i0:i1]
+    finite_mask = np.isfinite(z_seg) & np.isfinite(n_seg) & np.isfinite(e_seg)
+    if np.count_nonzero(finite_mask) == 0:
+        return _empty_mdir_result()
+
+    z_fin = z_seg[finite_mask]
+    n_fin = n_seg[finite_mask]
+    e_fin = e_seg[finite_mask]
+    z = z_fin - np.mean(z_fin)
+    n = n_fin - np.mean(n_fin)
+    e = e_fin - np.mean(e_fin)
 
     mat = np.vstack([z, n, e])
-    cov = (mat @ mat.T) / max(1, z.size)
-    evals, evecs = np.linalg.eigh(cov)
+    scale = float(np.max(np.abs(mat))) if mat.size > 0 else 0.0
+    if not math.isfinite(scale):
+        return _empty_mdir_result()
+
+    if scale > 0.0:
+        mat_scaled = mat / scale
+        cov_scaled = (mat_scaled @ mat_scaled.T) / max(1, z.size)
+        if not np.all(np.isfinite(cov_scaled)):
+            return _empty_mdir_result()
+        evals_scaled, evecs = np.linalg.eigh(cov_scaled)
+        evals = evals_scaled * (scale * scale)
+    else:
+        evals = np.zeros(3, dtype=np.float64)
+        evecs = np.eye(3, dtype=np.float64)
+
     # Sort eigenvalues descending: lam1 >= lam2 >= lam3
     order = np.argsort(evals)[::-1]
     evals = np.maximum(0.0, evals[order])
@@ -213,8 +134,8 @@ def compute_mdir(
     baz_deg = math.degrees(math.atan2(ee, en)) % 360.0
 
     lam1, lam2, lam3 = float(evals[0]), float(evals[1]), float(evals[2])
-    rectilinearity = 1.0 - (lam2 + lam3) / (2.0 * lam1) if lam1 > 1e-30 else 0.0
-    planarity = 1.0 - (2.0 * lam3) / (lam1 + lam2) if (lam1 + lam2) > 1e-30 else 0.0
+    rectilinearity = 1.0 - (lam2 + lam3) / (2.0 * lam1) if lam1 > 0.0 and lam1 > 1e-30 * max(1.0, scale * scale) else 0.0
+    planarity = 1.0 - (2.0 * lam3) / (lam1 + lam2) if (lam1 + lam2) > 0.0 and (lam1 + lam2) > 1e-30 * max(1.0, scale * scale) else 0.0
 
     # Orthogonal trajectory distance d_k = ||u_k - (u_k . v1) v1|| = sqrt(||u_k||^2 - (u_k . v1)^2)
     u_sq = np.sum(mat ** 2, axis=0)
@@ -226,8 +147,8 @@ def compute_mdir(
     rms_pol_norm = (rms_pol / rms_total) if rms_total > 1e-15 else 0.0
 
     # Jurkevics (1988) confidence cones
-    sigma_theta_deg = math.degrees(math.atan(math.sqrt(lam2 / max(lam1, 1e-15))))
-    sigma_phi_deg = math.degrees(math.atan(math.sqrt(lam3 / max(lam1, 1e-15))))
+    sigma_theta_deg = math.degrees(math.atan(math.sqrt(lam2 / max(lam1, 1e-300)))) if lam1 > 0.0 else 0.0
+    sigma_phi_deg = math.degrees(math.atan(math.sqrt(lam3 / max(lam1, 1e-300)))) if lam1 > 0.0 else 0.0
 
     return {
         "azimuth": baz_deg,
@@ -252,9 +173,12 @@ def analyze_polarization_diagnostic(
     t_hi: Optional[float] = None,
 ) -> FitDiagnosticResult:
     """Compute M-16 3C polarization trajectory diagnostics and package as FitDiagnosticResult."""
-    lth = min(tr_z.length, tr_n.length, tr_e.length)
-    dt = tr_z.delta if tr_z.delta > 0 else 0.05
-    i0, i1 = _polarization_window_indices(lth, dt, t_lo, t_hi)
+    t_start, dt, (z_all, n_all, e_all) = _align_traces_for_polarization(tr_z, tr_n, tr_e)
+    shift = t_start - float(tr_z.start_epoch)
+    lo_adj = (float(t_lo) - shift) if (t_lo is not None and t_hi is not None) else t_lo
+    hi_adj = (float(t_hi) - shift) if (t_lo is not None and t_hi is not None) else t_hi
+    lth = z_all.size
+    i0, i1 = _polarization_window_indices(lth, dt, lo_adj, hi_adj)
 
     mdir = compute_mdir(tr_z, tr_n, tr_e, t_lo=t_lo, t_hi=t_hi)
     baz = mdir["azimuth"]
@@ -269,7 +193,12 @@ def analyze_polarization_diagnostic(
     sigma_theta_deg = mdir["sigma_theta_deg"]
     sigma_phi_deg = mdir["sigma_phi_deg"]
 
-    if i1 <= i0:
+    z_seg = z_all[i0:i1] if i1 > i0 else np.empty(0, dtype=np.float64)
+    n_seg = n_all[i0:i1] if i1 > i0 else np.empty(0, dtype=np.float64)
+    e_seg = e_all[i0:i1] if i1 > i0 else np.empty(0, dtype=np.float64)
+    finite_mask = np.isfinite(z_seg) & np.isfinite(n_seg) & np.isfinite(e_seg)
+
+    if i1 <= i0 or np.count_nonzero(finite_mask) == 0:
         empty = np.array([], dtype=np.float64)
         return FitDiagnosticResult(
             fit_type=FitType.POLARIZATION_3C,
@@ -304,9 +233,12 @@ def analyze_polarization_diagnostic(
             },
         )
 
-    z_win = np.asarray(tr_z.data[i0:i1] - np.mean(tr_z.data[i0:i1]), dtype=np.float64)
-    n_win = np.asarray(tr_n.data[i0:i1] - np.mean(tr_n.data[i0:i1]), dtype=np.float64)
-    e_win = np.asarray(tr_e.data[i0:i1] - np.mean(tr_e.data[i0:i1]), dtype=np.float64)
+    mu_z = float(np.mean(z_seg[finite_mask]))
+    mu_n = float(np.mean(n_seg[finite_mask]))
+    mu_e = float(np.mean(e_seg[finite_mask]))
+    z_win = np.where(finite_mask, z_seg - mu_z, 0.0)
+    n_win = np.where(finite_mask, n_seg - mu_n, 0.0)
+    e_win = np.where(finite_mask, e_seg - mu_e, 0.0)
     time_rel = np.arange(i0, i1, dtype=np.float64) * dt
 
     # Rotate demeaned windowed traces into ray-aligned (L, Q, T)
@@ -324,7 +256,7 @@ def analyze_polarization_diagnostic(
     d_k = np.sqrt(np.maximum(0.0, q_arr ** 2 + t_arr ** 2))
 
     n_samples = int(z_win.size)
-    dof = max(1, n_samples - 3)
+    dof = max(1, int(np.count_nonzero(finite_mask)) - 3)
     tot_energy = lam1 + lam2 + lam3
     r_squared = (lam1 / tot_energy) if tot_energy > 1e-30 else 0.0
     sigma_scale = max(rms_pol, 1e-12)
@@ -412,7 +344,7 @@ def analyze_polarization_diagnostic(
     return FitDiagnosticResult(
         fit_type=FitType.POLARIZATION_3C,
         title=f"3C Polarization Analysis ({tr_z.station})",
-        converged=bool(lam1 > 1e-30),
+        converged=bool(lam1 > 0.0),
         iterations=1,
         dof=dof,
         rmse=rms_pol,
@@ -467,7 +399,7 @@ def apply_polarization_filter(
     baz_deg: float = 0.0,
     inci_deg: float = 20.0,
 ) -> Tuple[Trace, Trace, Trace]:
-    """Apply 3-component sliding-window covariance polarization filter matching polfil.c.
+    """Apply 3-component sliding-window centered-covariance polarization filter matching polfil.c.
 
     Modes:
     1 : Weight original (Z, N, E) by rectilinearity R(k)^p
@@ -476,24 +408,89 @@ def apply_polarization_filter(
     4 : P-wave azimuth filter (weight by horizontal alignment with baz_deg)
     5 : S-wave transverse filter (weight by perpendicularity to P direction)
     """
-    lth = min(tr_z.length, tr_n.length, tr_e.length)
-    dt = tr_z.delta if tr_z.delta > 0 else 0.05
+    t_start, dt, (z, n, e) = _align_traces_for_polarization(tr_z, tr_n, tr_e)
+    lth = z.size
+    tz, tn, te = tr_z.copy(), tr_n.copy(), tr_e.copy()
+    tz.start_epoch = t_start
+    tn.start_epoch = t_start
+    te.start_epoch = t_start
+    tz.opinfo = f"POLFIL(M{mode})"
+    tn.opinfo = f"POLFIL(M{mode})"
+    te.opinfo = f"POLFIL(M{mode})"
+
+    if lth == 0:
+        tz.data = np.empty(0, dtype=np.float64)
+        tn.data = np.empty(0, dtype=np.float64)
+        te.data = np.empty(0, dtype=np.float64)
+        return tz, tn, te
+
     half_w = max(1, int(round(0.5 * coherence_win_sec / dt)))
+    finite = np.isfinite(z) & np.isfinite(n) & np.isfinite(e)
+    if not np.any(finite):
+        tz.data = np.zeros(lth, dtype=np.float64)
+        tn.data = np.zeros(lth, dtype=np.float64)
+        te.data = np.zeros(lth, dtype=np.float64)
+        return tz, tn, te
 
-    z = tr_z.data[:lth]
-    n = tr_n.data[:lth]
-    e = tr_e.data[:lth]
+    z_fin = np.where(finite, z, 0.0)
+    n_fin = np.where(finite, n, 0.0)
+    e_fin = np.where(finite, e, 0.0)
 
-    # Precompute cumulative products for O(N) sliding-window 3x3 covariance matrices
-    stacks = np.vstack([z, n, e])  # (3, lth)
-    # Outer products at each sample: (3, 3, lth)
-    outer = stacks[:, None, :] * stacks[None, :, :]
-    csum = np.zeros((3, 3, lth + 1), dtype=np.float64)
-    csum[:, :, 1:] = np.cumsum(outer, axis=2)
+    # Subtract global finite mean first to eliminate catastrophic cancellation in prefix-sum covariance
+    mu_z = float(np.mean(z[finite]))
+    mu_n = float(np.mean(n[finite]))
+    mu_e = float(np.mean(e[finite]))
+    stacks_centered = np.vstack(
+        [
+            np.where(finite, z - mu_z, 0.0),
+            np.where(finite, n - mu_n, 0.0),
+            np.where(finite, e - mu_e, 0.0),
+        ]
+    )
+    scale = float(np.max(np.abs(stacks_centered)))
+    if scale > 0.0 and math.isfinite(scale):
+        stacks = stacks_centered / scale
+    else:
+        tz.data = np.zeros(lth, dtype=np.float64)
+        tn.data = np.zeros(lth, dtype=np.float64)
+        te.data = np.zeros(lth, dtype=np.float64)
+        return tz, tn, te
 
-    out_z = np.zeros(lth, dtype=np.float64)
-    out_n = np.zeros(lth, dtype=np.float64)
-    out_e = np.zeros(lth, dtype=np.float64)
+    # Precompute O(N) prefix sums for centered sliding-window 3x3 covariance matrices
+    csum_cnt = np.zeros(lth + 1, dtype=np.float64)
+    csum_cnt[1:] = np.cumsum(finite.astype(np.float64))
+
+    csum1 = np.zeros((3, lth + 1), dtype=np.float64)
+    csum1[:, 1:] = np.cumsum(stacks, axis=1)
+
+    outer = stacks[:, None, :] * stacks[None, :, :]  # (3, 3, lth)
+    csum2 = np.zeros((3, 3, lth + 1), dtype=np.float64)
+    csum2[:, :, 1:] = np.cumsum(outer, axis=2)
+
+    k_idx = np.arange(lth)
+    k0 = np.maximum(0, k_idx - half_w)
+    k1 = np.minimum(lth, k_idx + half_w + 1)
+    cnt = csum_cnt[k1] - csum_cnt[k0]
+    cnt_safe = np.maximum(1.0, cnt)
+
+    sum1 = csum1[:, k1] - csum1[:, k0]  # (3, lth)
+    mean1 = sum1 / cnt_safe[None, :]  # (3, lth)
+    sum2 = csum2[:, :, k1] - csum2[:, :, k0]  # (3, 3, lth)
+    covs = (sum2 / cnt_safe[None, None, :]) - (mean1[:, None, :] * mean1[None, :, :])  # (3, 3, lth)
+    covs_batch = np.transpose(covs, (2, 0, 1))  # (lth, 3, 3)
+    covs_batch = 0.5 * (covs_batch + np.swapaxes(covs_batch, 1, 2))
+    covs_batch = np.where(np.isfinite(covs_batch), covs_batch, 0.0)
+
+    # Vectorized eigendecomposition across all sliding windows
+    evals, evecs = np.linalg.eigh(covs_batch)
+    lam1 = np.maximum(0.0, evals[:, 2])
+    lam2 = np.maximum(0.0, evals[:, 1])
+    lam3 = np.maximum(0.0, evals[:, 0])
+    e1 = evecs[:, :, 2]  # (lth, 3)
+
+    valid_win = (cnt >= 1.0) & (lam1 > 1e-24)
+    rect = np.where(valid_win, 1.0 - (lam2 + lam3) / np.maximum(2.0 * lam1, 1e-300), 0.0)
+    w_rect = np.maximum(0.0, rect) ** linearity_power
 
     az_rad = math.radians(baz_deg)
     inc_rad = math.radians(inci_deg)
@@ -506,43 +503,26 @@ def apply_polarization_filter(
         dtype=np.float64,
     )
 
-    for k in range(lth):
-        k0 = max(0, k - half_w)
-        k1 = min(lth, k + half_w + 1)
-        cov = (csum[:, :, k1] - csum[:, :, k0]) / max(1, k1 - k0)
-        evals, evecs = np.linalg.eigh(cov)
-        lam1 = max(0.0, float(evals[2]))
-        lam2 = max(0.0, float(evals[1]))
-        lam3 = max(0.0, float(evals[0]))
-        e1 = evecs[:, 2]
+    vecs = np.column_stack([z_fin, n_fin, e_fin])  # (lth, 3)
+    if mode == 1:
+        res = vecs * w_rect[:, None]
+    elif mode == 2:
+        proj = np.sum(vecs * e1, axis=1)
+        res = (proj * w_rect)[:, None] * e1
+    elif mode == 3:
+        align = np.abs(e1 @ d_p) ** linearity_power
+        res = vecs * (w_rect * align)[:, None]
+    elif mode == 4:
+        h_norm = np.hypot(e1[:, 1], e1[:, 2])
+        h_num = np.abs(-e1[:, 1] * math.cos(az_rad) - e1[:, 2] * math.sin(az_rad))
+        h_align = np.where(h_norm > 1e-12, h_num / np.maximum(h_norm, 1e-30), 0.0)
+        res = vecs * (w_rect * (h_align ** linearity_power))[:, None]
+    else:
+        s_align = (1.0 - np.abs(e1 @ d_p)) ** linearity_power
+        res = vecs * (w_rect * s_align)[:, None]
 
-        rect = (1.0 - (lam2 + lam3) / (2.0 * lam1)) if lam1 > 1e-30 else 0.0
-        w_rect = max(0.0, rect) ** linearity_power
-
-        vec_k = np.array([z[k], n[k], e[k]], dtype=np.float64)
-        if mode == 1:
-            res = vec_k * w_rect
-        elif mode == 2:
-            proj = float(np.dot(vec_k, e1))
-            res = (proj * w_rect) * e1
-        elif mode == 3:
-            align = abs(float(np.dot(e1, d_p))) ** linearity_power
-            res = vec_k * (w_rect * align)
-        elif mode == 4:
-            # P-azimuth weighting
-            h_norm = math.hypot(e1[1], e1[2])
-            h_align = abs((-e1[1] * math.cos(az_rad) - e1[2] * math.sin(az_rad)) / h_norm) if h_norm > 1e-12 else 0.0
-            res = vec_k * (w_rect * (h_align ** linearity_power))
-        else:
-            # S-wave (perpendicular to P direction)
-            s_align = (1.0 - abs(float(np.dot(e1, d_p)))) ** linearity_power
-            res = vec_k * (w_rect * s_align)
-
-        out_z[k], out_n[k], out_e[k] = res[0], res[1], res[2]
-
-    tz, tn, te = tr_z.copy(), tr_n.copy(), tr_e.copy()
-    tz.data, tn.data, te.data = out_z, out_n, out_e
-    tz.opinfo = f"POLFIL(M{mode})"
-    tn.opinfo = f"POLFIL(M{mode})"
-    te.opinfo = f"POLFIL(M{mode})"
+    res[~finite] = 0.0
+    tz.data = res[:, 0].copy()
+    tn.data = res[:, 1].copy()
+    te.data = res[:, 2].copy()
     return tz, tn, te

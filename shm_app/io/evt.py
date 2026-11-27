@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from typing import List, Tuple
 
@@ -72,7 +73,7 @@ def read_evt_file(filepath: str) -> Tuple[AnalysisParamSet, List[PhasePick]]:
                 cur_pick.name = val
             elif key == "sign":
                 cur_pick.sign = PhasePick.sign_from_char(val)
-            elif key == "PickType" or key == "pick type" or key == "source":
+            elif key in ("picktype", "pick type", "source"):
                 cur_pick.source = (val.lower() or "m")[0]
             elif key == "quality number":
                 try:
@@ -194,12 +195,23 @@ def read_evt_file(filepath: str) -> Tuple[AnalysisParamSet, List[PhasePick]]:
             elif key == "reference longitude":
                 param.ref_lon = _fval(val)
 
+    # Flush trailing pick if the file omitted the final '--- End of Phase ---' marker
+    if cur_pick.station or cur_pick.onset:
+        picks.append(cur_pick)
+
     return param, picks
 
 
-def write_evt_file(filepath: str, param: AnalysisParamSet, picks: List[PhasePick]) -> None:
+def write_evt_file(
+    filepath: str,
+    param: AnalysisParamSet,
+    picks: List[PhasePick],
+    *,
+    include_zero_fields: bool = False,
+) -> None:
     """Write an SHM .evt event parameter file matching phaseinf.c."""
     os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+    has_located_origin = bool(param.origin)
     with open(filepath, "w", encoding="latin-1") as out:
         for idx, p in enumerate(picks):
             if param.event_id > 0:
@@ -224,40 +236,68 @@ def write_evt_file(filepath: str, param: AnalysisParamSet, picks: List[PhasePick
                 out.write(f"Broadband amplitude        : {p.bb_ampl:.2f}\n")
             if p.bb_period > 0.0:
                 out.write(f"Broadband period           : {p.bb_period:.2f}\n")
-            if p.mag_ml != 0.0:
+            if math.isfinite(p.mag_ml) and (
+                p.mag_ml != 0.0
+                or include_zero_fields
+                or (p.ampl > 0.0 and p.mag_mb == 0.0 and p.mag_ms == 0.0)
+            ):
                 out.write(f"Magnitude ml               : {p.mag_ml:.2f}\n")
-            if p.mag_mb != 0.0:
+            if math.isfinite(p.mag_mb) and (p.mag_mb != 0.0 or include_zero_fields):
                 out.write(f"Magnitude mb               : {p.mag_mb:.2f}\n")
-            if p.mag_ms != 0.0:
+            if math.isfinite(p.mag_ms) and (p.mag_ms != 0.0 or include_zero_fields):
                 out.write(f"Magnitude ms               : {p.mag_ms:.2f}\n")
-            if p.mag_mbb != 0.0:
+            if math.isfinite(p.mag_mbb) and (p.mag_mbb != 0.0 or include_zero_fields or p.bb_ampl > 0.0):
                 out.write(f"Magnitude mbb              : {p.mag_mbb:.2f}\n")
             if p.snr > 0.0:
                 out.write(f"Signal/Noise               : {p.snr:.1f}\n")
-            if p.resid != 0.0:
+            if math.isfinite(p.resid) and (
+                p.resid != 0.0 or p.resid_corr != 0.0 or has_located_origin or include_zero_fields
+            ):
                 out.write(f"Residual time              : {p.resid:.2f}\n")
-            if p.slowness != 0.0:
+            if p.slowness > 0.0 or include_zero_fields:
                 out.write(f"Phase slowness             : {p.slowness:.2f}\n")
-            if p.beam_azim != 0.0:
+            if math.isfinite(p.beam_azim) and (
+                p.beam_azim != 0.0 or p.slowness > 0.0 or p.d_beam_azim > 0.0 or include_zero_fields
+            ):
                 out.write(f"Phase beam azimuth         : {p.beam_azim:.2f}\n")
             if p.flags:
                 out.write(f"Phase flags                : {p.flags}\n")
 
             # Attach event summary block on the last phase (or first reference phase)
             if idx == len(picks) - 1:
-                _write_event_summary_lines(out, param)
+                _write_event_summary_lines(out, param, include_zero_fields=include_zero_fields)
 
             out.write(f"{PHASE_END_MARKER}\n")
 
         if not picks:
-            _write_event_summary_lines(out, param)
+            _write_event_summary_lines(out, param, include_zero_fields=include_zero_fields)
             out.write(f"{PHASE_END_MARKER}\n")
 
 
-def _write_event_summary_lines(out, param: AnalysisParamSet) -> None:
+def _write_event_summary_lines(
+    out,
+    param: AnalysisParamSet,
+    *,
+    include_zero_fields: bool = False,
+) -> None:
     if param.origin:
         out.write(f"Origin time                : {param.origin}\n")
-    if param.lat != 0.0 or param.lon != 0.0:
+    has_explicit_coords = (
+        include_zero_fields
+        or param.lat != 0.0
+        or param.lon != 0.0
+        or bool(param.origin)
+        or param.d_lat > 0.0
+        or param.d_lon > 0.0
+        or param.distance > 0.0
+        or param.azimuth != 0.0
+        or param.slowness > 0.0
+        or param.event_id > 0
+        or param.region_id > 0
+        or bool(param.region_name)
+        or param.error_ellipse is not None
+    )
+    if has_explicit_coords and math.isfinite(param.lat) and math.isfinite(param.lon):
         out.write(f"Latitude                   : {param.lat:+8.3f}\n")
         out.write(f"Longitude                  : {param.lon:+8.3f}\n")
     if param.d_lat > 0.0:
@@ -270,17 +310,28 @@ def _write_event_summary_lines(out, param: AnalysisParamSet) -> None:
     out.write(f"Depth type                 : {param.depth_type}\n")
     if param.distance > 0.0:
         out.write(f"Distance (deg)             : {param.distance:.2f}\n")
-    if param.azimuth != 0.0:
+    if math.isfinite(param.azimuth) and (
+        param.azimuth != 0.0
+        or param.distance > 0.0
+        or param.slowness > 0.0
+        or param.d_azimuth > 0.0
+        or bool(param.origin)
+        or include_zero_fields
+    ):
         out.write(f"Back-azimuth (deg)         : {param.azimuth:.2f}\n")
     if param.slowness > 0.0:
         out.write(f"Observed slowness (sec/deg): {param.slowness:.2f}\n")
-    if param.mag_ml != 0.0:
+    if math.isfinite(param.mag_ml) and (
+        param.mag_ml != 0.0
+        or include_zero_fields
+        or (param.mags_count > 0 and param.mag_mb == 0.0 and param.mag_ms == 0.0 and param.mag_mbb == 0.0)
+    ):
         out.write(f"Mean magnitude ml          : {param.mag_ml:.2f}\n")
-    if param.mag_mb != 0.0:
+    if math.isfinite(param.mag_mb) and (param.mag_mb != 0.0 or include_zero_fields):
         out.write(f"Mean magnitude mb          : {param.mag_mb:.2f}\n")
-    if param.mag_ms != 0.0:
+    if math.isfinite(param.mag_ms) and (param.mag_ms != 0.0 or include_zero_fields):
         out.write(f"Mean magnitude ms          : {param.mag_ms:.2f}\n")
-    if param.mag_mbb != 0.0:
+    if math.isfinite(param.mag_mbb) and (param.mag_mbb != 0.0 or include_zero_fields):
         out.write(f"Mean magnitude mbb         : {param.mag_mbb:.2f}\n")
     if param.region_id > 0:
         out.write(f"Region ID                  : {param.region_id}\n")

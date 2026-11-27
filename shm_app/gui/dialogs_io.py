@@ -19,7 +19,6 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -32,11 +31,14 @@ from shm_app.core.config_station import (
 )
 from shm_app.core.models import Trace
 from shm_app.core.time_utils import parse_sh_time
+from shm_app.gui.dialog_seedlink import SeedLinkStreamDialog
 from shm_app.gui.help_texts import register_tutorial_help
 from shm_app.gui.ui_helpers import apply_c_locale, disable_button_autodefault
+from shm_app.io.ascii_io import read_ascii_file
 from shm_app.io.gse import read_gse_file
-from shm_app.io.mseed import read_from_sfd, read_mseed_file
-from shm_app.io.qfile import read_ascii_file, read_qfile
+from shm_app.io.mseed import read_mseed_file
+from shm_app.io.qfile import read_qfile
+from shm_app.io.sfd import read_from_sfd
 
 
 class ReadDataDialog(QDialog):
@@ -56,18 +58,38 @@ class ReadDataDialog(QDialog):
         grp_ex = QGroupBox("Bundled SHM Example Datasets (One-Click Load)")
         ex_grid = QGridLayout(grp_ex)
         ex_grid.setSpacing(6)
-        btn_ex_mseed = QPushButton("Load GRSN+GRF Mini-SEED (02-Nov-2003)")
-        btn_ex_mseed.clicked.connect(self._load_example_mseed)
-        btn_ex_grf_gse = QPushButton("Load GRF Array GSE (02-Nov-2003 02:25)")
-        btn_ex_grf_gse.clicked.connect(lambda: self._load_example_gse("GRF_031102_0225.GSE"))
-        btn_ex_grsn1 = QPushButton("Load GRSN GSE (02-Oct-2003 23:34)")
-        btn_ex_grsn1.clicked.connect(lambda: self._load_example_gse("GRSN_031002_2334.GSE"))
-        btn_ex_grsn2 = QPushButton("Load GRSN GSE (02-Nov-2003 02:24)")
-        btn_ex_grsn2.clicked.connect(lambda: self._load_example_gse("GRSN_031102_0224.GSE"))
-        ex_grid.addWidget(btn_ex_mseed, 0, 0)
-        ex_grid.addWidget(btn_ex_grf_gse, 0, 1)
-        ex_grid.addWidget(btn_ex_grsn1, 1, 0)
-        ex_grid.addWidget(btn_ex_grsn2, 1, 1)
+        mseed_ex_dir = os.path.join(self.config.data_examples_dir, "mseed")
+        grf_gse_path = os.path.join(self.config.data_examples_dir, "gse", "GRF_031102_0225.GSE")
+        grsn1_gse_path = os.path.join(self.config.data_examples_dir, "gse", "GRSN_031002_2334.GSE")
+        grsn2_gse_path = os.path.join(self.config.data_examples_dir, "gse", "GRSN_031102_0224.GSE")
+        missing_ex_tip = "Requires external SHM_ROOT data-examples/ (not found)"
+
+        self.btn_ex_mseed = QPushButton("Load GRSN+GRF Mini-SEED (02-Nov-2003)")
+        self.btn_ex_mseed.clicked.connect(self._load_example_mseed)
+        self.btn_ex_grf_gse = QPushButton("Load GRF Array GSE (02-Nov-2003 02:25)")
+        self.btn_ex_grf_gse.clicked.connect(lambda: self._load_example_gse("GRF_031102_0225.GSE"))
+        self.btn_ex_grsn1 = QPushButton("Load GRSN GSE (02-Oct-2003 23:34)")
+        self.btn_ex_grsn1.clicked.connect(lambda: self._load_example_gse("GRSN_031002_2334.GSE"))
+        self.btn_ex_grsn2 = QPushButton("Load GRSN GSE (02-Nov-2003 02:24)")
+        self.btn_ex_grsn2.clicked.connect(lambda: self._load_example_gse("GRSN_031102_0224.GSE"))
+
+        ex_targets = (
+            (self.btn_ex_mseed, os.path.isdir(mseed_ex_dir)),
+            (self.btn_ex_grf_gse, os.path.isfile(grf_gse_path)),
+            (self.btn_ex_grsn1, os.path.isfile(grsn1_gse_path)),
+            (self.btn_ex_grsn2, os.path.isfile(grsn2_gse_path)),
+        )
+        for btn, available in ex_targets:
+            btn.setEnabled(available)
+            if not available:
+                btn.setToolTip(missing_ex_tip)
+        if not any(avail for _, avail in ex_targets):
+            grp_ex.setTitle("Bundled SHM Example Datasets (Requires external SHM_ROOT data-examples/ — not found)")
+
+        ex_grid.addWidget(self.btn_ex_mseed, 0, 0)
+        ex_grid.addWidget(self.btn_ex_grf_gse, 0, 1)
+        ex_grid.addWidget(self.btn_ex_grsn1, 1, 0)
+        ex_grid.addWidget(self.btn_ex_grsn2, 1, 1)
         layout.addWidget(grp_ex)
 
         # Station Matrix
@@ -112,8 +134,9 @@ class ReadDataDialog(QDialog):
         form = QFormLayout(grp_opt)
 
         path_h = QHBoxLayout()
-        mseed_default = os.path.join(self.config.data_examples_dir, "mseed")
-        self.path_edit = QLineEdit(mseed_default)
+        default_src = mseed_ex_dir if os.path.isdir(mseed_ex_dir) else ""
+        self.path_edit = QLineEdit(default_src)
+        self.path_edit.setPlaceholderText("Select a waveform file (.GSE, .mseed, .sfd, .QHD, .asc) or directory...")
         btn_browse_file = QPushButton("Browse File...")
         btn_browse_file.clicked.connect(self._browse_file)
         btn_browse_dir = QPushButton("Browse Dir...")
@@ -149,7 +172,9 @@ class ReadDataDialog(QDialog):
         self.len_spin.setSuffix(" s")
         self.len_spin.setMinimumHeight(30)
         self.chk_full_dur = QCheckBox("Read Full File Duration")
+        self.chk_full_dur.toggled.connect(self._on_full_duration_toggled)
         self.chk_full_dur.setChecked(True)
+        self._on_full_duration_toggled(True)
         time_grid.addWidget(QLabel("Start:"), 0, 0)
         time_grid.addWidget(self.start_edit, 0, 1)
         time_grid.addWidget(QLabel("Length:"), 0, 2)
@@ -186,18 +211,30 @@ class ReadDataDialog(QDialog):
         disable_button_autodefault(self)
         apply_c_locale(self)
 
+    def _on_full_duration_toggled(self, full_dur: bool) -> None:
+        self.start_edit.setEnabled(not full_dur)
+        self.len_spin.setEnabled(not full_dur)
+
+    def _default_browse_dir(self) -> str:
+        if os.path.isdir(self.config.data_examples_dir):
+            return self.config.data_examples_dir
+        cwd = os.getcwd()
+        if os.path.isdir(cwd):
+            return cwd
+        return os.path.expanduser("~")
+
     def _browse_file(self) -> None:
         fpath, _ = QFileDialog.getOpenFileName(
             self,
             "Select Waveform File",
-            self.config.data_examples_dir,
+            self._default_browse_dir(),
             "All Seismic Files (*.bhz *.bhn *.bhe *.mseed *.sfd *.GSE *.gse *.QHD *.qhd *.asc *.txt);;All Files (*)",
         )
         if fpath:
             self.path_edit.setText(fpath)
 
     def _browse_dir(self) -> None:
-        dpath = QFileDialog.getExistingDirectory(self, "Select Waveform Directory", self.config.data_examples_dir)
+        dpath = QFileDialog.getExistingDirectory(self, "Select Waveform Directory", self._default_browse_dir())
         if dpath:
             self.path_edit.setText(dpath)
 
@@ -228,10 +265,32 @@ class ReadDataDialog(QDialog):
                 return False
         return True
 
+    def _read_single_file(
+        self,
+        filepath: str,
+        t_start: Optional[float],
+        dur: Optional[float],
+        sfd_streams: List[str],
+    ) -> List[Trace]:
+        low = filepath.lower()
+        if low.endswith(".sfd"):
+            return read_from_sfd(filepath, streams=sfd_streams, t_start=t_start, duration=dur, config=self.config)
+        if low.endswith(".gse"):
+            return read_gse_file(filepath, config=self.config)
+        if low.endswith(".qhd") or low.endswith(".qbn"):
+            return read_qfile(filepath, config=self.config)
+        if low.endswith(".asc") or low.endswith(".txt"):
+            return read_ascii_file(filepath, config=self.config)
+        return read_mseed_file(filepath, t_start=t_start, duration=dur, config=self.config)
+
     def _execute_read(self) -> None:
         self.append_mode = self.chk_keep.isChecked()
         src = self.path_edit.text().strip()
         if not src:
+            QMessageBox.warning(self, "Read Waveforms", "Please enter or browse to a waveform file or directory.")
+            return
+        if not os.path.exists(src):
+            QMessageBox.warning(self, "Read Waveforms", f"Waveform source not found:\n{src}")
             return
 
         selected_comps = self.selected_components()
@@ -241,43 +300,68 @@ class ReadDataDialog(QDialog):
         band = self.chan_combo.currentText().strip().upper()
         sfd_streams = self._sfd_stream_patterns(band, selected_comps)
 
-        selected_stations = {st for st, cb in self.station_checks.items() if cb.isChecked()}
-        t_start = None if self.chk_full_dur.isChecked() else parse_sh_time(self.start_edit.text())
+        unchecked_stations = {st for st, cb in self.station_checks.items() if not cb.isChecked()}
+        try:
+            t_start = None if self.chk_full_dur.isChecked() else parse_sh_time(self.start_edit.text())
+        except Exception as exc:
+            QMessageBox.warning(self, "Read Waveforms", f"Invalid start time:\n{exc}")
+            return
         dur = None if self.chk_full_dur.isChecked() else self.len_spin.value()
 
         traces: List[Trace] = []
-        if os.path.isdir(src):
-            sfd_path = os.path.join(src, "sfdlist.sfd")
-            if os.path.isfile(sfd_path):
-                traces = read_from_sfd(sfd_path, streams=sfd_streams, t_start=t_start, duration=dur, config=self.config)
+        dir_errors: List[str] = []
+        try:
+            if os.path.isdir(src):
+                sfd_path = os.path.join(src, "sfdlist.sfd")
+                if os.path.isfile(sfd_path):
+                    traces = read_from_sfd(
+                        sfd_path, streams=sfd_streams, t_start=t_start, duration=dur, config=self.config
+                    )
+                else:
+                    for fn in sorted(os.listdir(src)):
+                        fp = os.path.join(src, fn)
+                        low = fn.lower()
+                        if not os.path.isfile(fp) or fn.startswith(".") or low.endswith((".sfd", ".qbn")):
+                            continue
+                        try:
+                            traces.extend(self._read_single_file(fp, t_start, dur, sfd_streams))
+                        except Exception as exc:
+                            dir_errors.append(f"{fn}: {exc}")
             else:
-                for fn in sorted(os.listdir(src)):
-                    fp = os.path.join(src, fn)
-                    if os.path.isfile(fp) and not fn.endswith(".sfd"):
-                        traces.extend(read_mseed_file(fp, t_start=t_start, duration=dur, config=self.config))
-        elif src.lower().endswith(".sfd"):
-            traces = read_from_sfd(src, streams=sfd_streams, t_start=t_start, duration=dur, config=self.config)
-        elif src.lower().endswith(".gse"):
-            traces = read_gse_file(src, config=self.config)
-        elif src.lower().endswith(".qhd") or src.lower().endswith(".qbn"):
-            traces = read_qfile(src, config=self.config)
-        elif src.lower().endswith(".asc") or src.lower().endswith(".txt"):
-            traces = read_ascii_file(src, config=self.config)
-        else:
-            traces = read_mseed_file(src, t_start=t_start, duration=dur, config=self.config)
+                traces = self._read_single_file(src, t_start, dur, sfd_streams)
+        except Exception as exc:
+            QMessageBox.warning(self, "Read Waveforms", f"Failed to read waveform data:\n{exc}")
+            return
 
-        if len(selected_stations) < len(self.station_checks):
-            traces = [t for t in traces if t.station.upper() in selected_stations]
+        if not traces and dir_errors:
+            QMessageBox.warning(
+                self,
+                "Read Waveforms",
+                f"No waveforms could be read from directory:\n{src}\n\n{dir_errors[0]}",
+            )
+            return
+
+        if unchecked_stations:
+            traces = [t for t in traces if t.station.upper() not in unchecked_stations]
         traces = [t for t in traces if self._matches_stream_filter(t, band, selected_comps)]
+
+        if not traces:
+            QMessageBox.warning(
+                self,
+                "Read Waveforms",
+                "No traces matched the selected station, channel, or component filters.",
+            )
+            return
 
         self.loaded_traces = traces
         self.accept()
 
     def _load_stationxml_file(self) -> None:
+        start_dir = self.config.shm_root if os.path.isdir(self.config.shm_root) else self._default_browse_dir()
         fpath, _ = QFileDialog.getOpenFileName(
             self,
             "Load FDSN StationXML",
-            self.config.shm_root,
+            start_dir,
             "StationXML Files (*.xml *.stationxml);;All Files (*)",
         )
         if not fpath:
@@ -293,123 +377,4 @@ class ReadDataDialog(QDialog):
             )
         except Exception as exc:
             QMessageBox.warning(self, "StationXML Error", str(exc))
-
-
-class SeedLinkStreamDialog(QDialog):
-    """Configuration and control dialog for native SeedLink v3.1 TCP streaming (M-21)."""
-
-    def __init__(self, live_coordinator, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.live_coordinator = live_coordinator
-        self.setWindowTitle("SeedLink v3.1 Live Waveform Stream")
-        self.resize(520, 260)
-
-        layout = QVBoxLayout(self)
-
-        grp = QGroupBox("SeedLink Server && Stream Selection")
-        form = QFormLayout(grp)
-
-        self.host_edit = QLineEdit("geofon.gfz-potsdam.de")
-        self.port_spin = QSpinBox()
-        self.port_spin.setRange(1, 65535)
-        self.port_spin.setValue(18000)
-
-        self.streams_edit = QLineEdit("GR_GRA1:BHZ,GR_GRB1:BHZ")
-        self.streams_edit.setPlaceholderText("Comma-separated NET_STA:LOCCHA (e.g. GR_GRA1:BHZ)")
-
-        self.max_samples_spin = QSpinBox()
-        self.max_samples_spin.setRange(200, 500000)
-        self.max_samples_spin.setValue(36000)
-        self.max_samples_spin.setSingleStep(1000)
-
-        form.addRow("Host:", self.host_edit)
-        form.addRow("Port:", self.port_spin)
-        form.addRow("Streams:", self.streams_edit)
-        form.addRow("Buffer Samples / Stream:", self.max_samples_spin)
-        layout.addWidget(grp)
-
-        self.status_lbl = QLabel(f"Status: {getattr(live_coordinator, 'seedlink_status', 'idle')}")
-        self.status_lbl.setStyleSheet("color: #58a6ff; font-family: Monospace;")
-        layout.addWidget(self.status_lbl)
-
-        btn_h = QHBoxLayout()
-        self.btn_start = QPushButton("Start Stream")
-        self.btn_start.clicked.connect(self._on_start)
-        self.btn_stop = QPushButton("Stop Stream")
-        self.btn_stop.clicked.connect(self._on_stop)
-        btn_close = QPushButton("Close")
-        btn_close.clicked.connect(self.accept)
-        btn_h.addStretch(1)
-        btn_h.addWidget(self.btn_start)
-        btn_h.addWidget(self.btn_stop)
-        btn_h.addWidget(btn_close)
-        layout.addLayout(btn_h)
-
-        if hasattr(live_coordinator, "seedlinkStatusChanged"):
-            live_coordinator.seedlinkStatusChanged.connect(self._on_status_changed)
-
-        self._sync_buttons()
-        disable_button_autodefault(self)
-        apply_c_locale(self)
-
-    def parsed_streams(self) -> List[tuple]:
-        out: List[tuple] = []
-        for raw in self.streams_edit.text().split(","):
-            tok = raw.strip()
-            if not tok:
-                continue
-            if ":" in tok:
-                left, sel = tok.split(":", 1)
-                parts = [p for p in left.replace(".", "_").split("_") if p]
-                if len(parts) >= 2:
-                    sel_norm = sel.strip().upper()
-                    if "." not in sel_norm:
-                        sel_norm = f"{sel_norm}.D"
-                    out.append((parts[0].upper(), parts[1].upper(), sel_norm))
-                    continue
-            if "." in tok:
-                parts = tok.split(".")
-                if len(parts) >= 4:
-                    loc = parts[2].strip().upper()
-                    cha = parts[3].strip().upper() or "BHZ"
-                    sel = f"{loc}{cha}.D" if loc else f"{cha}.D"
-                    out.append((parts[0].strip().upper(), parts[1].strip().upper(), sel))
-                    continue
-                if len(parts) >= 2:
-                    sel = f"{parts[2].strip().upper()}.D" if len(parts) == 3 and parts[2].strip() else "BHZ.D"
-                    out.append((parts[0].strip().upper(), parts[1].strip().upper(), sel))
-                    continue
-            if "_" in tok:
-                parts = [p for p in tok.split("_") if p]
-                if len(parts) >= 2:
-                    sel = f"{parts[2].upper()}.D" if len(parts) >= 3 else "BHZ.D"
-                    out.append((parts[0].upper(), parts[1].upper(), sel))
-        return out
-
-    def _on_start(self) -> None:
-        host = self.host_edit.text().strip()
-        if not host:
-            QMessageBox.warning(self, "SeedLink", "Please enter a SeedLink host.")
-            return
-        streams = self.parsed_streams()
-        self.live_coordinator.start_seedlink(
-            host=host,
-            port=int(self.port_spin.value()),
-            streams=streams or None,
-            max_samples_per_stream=int(self.max_samples_spin.value()),
-        )
-        self._sync_buttons()
-
-    def _on_stop(self) -> None:
-        self.live_coordinator.stop_seedlink()
-        self._sync_buttons()
-
-    def _on_status_changed(self, status: str) -> None:
-        self.status_lbl.setText(f"Status: {status}")
-        self._sync_buttons()
-
-    def _sync_buttons(self) -> None:
-        running = bool(getattr(self.live_coordinator, "is_seedlink_running", False))
-        self.btn_start.setEnabled(not running)
-        self.btn_stop.setEnabled(running)
 

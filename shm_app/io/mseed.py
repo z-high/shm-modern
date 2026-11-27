@@ -1,9 +1,10 @@
-"""Mini-SEED and SFD index file reader/writer with Steim-1 and Steim-2 compression/decompression."""
+"""Mini-SEED reader/writer with Steim-1 and Steim-2 compression/decompression."""
 
 from __future__ import annotations
 
 import datetime
 from dataclasses import dataclass
+import logging
 import math
 import os
 import struct
@@ -14,23 +15,7 @@ from shm_app.core.config_station import SHMConfig, get_config
 from shm_app.core.models import Trace
 from shm_app.core.time_utils import format_sh_time, julian_to_month_day, month_day_to_julian, parse_sh_time
 
-
-@dataclass
-class SFDRecord:
-    """Single line entry in an SFD index file (sfdlist.sfd)."""
-
-    stream: str = ""
-    filepath: str = ""
-    t_start: float = 0.0
-    t_end: float = 0.0
-    t_start_str: str = ""
-    t_end_str: str = ""
-    recno: int = 1
-    swap_hdr: int = 0
-    reclth: int = 4096
-    byteoff: int = 0
-    calib: float = 1.0
-    net_loc: str = ""
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -260,14 +245,17 @@ def compress_steim1_record(
 
     Returns (record_bytes, num_samples_packed).
     """
+    if not isinstance(reclth, int) or isinstance(reclth, bool) or reclth < 128 or (reclth & (reclth - 1)) != 0:
+        raise ValueError(f"Mini-SEED record length must be a power of 2 >= 128, got {reclth!r}")
+
     nframes = (reclth - 64) // 64
-    smp = np.asarray(samples, dtype=np.int32)
+    smp = np.asarray(samples, dtype=np.int64)
     total_avail = int(smp.size)
     if total_avail == 0:
         return b"\x00" * reclth, 0
 
-    # Compute differences: d[0] = smp[0] - prev_sample, d[i] = smp[i] - smp[i-1]
-    diffs = np.empty(total_avail, dtype=np.int32)
+    # Compute differences in int64: d[0] = smp[0] - prev_sample, d[i] = smp[i] - smp[i-1]
+    diffs = np.empty(total_avail, dtype=np.int64)
     diffs[0] = int(smp[0]) - int(prev_sample)
     if total_avail > 1:
         diffs[1:] = smp[1:] - smp[:-1]
@@ -336,12 +324,17 @@ def compress_steim1_record(
     else:
         fact, mult = 20, 1
 
+    def _ascii_field(val: str, width: int) -> bytes:
+        cleaned = (val or "").encode("ascii", errors="replace").decode("ascii")
+        return f"{cleaned[:width]:<{width}s}".encode("ascii")
+
     recexp = int(round(math.log2(reclth)))
-    seq_str = f"{seqno:06d}"[:6].encode("ascii")
-    stat_b = f"{station[:5]:<5s}".encode("ascii")
-    loc_b = f"{locid[:2]:<2s}".encode("ascii")
-    chan_b = f"{channel[:3]:<3s}".encode("ascii")
-    net_b = f"{network[:2]:<2s}".encode("ascii")
+    seq_val = abs(int(seqno)) % 1000000
+    seq_str = f"{seq_val:06d}".encode("ascii")
+    stat_b = _ascii_field(station, 5)
+    loc_b = _ascii_field(locid, 2)
+    chan_b = _ascii_field(channel, 3)
+    net_b = _ascii_field(network, 2)
 
     hdr = struct.pack(
         ">6scB5s2s3s2sHHBBBBHHhhBBBBiHH",
@@ -431,7 +424,13 @@ def read_mseed_bytes(
     while offset + 64 <= total_len:
         try:
             hdr = parse_seed_header(raw[offset : offset + min(512, total_len - offset)])
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Stopping Mini-SEED parse at byte offset %d (%s): %s",
+                offset,
+                source_path or "<bytes>",
+                exc,
+            )
             break
 
         reclth = hdr.reclth if hdr.reclth >= 128 else 4096
@@ -458,92 +457,122 @@ def read_mseed_bytes(
     out_traces: List[Trace] = []
     for (station, channel, network, locid), segments in traces_by_key.items():
         segments.sort(key=lambda x: x[0])
+
+        groups: List[Tuple[float, float, List[np.ndarray]]] = []
         dt = segments[0][1]
         merged_start = segments[0][0]
         chunks: List[np.ndarray] = [segments[0][2]]
         cur_end = merged_start + segments[0][2].size * dt
 
-        for seg_start, _seg_dt, seg_data in segments[1:]:
+        for seg_start, seg_dt, seg_data in segments[1:]:
+            rate_changed = (
+                dt <= 0
+                or seg_dt <= 0
+                or abs(seg_dt - dt) > max(1e-6, 0.01 * dt)
+            )
             gap = seg_start - cur_end
+            if rate_changed or gap >= 3600.0:
+                groups.append((merged_start, dt, chunks))
+                dt = seg_dt
+                merged_start = seg_start
+                chunks = [seg_data]
+                cur_end = merged_start + seg_data.size * dt
+                continue
+
             if abs(gap) <= 1.5 * dt:
-                chunks.append(seg_data)
-            elif gap > 1.5 * dt and gap < 3600.0:
-                # Pad small gap with linear interpolation between boundary samples
+                if gap < 0:
+                    skip = int(round(-gap / dt))
+                    if skip > 0:
+                        if skip < seg_data.size:
+                            chunks.append(seg_data[skip:])
+                    else:
+                        chunks.append(seg_data)
+                else:
+                    chunks.append(seg_data)
+            elif gap > 1.5 * dt:
+                # Pad small gap (< 3600s) with linear interpolation between boundary samples
                 n_pad = int(round(gap / dt))
                 if n_pad > 0:
                     pad = np.linspace(chunks[-1][-1], seg_data[0], n_pad + 2)[1:-1]
                     chunks.append(pad)
                 chunks.append(seg_data)
-            elif gap < -1.5 * dt:
+            else:
                 # Overlap: skip already-covered samples
                 skip = int(round(-gap / dt))
                 if skip < seg_data.size:
                     chunks.append(seg_data[skip:])
             cur_end = merged_start + sum(c.size for c in chunks) * dt
 
-        full_data = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+        groups.append((merged_start, dt, chunks))
 
-        # Trim to [t_start, t_start + duration] if requested
-        if t_start is not None and duration is not None:
-            i0 = max(0, int(round((t_start - merged_start) / dt)))
-            i1 = min(full_data.size, max(0, int(round((t_start + duration - merged_start) / dt))))
-            if i1 > i0:
-                merged_start = merged_start + i0 * dt
-                full_data = full_data[i0:i1]
+        for grp_start, grp_dt, grp_chunks in groups:
+            full_data = np.concatenate(grp_chunks) if len(grp_chunks) > 1 else grp_chunks[0]
+            merged_start = grp_start
+            dt = grp_dt
 
-        chan1 = channel[0:1] if len(channel) >= 1 else "B"
-        chan2 = channel[1:2] if len(channel) >= 2 else "H"
-        comp = channel[2:3] if len(channel) >= 3 else "Z"
-        stream_str = f"{station.lower()}-{chan1.lower()}{chan2.lower()}-{comp.lower()}"
-        ch_meta = (
-            cfg.get_channel_metadata(network, station, locid, channel, merged_start)
-            if hasattr(cfg, "get_channel_metadata")
-            else None
-        )
-        if calib_override is not None and calib_override > 0:
-            calib = calib_override
-        elif ch_meta is not None and hasattr(cfg, "_stationxml_calib_nm_per_count"):
-            sxml_calib = cfg._stationxml_calib_nm_per_count(ch_meta)
-            calib = sxml_calib if (sxml_calib is not None and sxml_calib > 0) else cfg.get_sensitivity(stream_str, merged_start)
-        else:
-            calib = cfg.get_sensitivity(stream_str, merged_start)
-        scaled_data = full_data * calib
+            # Trim to [t_start, t_start + duration] if requested
+            if t_start is not None and duration is not None:
+                i0 = max(0, int(round((t_start - merged_start) / dt)))
+                i1 = min(full_data.size, max(0, int(round((t_start + duration - merged_start) / dt))))
+                if i1 > i0:
+                    merged_start = merged_start + i0 * dt
+                    full_data = full_data[i0:i1]
+                elif merged_start >= t_start + duration or (merged_start + full_data.size * dt) <= t_start:
+                    continue
 
-        stat_info = cfg.get_station(station)
-        if ch_meta is not None and (ch_meta.latitude != 0.0 or ch_meta.longitude != 0.0):
-            tr_lat = float(ch_meta.latitude)
-            tr_lon = float(ch_meta.longitude)
-        else:
-            tr_lat = stat_info.lat
-            tr_lon = stat_info.lon
-        tr_inst = (ch_meta.sensor_description if (ch_meta is not None and ch_meta.sensor_description) else stat_info.instrument)
-        extra_headers: Dict[str, Any] = {}
-        if ch_meta is not None:
-            extra_headers["azimuth"] = float(ch_meta.azimuth)
-            extra_headers["dip"] = float(ch_meta.dip)
-            extra_headers["station_lat"] = float(tr_lat)
-            extra_headers["station_lon"] = float(tr_lon)
-            extra_headers["station_elev"] = float(ch_meta.elevation)
-            extra_headers["channel_depth_m"] = float(ch_meta.depth)
+            chan1 = channel[0:1] if len(channel) >= 1 else "B"
+            chan2 = channel[1:2] if len(channel) >= 2 else "H"
+            comp = channel[2:3] if len(channel) >= 3 else "Z"
+            stream_str = f"{station.lower()}-{chan1.lower()}{chan2.lower()}-{comp.lower()}"
+            ch_meta = (
+                cfg.get_channel_metadata(network, station, locid, channel, merged_start)
+                if hasattr(cfg, "get_channel_metadata")
+                else None
+            )
+            if calib_override is not None and calib_override > 0:
+                calib = calib_override
+            elif ch_meta is not None and hasattr(cfg, "_stationxml_calib_nm_per_count"):
+                sxml_calib = cfg._stationxml_calib_nm_per_count(ch_meta)
+                calib = sxml_calib if (sxml_calib is not None and sxml_calib > 0) else cfg.get_sensitivity(stream_str, merged_start)
+            else:
+                calib = cfg.get_sensitivity(stream_str, merged_start)
+            scaled_data = full_data * calib
 
-        tr = Trace(
-            data=scaled_data,
-            delta=dt,
-            station=station,
-            comp=comp,
-            chan1=chan1,
-            chan2=chan2,
-            network=network,
-            locid=locid,
-            start_epoch=merged_start,
-            calib=calib,
-            lat=tr_lat,
-            lon=tr_lon,
-            instype=tr_inst,
-            extra_headers=extra_headers,
-            source_path=source_path,
-        )
-        out_traces.append(tr)
+            stat_info = cfg.get_station(station)
+            if ch_meta is not None and (ch_meta.latitude != 0.0 or ch_meta.longitude != 0.0):
+                tr_lat = float(ch_meta.latitude)
+                tr_lon = float(ch_meta.longitude)
+            else:
+                tr_lat = stat_info.lat
+                tr_lon = stat_info.lon
+            tr_inst = (ch_meta.sensor_description if (ch_meta is not None and ch_meta.sensor_description) else stat_info.instrument)
+            extra_headers: Dict[str, Any] = {}
+            if ch_meta is not None:
+                extra_headers["azimuth"] = float(ch_meta.azimuth)
+                extra_headers["dip"] = float(ch_meta.dip)
+                extra_headers["station_lat"] = float(tr_lat)
+                extra_headers["station_lon"] = float(tr_lon)
+                extra_headers["station_elev"] = float(ch_meta.elevation)
+                extra_headers["channel_depth_m"] = float(ch_meta.depth)
+
+            tr = Trace(
+                data=scaled_data,
+                delta=dt,
+                station=station,
+                comp=comp,
+                chan1=chan1,
+                chan2=chan2,
+                network=network,
+                locid=locid,
+                start_epoch=merged_start,
+                calib=calib,
+                lat=tr_lat,
+                lon=tr_lon,
+                instype=tr_inst,
+                extra_headers=extra_headers,
+                source_path=source_path,
+            )
+            out_traces.append(tr)
 
     return out_traces
 
@@ -574,12 +603,22 @@ def read_mseed_file(
 
 def write_mseed_file(filepath: str, traces: List[Trace], reclth: int = 4096) -> None:
     """Write a list of Traces to a Steim-1 Mini-SEED file."""
+    if not isinstance(reclth, int) or isinstance(reclth, bool) or reclth < 128 or (reclth & (reclth - 1)) != 0:
+        raise ValueError(f"Mini-SEED record length must be a power of 2 >= 128, got {reclth!r}")
     os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
     seqno = 1
     with open(filepath, "wb") as f:
         for tr in traces:
             calib = tr.calib if tr.calib > 0 else 1.0
-            counts = np.round(tr.data / calib).astype(np.int32)
+            raw_vals = np.asarray(tr.data, dtype=np.float64) / calib
+            if raw_vals.size > 0 and not np.all(np.isfinite(raw_vals)):
+                logger.warning(
+                    "Trace %s.%s contains non-finite samples; replacing with 0 for Mini-SEED export",
+                    tr.station,
+                    tr.channel3,
+                )
+                raw_vals = np.nan_to_num(raw_vals, nan=0.0, posinf=0.0, neginf=0.0)
+            counts = np.clip(np.round(raw_vals), -2147483648.0, 2147483647.0).astype(np.int32)
             idx = 0
             prev = 0
             while idx < counts.size:
@@ -604,156 +643,10 @@ def write_mseed_file(filepath: str, traces: List[Trace], reclth: int = 4096) -> 
                 seqno = (seqno % 999999) + 1
 
 
-def parse_sfd_file(sfdfile: str, base_dir: Optional[str] = None) -> List[SFDRecord]:
-    """Parse an SHM SFD index file (e.g. sfdlist.sfd)."""
-    if not os.path.isfile(sfdfile):
-        return []
-    bdir = base_dir or os.path.dirname(os.path.abspath(sfdfile))
-    records: List[SFDRecord] = []
-    with open(sfdfile, "r", encoding="latin-1", errors="ignore") as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("!"):
-                continue
-            rec = SFDRecord()
-            for token in s.split():
-                if len(token) > 2 and token[1] == ">":
-                    tag = token[0]
-                    val = token[2:]
-                    if tag == "s":
-                        rec.stream = val.lower()
-                    elif tag == "n":
-                        rec.filepath = val if os.path.isabs(val) else os.path.normpath(os.path.join(bdir, val))
-                    elif tag == "b":
-                        rec.t_start_str = val
-                        try:
-                            rec.t_start = parse_sh_time(val)
-                        except ValueError:
-                            rec.t_start = 0.0
-                    elif tag == "e":
-                        rec.t_end_str = val
-                        try:
-                            rec.t_end = parse_sh_time(val)
-                        except ValueError:
-                            rec.t_end = 0.0
-                    elif tag == "r":
-                        rec.recno = int(val)
-                    elif tag == "h":
-                        rec.swap_hdr = int(val)
-                    elif tag == "l":
-                        rec.reclth = int(val)
-                    elif tag == "o":
-                        rec.byteoff = int(val)
-                    elif tag == "c":
-                        rec.calib = float(val)
-                    elif tag == "a":
-                        rec.net_loc = val
-            if rec.stream and rec.filepath:
-                records.append(rec)
-    return records
-
-
-def generate_sfd_file(
-    data_dir: str,
-    output_sfd: Optional[str] = None,
-    config: Optional[SHMConfig] = None,
-) -> List[SFDRecord]:
-    """Scan a directory for Mini-SEED files and generate an sfdlist.sfd index."""
-    cfg = config or get_config()
-    records: List[Tuple[str, SFDRecord]] = []
-    for root, _dirs, files in os.walk(data_dir):
-        for fname in sorted(files):
-            if fname.endswith(".sfd") or fname.startswith("."):
-                continue
-            fpath = os.path.join(root, fname)
-            try:
-                with open(fpath, "rb") as f:
-                    first_chunk = f.read(512)
-                    if len(first_chunk) < 64:
-                        continue
-                    hdr0 = parse_seed_header(first_chunk)
-                    reclth = hdr0.reclth if hdr0.reclth >= 128 else 4096
-                    f.seek(0, os.SEEK_END)
-                    fsize = f.tell()
-                    nrecs = fsize // reclth
-                    if nrecs <= 0:
-                        continue
-                    f.seek((nrecs - 1) * reclth)
-                    last_chunk = f.read(min(512, reclth))
-                    hdr_last = parse_seed_header(last_chunk)
-            except Exception:
-                continue
-
-            ch = hdr0.channel
-            c1 = ch[0:1].lower() if len(ch) >= 1 else "b"
-            c2 = ch[1:2].lower() if len(ch) >= 2 else "h"
-            cp = ch[2:3].lower() if len(ch) >= 3 else "z"
-            stream = f"{hdr0.station.lower()}-{c1}{c2}-{cp}"
-            t_start = hdr0.start_epoch
-            t_end = hdr_last.start_epoch + hdr_last.no_of_samples * hdr_last.dt
-            calib = cfg.get_sensitivity(stream, t_start)
-            rel_path = os.path.relpath(fpath, os.path.dirname(os.path.abspath(output_sfd))) if output_sfd else fpath
-            rec = SFDRecord(
-                stream=stream,
-                filepath=os.path.abspath(fpath),
-                t_start=t_start,
-                t_end=t_end,
-                t_start_str=format_sh_time(t_start),
-                t_end_str=format_sh_time(t_end),
-                recno=nrecs,
-                swap_hdr=0 if hdr0.big_endian_hdr else 1,
-                reclth=reclth,
-                byteoff=0,
-                calib=calib,
-                net_loc=f"{hdr0.network:<2s}{hdr0.locid:<2s}",
-            )
-            records.append((rel_path, rec))
-
-    records.sort(key=lambda item: (item[1].stream, item[1].t_start))
-    if output_sfd:
-        with open(output_sfd, "w", encoding="ascii") as out:
-            for rel_path, r in records:
-                out.write(
-                    f"s>{r.stream:<11s} n>{rel_path} "
-                    f"b>{r.t_start_str} e>{r.t_end_str} "
-                    f"r>{r.recno:6d} h>{r.swap_hdr:1d} l>{r.reclth:5d} "
-                    f"o>{r.byteoff:7d} c>{r.calib:9.4e} a>{r.net_loc}\n"
-                )
-    return [r for _, r in records]
-
-
-def read_from_sfd(
-    sfdfile: str,
-    streams: Optional[List[str]] = None,
-    t_start: Optional[float] = None,
-    duration: Optional[float] = None,
-    config: Optional[SHMConfig] = None,
-) -> List[Trace]:
-    """Read requested streams and time window using an SFD index file."""
-    cfg = config or get_config()
-    records = parse_sfd_file(sfdfile)
-    if not records:
-        return []
-
-    wanted = {s.strip().lower() for s in streams} if streams else None
-    out: List[Trace] = []
-    for rec in records:
-        if wanted is not None and rec.stream not in wanted:
-            # Also support wildcard matching (e.g. 'gr*-bh-z' or 'bfo-bh-*')
-            import fnmatch
-
-            if not any(fnmatch.fnmatch(rec.stream, pat) for pat in wanted):
-                continue
-        if t_start is not None and duration is not None:
-            if rec.t_end < t_start or rec.t_start > (t_start + duration):
-                continue
-        calib = rec.calib if rec.calib > 0 else None
-        trs = read_mseed_file(
-            rec.filepath,
-            t_start=t_start,
-            duration=duration,
-            calib_override=calib,
-            config=cfg,
-        )
-        out.extend(trs)
-    return out
+# Backward-compatible re-exports from shm_app.io.sfd (placed after parse_seed_header/read_mseed_file).
+from shm_app.io.sfd import (  # noqa: E402
+    SFDRecord,
+    generate_sfd_file,
+    parse_sfd_file,
+    read_from_sfd,
+)

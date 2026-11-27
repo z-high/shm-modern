@@ -19,7 +19,10 @@ Tests:
 """
 
 import math
+import os
+import tempfile
 import unittest
+from unittest import mock
 import warnings
 import numpy as np
 
@@ -317,6 +320,10 @@ class TestFitDiagnosticWindowUI(unittest.TestCase):
         self.bridge = FitDiagnosticBridge()
         self.win = FitDiagnosticWindow(bridge=self.bridge)
 
+    def tearDown(self) -> None:
+        self.win.close()
+        app.processEvents()
+
     def test_kpi_card_update(self) -> None:
         """Verify KPI metric card value and color styling."""
         card = KPICard("Test KPI", "--")
@@ -473,6 +480,16 @@ class TestReactiveReFitLoop(unittest.TestCase):
     def setUp(self) -> None:
         from shm_app.seismology.traveltime import get_ttt_manager, sphere_diff
 
+        self._sess_dir = tempfile.TemporaryDirectory()
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {
+                "SHM_SESSION_PATH": os.path.join(self._sess_dir.name, "session.json"),
+                "SHM_NO_SESSION_PROMPT": "1",
+            },
+        )
+        self._env_patch.start()
+
         self.cfg = get_config()
         self.ttt = get_ttt_manager(self.cfg.inputs_dir)
         true_lat, true_lon, true_z = 50.1, 12.3, 10.0
@@ -485,6 +502,11 @@ class TestReactiveReFitLoop(unittest.TestCase):
             tt = self.ttt.travel_time("P", max(0.05, dist), true_z)
             pk = PhasePick(name="P", onset=format_sh_time(t0 + tt), station=st_code)
             self.picks.append(pk)
+
+    def tearDown(self) -> None:
+        app.processEvents()
+        self._env_patch.stop()
+        self._sess_dir.cleanup()
 
     def test_locate_network_geiger_with_diagnostics(self) -> None:
         """Verify locate_network_geiger returns AnalysisParamSet, residuals, and FitDiagnosticResult."""
@@ -527,42 +549,45 @@ class TestReactiveReFitLoop(unittest.TestCase):
     def test_main_window_reactive_refit_integration(self) -> None:
         """Verify MainWindow reactive loop: recomputeFitRequested re-inverts and updates canvas."""
         win = MainWindow(autoload_example=False)
-        self.assertTrue(hasattr(win, "fit_dock"))
-        self.assertTrue(hasattr(win, "fit_bridge"))
+        try:
+            self.assertTrue(hasattr(win, "fit_dock"))
+            self.assertTrue(hasattr(win, "fit_bridge"))
 
-        # Add traces with picks
-        dt = 0.05
-        t_arr = np.arange(200) * dt
-        traces = []
-        for i, pk in enumerate(self.picks):
-            tr = Trace(data=np.zeros_like(t_arr), delta=dt, station=pk.station, comp="Z", start_epoch=1000000.0)
-            tr.add_or_replace_pick(pk)
-            traces.append(tr)
+            # Add traces with picks
+            dt = 0.05
+            t_arr = np.arange(200) * dt
+            traces = []
+            for i, pk in enumerate(self.picks):
+                tr = Trace(data=np.zeros_like(t_arr), delta=dt, station=pk.station, comp="Z", start_epoch=1000000.0)
+                tr.add_or_replace_pick(pk)
+                traces.append(tr)
 
-        win.engine.traces = traces
-        win.refresh_views()
+            win.engine.traces = traces
+            win.refresh_views()
 
-        # Trigger recompute
-        req = FitModificationRequest(
-            fit_type=FitType.HYPOCENTER_GEIGER,
-            excluded_identifiers=["FUR"],
-            weight_overrides={"FUR": 0.0},
-        )
-        win._on_recompute_fit_requested(req)
+            # Trigger recompute
+            req = FitModificationRequest(
+                fit_type=FitType.HYPOCENTER_GEIGER,
+                excluded_identifiers=["FUR"],
+                weight_overrides={"FUR": 0.0},
+            )
+            win._on_recompute_fit_requested(req)
 
-        # Check that active parameter set is updated
-        curr_p = win.engine.current_params
-        self.assertTrue(curr_p.lat != 0.0 or curr_p.lon != 0.0)
-        self.assertIsNotNone(curr_p.residuals)
-        self.assertIsNotNone(curr_p.error_ellipse)
+            # Check that active parameter set is updated
+            curr_p = win.engine.current_params
+            self.assertTrue(curr_p.lat != 0.0 or curr_p.lon != 0.0)
+            self.assertIsNotNone(curr_p.residuals)
+            self.assertIsNotNone(curr_p.error_ellipse)
 
-        # Check that traces received theoretical arrivals and updated residuals
-        for tr in win.engine.traces:
-            self.assertTrue(tr.distance > 0.0)
-            self.assertTrue(len(tr.theo_picks) > 0)
-            for p in tr.picks:
-                self.assertIsNotNone(p.resid)
-        win.close()
+            # Check that traces received theoretical arrivals and updated residuals
+            for tr in win.engine.traces:
+                self.assertTrue(tr.distance > 0.0)
+                self.assertTrue(len(tr.theo_picks) > 0)
+                for p in tr.picks:
+                    self.assertIsNotNone(p.resid)
+        finally:
+            win.close()
+            app.processEvents()
 
     def test_zero_height_canvas_recompute_no_singular_matrix(self) -> None:
         """FitDiagnosticWindow must never crash with LinAlgError when canvases are tiny/zero-height."""
@@ -589,6 +614,7 @@ class TestReactiveReFitLoop(unittest.TestCase):
             self.assertEqual(mean_warns, [])
         finally:
             win.close()
+            app.processEvents()
 
     def test_pick_placement_matches_release_cursor_and_no_empty_mean_warning(self) -> None:
         """Verify cursor-to-pick alignment on release and empty-slice protection in snap_time_to_feature."""
@@ -654,6 +680,7 @@ class TestReactiveReFitLoop(unittest.TestCase):
             self.assertLess(abs(drawn_x - release_pt.x()), 0.5)
         finally:
             win.close()
+            app.processEvents()
 
 
 if __name__ == "__main__":

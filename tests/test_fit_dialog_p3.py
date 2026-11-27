@@ -76,6 +76,7 @@ class TestFitDialogPhase3And4(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.win.close()
+        app.processEvents()
 
     def test_tab3_array_fk_real_data_with_arf_calibration_and_poor_channel(self) -> None:
         cfg = get_config()
@@ -262,6 +263,7 @@ class TestFitDialogPhase3And4(unittest.TestCase):
             self.assertIn(f"{fm_sol['strike']:.1f}°", win2.lbl_fm_summary.text())
         finally:
             win2.close()
+            app.processEvents()
 
     def test_tab6_restitution_receiver_func_and_dispersion(self) -> None:
         freqs = np.logspace(-2, 1.5, 60)

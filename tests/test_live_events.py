@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 import urllib.parse
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -1057,6 +1058,22 @@ class TestLiveEventMainWindowAndDialogGUI(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def setUp(self) -> None:
+        self._sess_dir = tempfile.TemporaryDirectory()
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {
+                "SHM_SESSION_PATH": os.path.join(self._sess_dir.name, "session.json"),
+                "SHM_NO_SESSION_PROMPT": "1",
+            },
+        )
+        self._env_patch.start()
+
+    def tearDown(self) -> None:
+        self.app.processEvents()
+        self._env_patch.stop()
+        self._sess_dir.cleanup()
+
     def test_opt_in_default_dialog_widgets_load_params_theo_undo_and_bgr_handoff(self) -> None:
         win = SHMMainWindow(autoload_example=True)
         n_initial = len(win.engine.traces)
@@ -1201,6 +1218,7 @@ class TestLiveEventMainWindowAndDialogGUI(unittest.TestCase):
             for d in list(win._open_dialogs):
                 d.close()
             win.close()
+            self.app.processEvents()
 
 
 if __name__ == "__main__":

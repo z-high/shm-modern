@@ -227,15 +227,12 @@ def parse_usgs_geojson(text: str, source_feed: str = "USGS") -> List[LiveEvent]:
         lon = _safe_float(coords[0], default=math.nan)
         lat = _safe_float(coords[1], default=math.nan)
         depth = max(0.0, _safe_float(coords[2] if len(coords) > 2 else None, default=10.0))
-        t_ms = props.get("time")
-        if t_ms is None or not (math.isfinite(lat) and math.isfinite(lon)):
+        t_ms = _safe_float(props.get("time"), default=math.nan)
+        if not (math.isfinite(t_ms) and math.isfinite(lat) and math.isfinite(lon)):
             continue
-        try:
-            origin_ep = float(t_ms) / 1000.0
-        except (TypeError, ValueError):
-            continue
-        upd_ms = props.get("updated")
-        updated_ep = (float(upd_ms) / 1000.0) if upd_ms is not None else origin_ep
+        origin_ep = t_ms / 1000.0
+        upd_ms = _safe_float(props.get("updated"), default=math.nan)
+        updated_ep = (upd_ms / 1000.0) if math.isfinite(upd_ms) else origin_ep
         ev_id = str(feat.get("id") or f"{props.get('net', 'us')}{props.get('code', '')}").strip()
         if not ev_id:
             continue
@@ -274,9 +271,11 @@ class EventDeduplicator:
         self.time_match_s = float(time_match_s)
         self.dist_match_deg = float(dist_match_deg)
         self._events_by_id: Dict[str, LiveEvent] = {}
+        self.last_evicted_ids: List[str] = []
 
     def clear(self) -> None:
         self._events_by_id.clear()
+        self.last_evicted_ids.clear()
 
     def _find_matching_id(self, ev: LiveEvent) -> Optional[str]:
         if ev.event_id in self._events_by_id:
@@ -308,12 +307,14 @@ class EventDeduplicator:
         Status is 'new', 'updated', or 'duplicate'.
         Canonical event retains the primary tracked event_id when matched cross-feed.
         """
+        self.last_evicted_ids = []
         matched_id = self._find_matching_id(ev)
         if matched_id is None:
             if len(self._events_by_id) >= self.max_entries:
                 oldest = sorted(self._events_by_id.items(), key=lambda kv: kv[1].origin_epoch)
                 for old_id, _ in oldest[: max(1, len(oldest) // 4)]:
-                    self._events_by_id.pop(old_id, None)
+                    if self._events_by_id.pop(old_id, None) is not None:
+                        self.last_evicted_ids.append(old_id)
             self._events_by_id[ev.event_id] = ev
             return "new", ev
 

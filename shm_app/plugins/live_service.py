@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -14,15 +15,13 @@ from shm_app.core.config_station import SHMConfig, get_config
 from shm_app.core.models import AnalysisParamSet, Trace, normalize_shm_event_type
 from shm_app.io.seedlink import (
     SEEDLINK_DEFAULT_PORT,
-    SeedLinkClient,
-    SeedLinkError,
-    SeedLinkPacket,
-    SeedLinkStoppedError,
     WaveformRingBuffer,
 )
+from shm_app.plugins.seedlink_worker import SeedLinkStreamWorker
 from shm_app.plugins.bgr_fetch import (
     BGRFetchSummary,
     HttpOpener,
+    _default_http_open,
     fetch_fdsn_waveforms,
 )
 from shm_app.plugins.live_events import (
@@ -40,6 +39,8 @@ from shm_app.plugins.live_planner import (
     resolve_reference_coords,
 )
 from shm_app.seismology.traveltime import TravelTimeManager, get_ttt_manager
+
+logger = logging.getLogger(__name__)
 
 # Canonical lifecycle states
 STATE_DETECTED = "DETECTED"
@@ -94,8 +95,27 @@ class CatalogFetchWorker(QThread):
         self.context_label = context_label
         self.now_epoch = float(now_epoch)
         self.opener = opener
+        self._cancel_event = threading.Event()
+
+    def _is_cancelled(self) -> bool:
+        return self._cancel_event.is_set() or self.isInterruptionRequested()
+
+    def stop(self, wait_ms: int = 3000) -> bool:
+        """Request cancellation and optionally wait for thread completion."""
+        self._cancel_event.set()
+        self.requestInterruption()
+        if wait_ms > 0 and self.isRunning() and QThread.currentThread() is not self:
+            return bool(self.wait(wait_ms))
+        return not self.isRunning()
 
     def run(self) -> None:
+        base_opener = self.opener or _default_http_open
+
+        def _cancellable_opener(url: str, timeout: float) -> tuple[int, bytes]:
+            if self._is_cancelled():
+                raise RuntimeError("Catalog fetch cancelled")
+            return base_opener(url, timeout)
+
         try:
             events = fetch_events_from_source(
                 source_key=self.source_key,
@@ -103,12 +123,12 @@ class CatalogFetchWorker(QThread):
                 min_mag=self.min_mag,
                 limit=self.limit,
                 now_epoch=self.now_epoch,
-                opener=self.opener,
+                opener=_cancellable_opener,
             )
-            if not self.isInterruptionRequested():
+            if not self._is_cancelled():
                 self.eventsFetched.emit(events, self.context_label)
         except Exception as exc:
-            if not self.isInterruptionRequested():
+            if not self._is_cancelled():
                 self.fetchFailed.emit(str(exc), self.context_label)
 
 
@@ -139,8 +159,27 @@ class EventFetchWorker(QThread):
         self.now_epoch = float(now_epoch)
         self.allow_network_discovery = allow_network_discovery
         self.opener = opener
+        self._cancel_event = threading.Event()
+
+    def _is_cancelled(self) -> bool:
+        return self._cancel_event.is_set() or self.isInterruptionRequested()
+
+    def stop(self, wait_ms: int = 3000) -> bool:
+        """Request cancellation and optionally wait for thread completion."""
+        self._cancel_event.set()
+        self.requestInterruption()
+        if wait_ms > 0 and self.isRunning() and QThread.currentThread() is not self:
+            return bool(self.wait(wait_ms))
+        return not self.isRunning()
 
     def run(self) -> None:
+        base_opener = self.opener or _default_http_open
+
+        def _cancellable_opener(url: str, timeout: float) -> tuple[int, bytes]:
+            if self._is_cancelled():
+                raise RuntimeError("Event fetch cancelled")
+            return base_opener(url, timeout)
+
         try:
             active_plan = self.plan
             if self.live_cfg.station_strategy == "epicenter" and self.allow_network_discovery:
@@ -151,12 +190,12 @@ class EventFetchWorker(QThread):
                     live_cfg=self.live_cfg,
                     shm_cfg=self.shm_cfg,
                     ttt=self.ttt,
-                    opener=self.opener,
+                    opener=_cancellable_opener,
                     allow_network=True,
                     now_epoch=self.now_epoch,
                 )
 
-            if self.isInterruptionRequested():
+            if self._is_cancelled():
                 return
 
             summary = fetch_fdsn_waveforms(
@@ -166,123 +205,14 @@ class EventFetchWorker(QThread):
                 output_dir=active_plan.output_dir,
                 build_sfd=True,
                 config=self.shm_cfg,
-                opener=self.opener,
-                cancel_check=self.isInterruptionRequested,
+                opener=_cancellable_opener,
+                cancel_check=self._is_cancelled,
             )
-            self.fetchCompleted.emit(self.event_id, active_plan, summary)
+            if not self._is_cancelled():
+                self.fetchCompleted.emit(self.event_id, active_plan, summary)
         except Exception as exc:
-            if not self.isInterruptionRequested():
+            if not self._is_cancelled():
                 self.fetchFailed.emit(self.event_id, str(exc))
-
-
-class SeedLinkStreamWorker(QThread):
-    """Background QThread streaming Mini-SEED packets over SeedLink v3.1 into a WaveformRingBuffer."""
-
-    packetReceived = pyqtSignal(object)  # SeedLinkPacket
-    tracesUpdated = pyqtSignal(list)  # List[Trace] snapshot
-    statusChanged = pyqtSignal(str)  # status state string
-    errorOccurred = pyqtSignal(str)  # error message
-
-    def __init__(
-        self,
-        host: str,
-        port: int = SEEDLINK_DEFAULT_PORT,
-        streams: Optional[Sequence[Any]] = None,
-        ring_buffer: Optional[WaveformRingBuffer] = None,
-        shm_config: Optional[SHMConfig] = None,
-        timeout: float = 5.0,
-        reconnect_delay: float = 0.5,
-        max_reconnect_delay: float = 30.0,
-        auto_reconnect: bool = True,
-        emit_interval_sec: float = 0.0,
-        parent: Optional[QObject] = None,
-    ) -> None:
-        super().__init__(parent)
-        self.host = str(host)
-        self.port = int(port)
-        self.streams = list(streams) if streams else []
-        self.ring_buffer = ring_buffer if ring_buffer is not None else WaveformRingBuffer()
-        self.shm_config = shm_config or get_config()
-        self.timeout = float(timeout)
-        self.reconnect_delay = max(0.05, float(reconnect_delay))
-        self.max_reconnect_delay = max(self.reconnect_delay, float(max_reconnect_delay))
-        self.auto_reconnect = bool(auto_reconnect)
-        self.emit_interval_sec = max(0.0, float(emit_interval_sec))
-
-        self._stop_event = threading.Event()
-        self._client = SeedLinkClient(
-            host=self.host,
-            port=self.port,
-            streams=self.streams,
-            timeout=self.timeout,
-            config=self.shm_config,
-            ring_buffer=self.ring_buffer,
-            stop_event=self._stop_event,
-        )
-
-    def stop(self, wait_ms: int = 3000) -> None:
-        """Request clean cancellation, unblock socket I/O, and optionally wait for thread exit."""
-        self._stop_event.set()
-        self.requestInterruption()
-        self._client.request_stop()
-        if wait_ms > 0 and self.isRunning() and QThread.currentThread() is not self:
-            self.wait(wait_ms)
-
-    def _should_stop(self) -> bool:
-        return self._stop_event.is_set() or self.isInterruptionRequested()
-
-    def run(self) -> None:
-        self._stop_event.clear()
-        self._client.stop_event = self._stop_event
-        delay = self.reconnect_delay
-        last_trace_emit = 0.0
-        self.statusChanged.emit("connecting")
-
-        try:
-            while not self._should_stop():
-                try:
-                    self._client.connect()
-                    self._client.negotiate(send_hello=True)
-                    delay = self.reconnect_delay
-                    self.statusChanged.emit("streaming")
-
-                    while not self._should_stop():
-                        pkt: Optional[SeedLinkPacket] = self._client.read_packet()
-                        if pkt is None:
-                            self.statusChanged.emit("completed")
-                            return
-
-                        if not pkt.is_valid and pkt.error:
-                            self.errorOccurred.emit(pkt.error)
-                            continue
-
-                        if pkt.is_info:
-                            self.packetReceived.emit(pkt)
-                            continue
-
-                        self.packetReceived.emit(pkt)
-                        now_m = time.monotonic()
-                        if self.emit_interval_sec <= 0.0 or (now_m - last_trace_emit) >= self.emit_interval_sec:
-                            last_trace_emit = now_m
-                            self.tracesUpdated.emit(self.ring_buffer.snapshot_traces())
-
-                except SeedLinkStoppedError:
-                    break
-                except (SeedLinkError, OSError) as exc:
-                    if self._should_stop():
-                        break
-                    self.errorOccurred.emit(str(exc))
-                    if not self.auto_reconnect:
-                        self.statusChanged.emit("error")
-                        break
-                    self.statusChanged.emit("reconnecting")
-                    self._client.close()
-                    if self._stop_event.wait(delay):
-                        break
-                    delay = min(self.max_reconnect_delay, delay * 2.0)
-        finally:
-            self._client.close()
-            self.statusChanged.emit("stopped")
 
 
 def build_analysis_param_set(
@@ -377,6 +307,8 @@ class LiveEventCoordinator(QObject):
         self._active_fetch_id: Optional[str] = None
         self._fetch_worker: Optional[EventFetchWorker] = None
         self._catalog_worker: Optional[CatalogFetchWorker] = None
+        self._shutting_down: bool = False
+        self._lingering_workers: List[QThread] = []
         self._seedlink_buffer = WaveformRingBuffer()
         self._seedlink_worker: Optional[SeedLinkStreamWorker] = None
         self._seedlink_status: str = "stopped"
@@ -414,6 +346,7 @@ class LiveEventCoordinator(QObject):
             return
         self._enabled = want
         if want:
+            self._shutting_down = False
             self._scheduler_timer.start()
             self._start_active_feed(run_catchup=run_catchup)
             self._log("Live Event Mode ENABLED.")
@@ -476,6 +409,8 @@ class LiveEventCoordinator(QObject):
 
     def fetch_recent_catalog(self, lookback_hours: float = 24.0, context_label: str = "Replay") -> None:
         """Query recent catalog events asynchronously without blocking the GUI thread."""
+        if self._shutting_down:
+            return
         if self._catalog_worker is not None and self._catalog_worker.isRunning():
             return
         min_mag = min(
@@ -501,6 +436,8 @@ class LiveEventCoordinator(QObject):
 
     def _on_catalog_fetched(self, events: list, context_label: str) -> None:
         self._catalog_worker = None
+        if self._shutting_down:
+            return
         # Process oldest-to-newest so newest ends up on top of ordered_ids
         ordered = sorted(events, key=lambda e: e.origin_epoch)
         n_new = 0
@@ -516,13 +453,32 @@ class LiveEventCoordinator(QObject):
 
     def _on_catalog_failed(self, err: str, context_label: str) -> None:
         self._catalog_worker = None
+        if self._shutting_down:
+            return
         self._log(f"{context_label} failed: {err}")
         if self._enabled and self.live_config.source_key != "emsc_ws":
             self._set_stream_status("error", f"Poll failed: {err}")
 
+    def _prune_evicted_entries(self) -> None:
+        """Prune entries and ordered_ids evicted by EventDeduplicator to bound memory."""
+        evicted = getattr(self._dedup, "last_evicted_ids", None)
+        evict_set = {eid for eid in (evicted or ()) if eid != self._active_fetch_id}
+        if len(self.entries) > self._dedup.max_entries:
+            tracked = getattr(self._dedup, "_events_by_id", {})
+            for eid in list(self.entries.keys()):
+                if eid not in tracked and eid != self._active_fetch_id:
+                    evict_set.add(eid)
+        if not evict_set:
+            return
+        for eid in evict_set:
+            self.entries.pop(eid, None)
+        self.ordered_ids = [eid for eid in self.ordered_ids if eid not in evict_set]
+        self._fetch_queue = [eid for eid in self._fetch_queue if eid not in evict_set]
+
     def ingest_event(self, ev: LiveEvent) -> Optional[LiveEventEntry]:
         """Deduplicate, evaluate relevance, plan fetch timing, and update state machine."""
         kind, canonical = self._dedup.ingest(ev)
+        self._prune_evicted_entries()
         if kind == "duplicate":
             return self.entries.get(canonical.event_id)
 
@@ -709,10 +665,14 @@ class LiveEventCoordinator(QObject):
         self._dispatch_queue()
 
     def _dispatch_queue(self) -> None:
+        if self._shutting_down:
+            return
         now_ep = self.now()
         if self._enabled:
             for eid in self.ordered_ids:
-                entry = self.entries[eid]
+                entry = self.entries.get(eid)
+                if entry is None:
+                    continue
                 if entry.state in (STATE_WAITING, STATE_RETRY_WAIT) and entry.next_action_epoch <= now_ep:
                     if eid != self._active_fetch_id and eid not in self._fetch_queue:
                         self._fetch_queue.append(eid)
@@ -763,14 +723,18 @@ class LiveEventCoordinator(QObject):
     def _on_event_fetch_completed(self, event_id: str, plan: EventFetchPlan, summary: BGRFetchSummary) -> None:
         self._fetch_worker = None
         self._active_fetch_id = None
+        if self._shutting_down:
+            return
         entry = self.entries.get(event_id)
         if entry is None:
+            self._prune_evicted_entries()
             self._dispatch_queue()
             return
         entry.plan = plan
         entry.last_summary = summary
 
         if entry.state == STATE_IGNORED:
+            self._prune_evicted_entries()
             self._dispatch_queue()
             return
 
@@ -794,16 +758,20 @@ class LiveEventCoordinator(QObject):
         else:
             self._schedule_retry_or_error(entry, reason="No archive data yet (204/nodata)")
 
+        self._prune_evicted_entries()
         self.entriesUpdated.emit()
         self._dispatch_queue()
 
     def _on_event_fetch_failed(self, event_id: str, err: str) -> None:
         self._fetch_worker = None
         self._active_fetch_id = None
+        if self._shutting_down:
+            return
         entry = self.entries.get(event_id)
         if entry is not None and entry.state != STATE_IGNORED:
             self._schedule_retry_or_error(entry, reason=err)
             self.entriesUpdated.emit()
+        self._prune_evicted_entries()
         self._dispatch_queue()
 
     def _schedule_retry_or_error(self, entry: LiveEventEntry, reason: str) -> None:
@@ -924,13 +892,27 @@ class LiveEventCoordinator(QObject):
     def _log(self, msg: str) -> None:
         self.logMessage.emit(f"[Live] {msg}")
 
-    def shutdown(self) -> None:
+    def shutdown(self, wait_ms: int = 3000) -> None:
         """Stop timers, WebSocket stream, SeedLink stream, and background workers cleanly before exit."""
+        self._shutting_down = True
         self.set_enabled(False)
         self.stop_seedlink()
         for attr in ("_catalog_worker", "_fetch_worker"):
             worker = getattr(self, attr, None)
-            if worker is not None and worker.isRunning():
-                worker.requestInterruption()
-                worker.wait(3000)
             setattr(self, attr, None)
+            if worker is None:
+                continue
+            if hasattr(worker, "stop"):
+                finished = worker.stop(wait_ms=wait_ms)
+            else:
+                worker.requestInterruption()
+                finished = bool(worker.wait(wait_ms)) if worker.isRunning() else True
+            if not finished and worker.isRunning():
+                logger.warning("Worker %s still running after %d ms shutdown wait", type(worker).__name__, wait_ms)
+                self._lingering_workers.append(worker)
+                try:
+                    worker.finished.connect(
+                        lambda w=worker: self._lingering_workers.remove(w) if w in self._lingering_workers else None
+                    )
+                except Exception:
+                    pass

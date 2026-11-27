@@ -4,6 +4,7 @@
 import argparse
 import os
 import sys
+from typing import List, Optional, Sequence, Tuple
 
 # Ensure package root is on sys.path
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -12,12 +13,76 @@ if APP_ROOT not in sys.path:
 
 from PyQt6.QtWidgets import QApplication
 from shm_app import SHM_DEFAULT_ROOT
+from shm_app.__version__ import __version__
 from shm_app.gui.main_window import SHMMainWindow, apply_dark_theme
 from shm_app.gui.ui_helpers import apply_c_locale
 
+_QT_VALUE_FLAGS = frozenset({
+    "-platform",
+    "-platformpluginpath",
+    "-platformtheme",
+    "-plugin",
+    "-display",
+    "-geometry",
+    "-fn",
+    "-font",
+    "-bg",
+    "-background",
+    "-fg",
+    "-foreground",
+    "-btn",
+    "-button",
+    "-name",
+    "-title",
+    "-style",
+    "-stylesheet",
+    "-qwindowgeometry",
+    "-qwindowicon",
+    "-qwindowtitle",
+    "-session",
+    "-graphicssystem",
+    "-qmljsdebugger",
+})
 
-def main() -> int:
+
+def _quote_sh_arg(path: str) -> str:
+    if '"' not in path:
+        return f'"{path}"'
+    if "'" not in path:
+        return f"'{path}'"
+    return '"' + path.replace('"', '\\"') + '"'
+
+
+def _is_quakeml_xml(fpath: str) -> bool:
+    try:
+        with open(fpath, "rb") as fh:
+            head = fh.read(2048).lower()
+        return b"quakeml" in head
+    except OSError:
+        return False
+
+
+def parse_cli_args(argv: Optional[Sequence[str]] = None) -> Tuple[argparse.Namespace, List[str]]:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    qt_args: List[str] = []
+    cli_argv: List[str] = []
+    i = 0
+    while i < len(raw_argv):
+        tok = raw_argv[i]
+        if tok in _QT_VALUE_FLAGS and i + 1 < len(raw_argv) and not raw_argv[i + 1].startswith("-"):
+            qt_args.extend([tok, raw_argv[i + 1]])
+            i += 2
+            continue
+        cli_argv.append(tok)
+        i += 1
+
     parser = argparse.ArgumentParser(description="SeismicHandler Motif (SHM) Modernized Desktop GUI")
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"shm {__version__}",
+    )
     parser.add_argument(
         "--shm-root",
         default=SHM_DEFAULT_ROOT,
@@ -26,36 +91,68 @@ def main() -> int:
     parser.add_argument(
         "--example",
         action="store_true",
-        help="Automatically load bundled GRF array example dataset on startup",
+        help="Automatically load GRF array example dataset on startup (when available)",
     )
     parser.add_argument(
         "files",
         nargs="*",
-        help="Optional waveform or .evt files to load on startup",
+        help="Optional waveform, event (.evt/.qml), or station (.xml) files to load on startup",
     )
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args(cli_argv)
+    return args, [sys.argv[0]] + qt_args + unknown
 
-    app = QApplication(sys.argv)
+
+def load_startup_files(win: SHMMainWindow, files: Sequence[str]) -> List[str]:
+    errors: List[str] = []
+    for fpath in files:
+        low = fpath.lower()
+        qpath = _quote_sh_arg(fpath)
+        if low.endswith(".gse"):
+            cmd = f"READGSE {qpath}"
+        elif low.endswith((".qhd", ".qbn")):
+            cmd = f"READ {qpath}"
+        elif low.endswith(".evt"):
+            cmd = f"READEVT {qpath}"
+        elif low.endswith((".asc", ".txt")):
+            cmd = f"READA {qpath}"
+        elif low.endswith(".qml"):
+            cmd = f"READQML {qpath}"
+        elif low.endswith(".xml"):
+            cmd = f"READQML {qpath}" if _is_quakeml_xml(fpath) else f"READSXML {qpath}"
+        else:
+            cmd = f"READS {qpath}"
+        res = win.engine.execute_line(cmd)
+        if res and res.lstrip().startswith("SH Error"):
+            errors.append(res)
+    if win.engine.traces:
+        win._register_unfiltered_traces(win.engine.traces)
+    if files:
+        win.refresh_views(reset_time=True)
+    return errors
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args, qt_argv = parse_cli_args(argv)
+
+    missing = [fp for fp in args.files if not os.path.exists(fp)]
+    if missing:
+        for fp in missing:
+            print(f"Error: Input path not found: {fp}", file=sys.stderr)
+        return 1
+
+    app = QApplication.instance() or QApplication(qt_argv)
     apply_c_locale()
     apply_dark_theme(app)
     app.setApplicationName("SeismicHandler Motif (Modernized)")
 
     win = SHMMainWindow(shm_root=args.shm_root, autoload_example=args.example)
-    for fpath in args.files:
-        if os.path.exists(fpath):
-            low = fpath.lower()
-            if low.endswith(".gse"):
-                win.engine.execute_line(f"READGSE {fpath}")
-            elif low.endswith((".qhd", ".qbn")):
-                win.engine.execute_line(f"READ {fpath}")
-            elif low.endswith(".evt"):
-                win.engine.execute_line(f"READEVT {fpath}")
-            elif low.endswith((".asc", ".txt")):
-                win.engine.execute_line(f"READA {fpath}")
-            else:
-                win.engine.execute_line(f"READS {fpath}")
     if args.files:
-        win.refresh_views(reset_time=True)
+        errors = load_startup_files(win, args.files)
+        if errors:
+            for err in errors:
+                print(err, file=sys.stderr)
+            win.close()
+            return 1
 
     win.show()
     return app.exec()
